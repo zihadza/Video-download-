@@ -3,7 +3,7 @@ import os, subprocess, re
 
 app = Flask(__name__)
 PORT = 5050
-FOLDER = "/storage/emulated/0/Zihad"
+FOLDER = "/storage/emulated/0/Zihad"  # same folder
 FFMPEG = "ffmpeg"
 
 HTML = """
@@ -56,40 +56,39 @@ def scan_files():
     videos = {}
     audios = {}
     for f in files:
-        if f.endswith(".temp.webm"):
-            continue
+        if f.endswith(".temp.webm"): continue
         name, ext = os.path.splitext(f)
-        name_clean = re.sub(r'\.f\d+[av]$', '', name)
-        if ext.lower() in [".mp4",".webm",".mkv"]:
-            videos[name_clean] = f
-        if ext.lower() in [".m4a",".webm",".mp3"]:
-            audios[name_clean] = f
+        base_name = re.sub(r'\.f\d+[av]$', '', name)
+        if ext.lower() in [".mp4",".webm",".mkv"]: videos[base_name] = f
+        if ext.lower() in [".m4a",".mp3",".webm"]: audios[base_name] = f
     mergeable = []
     for n in videos:
         if n in audios:
             mergeable.append((videos[n], audios[n]))
     return mergeable
 
-def merge_files(video,audio):
-    output = os.path.splitext(video)[0] + "_merged.mp4"
-    cmd = [FFMPEG, "-i", os.path.join(FOLDER,video), "-i", os.path.join(FOLDER,audio),
-           "-c","copy","-y", os.path.join(FOLDER,output)]
+def merge_files(video_file, audio_file):
+    output_name = os.path.splitext(video_file)[0]+"_merged.mp4"
+    video_path = os.path.join(FOLDER, video_file)
+    audio_path = os.path.join(FOLDER, audio_file)
+    output_path = os.path.join(FOLDER, output_name)
+    cmd = [FFMPEG, "-i", video_path, "-i", audio_path, "-c", "copy", "-y", output_path]
     process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    if process.returncode==0:
-        return f"Merged successfully: {output}"
+    if process.returncode == 0:
+        return f"Merged successfully: {output_name}"
     else:
-        return f"Merge failed for {video}"
+        return f"Merge failed for {video_file}"
 
 @app.route("/")
 def index():
     mergeable = scan_files()
     return render_template_string(HTML, mergeable=mergeable)
 
-@app.route("/merge",methods=["POST"])
+@app.route("/merge", methods=["POST"])
 def merge_route():
     data = request.json
     msg = merge_files(data["video"], data["audio"])
-    return jsonify({"msg":msg})
+    return jsonify({"msg": msg})
 
 if __name__=="__main__":
     print(f"Server running on http://0.0.0.0:{PORT}")
