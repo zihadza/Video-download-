@@ -60,7 +60,7 @@ max-height:250px;
 <body>
 
 <div class="box">
-<h2>WebM Video Downloader</h2>
+<h2>YouTube Video Downloader</h2>
 
 <form method="POST">
 
@@ -102,8 +102,8 @@ def home():
 
             cmd=[
             "yt-dlp",
-            "-f",f"bestvideo[ext=webm][height<={quality}]/best[ext=webm]/best",
-            "--no-part",
+            "-f",f"bestvideo[height<={quality}]+bestaudio/best",
+            "--merge-output-format","webm",
             "-o",SAVE_PATH,
             url
             ]
