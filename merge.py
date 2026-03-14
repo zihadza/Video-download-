@@ -1,8 +1,10 @@
 import os, re, subprocess, time
 
+# Main download folder
 FOLDER = "/storage/emulated/0/Zihad/Video-download-"
 MERGED_FOLDER = os.path.join(FOLDER, "merged")
 
+# Create merged folder if not exists
 if not os.path.exists(MERGED_FOLDER):
     os.makedirs(MERGED_FOLDER)
 
@@ -15,6 +17,9 @@ def clean_name(name):
     return name.strip()
 
 def scan_files():
+    """
+    Scan the folder and detect mergeable audio+video pairs
+    """
     files = os.listdir(FOLDER)
     videos = {}
     audios = {}
@@ -29,9 +34,9 @@ def scan_files():
         ext = ext.lower()
         base_name = clean_name(name)
 
-        if ext in [".mp4", ".webm", ".mkv"]:
+        if ext in [".mp4", ".mkv", ".webm"]:
             videos[base_name] = f
-        elif ext in [".m4a", ".mp3", ".webm"]:
+        elif ext in [".m4a", ".mp3"]:
             audios[base_name] = f
 
     # Only pair audio+video which both exist
@@ -42,18 +47,23 @@ def scan_files():
     return mergeable
 
 def merge_files(video_file, audio_file):
+    """
+    Merge video and audio into MP4 without quality loss
+    """
     video_path = os.path.join(FOLDER, video_file)
     audio_path = os.path.join(FOLDER, audio_file)
     base_name = clean_name(os.path.splitext(video_file)[0])
-    output_file = os.path.join(MERGED_FOLDER, f"{base_name}_merged.webm")
+    output_file = os.path.join(MERGED_FOLDER, f"{base_name}_merged.mp4")
 
     print(f"Merging:\n Video: {video_file}\n Audio: {audio_file}\n -> Output: {output_file}")
 
+    # Use copy codec to avoid re-encoding (maintain quality)
     cmd = [
         "ffmpeg",
         "-i", video_path,
         "-i", audio_path,
-        "-c", "copy",
+        "-c:v", "copy",
+        "-c:a", "copy",
         "-y",
         output_file
     ]
