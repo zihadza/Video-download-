@@ -40,3 +40,31 @@ pip install --upgrade pip
 # Install required Python packages
 pip install flask
 pip install yt-dlp
+
+2️⃣ Clone Project
+Bash
+Copy code
+# Prepare Zihad folder
+mkdir -p /storage/emulated/0/Zihad
+cd /storage/emulated/0/Zihad
+
+# Remove old copy if exists
+rm -rf Video-download-
+
+# Clone GitHub repo
+git clone https://github.com/zihadza/Video-download-.git
+cd Video-download-
+
+3️⃣ Run Python Server
+Bash
+Copy code
+# Run the Flask app
+python app.py
+⚠️ Make sure port 3030 is free.
+Optional NodeJS recommended for better YouTube extraction
+
+4️⃣ Open in Browser
+Plain text
+Copy code
+http://localhost:3030
+
