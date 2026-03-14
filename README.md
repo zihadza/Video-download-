@@ -1,41 +1,55 @@
 # Video-download-
-It's about a video download from YouTube 
-Video Downloader Project
-1️⃣ Requirements
-Python 3.13+
-pip (Python package installer)
-Flask
-yt-dlp
-Optional: NodeJS (for full YouTube extraction support)
 
-install
+YouTube Video Downloader Project
 
-# Update Termux / Linux
+---
+
+## 🎯 Overview
+
+Download YouTube videos in multiple resolutions with a simple web interface.
+
+---
+
+## ⚡ Requirements
+
+- Python 3.13+
+- pip
+- Flask
+- yt-dlp
+- Optional: NodeJS (for full YouTube extraction support)
+
+---
+
+## 🛠 Installation & Setup
+
+Copy and paste each block in terminal:
+
+```bash
+# 1️⃣ Update Termux / Linux
 pkg update && pkg upgrade -y
 pkg install python git -y
 
-# Install Python packages
+# 2️⃣ Install Python packages
 pip install --upgrade pip
 pip install flask
 pip install yt-dlp
 
-# Optional JS runtime
+# 3️⃣ Optional: Install NodeJS
 pkg install nodejs -y
 
-# git clone 
-git clone https://github.com/zihadza/Video-download-.git
+# 4️⃣ Prepare folders
 mkdir -p /storage/emulated/0/Zihad
+cd /storage/emulated/0/Zihad
 
+# 5️⃣ Remove old copy if exists
+rm -rf Video-download-
 
-
-# Go to project folder
+# 6️⃣ Clone the GitHub repo
+git clone https://github.com/zihadza/Video-download-.git
 cd Video-download-
 
-# Run server
+# 7️⃣ Run the server
 python app.py
 
-
-open browser and run
-
+# 8️⃣ Open in browser
 http://localhost:3030
-
