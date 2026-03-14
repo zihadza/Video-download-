@@ -22,12 +22,14 @@ pip install yt-dlp
 # Optional JS runtime
 pkg install nodejs -y
 
+# git clone 
+git clone https://github.com/zihadza/Video-download-.git
+mkdir -p /storage/emulated/0/Zihad
 
 
 
-run 
 # Go to project folder
-cd ~/Video-download
+cd Video-download-
 
 # Run server
 python app.py
