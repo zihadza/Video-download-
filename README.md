@@ -55,6 +55,10 @@ rm -rf Video-download-
 git clone https://github.com/zihadza/Video-download-.git
 cd Video-download-
 
+### 1️⃣ Update & Install Packages
+
+```bash
+
 3️⃣ Run Python Server
 Bash
 Copy code
