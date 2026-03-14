@@ -1,66 +1,25 @@
-from flask import Flask, render_template_string, request, jsonify
-import os, subprocess, re
+import os, re, subprocess, time
 
-app = Flask(__name__)
-PORT = 5050
-FOLDER = "/storage/emulated/0/Zihad/Video-download-"  # same folder
-FFMPEG = "ffmpeg"
+FOLDER = "/storage/emulated/0/Zihad/Video-download-"
+MERGED_FOLDER = os.path.join(FOLDER, "merged")
 
-HTML = """
-<!DOCTYPE html>
-<html>
-<head>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Video Merge Tool</title>
-<style>
-body{ font-family:Arial; background:#111; color:white; text-align:center; padding:20px;}
-.box{ background:rgba(255,255,255,0.1); padding:20px; border-radius:15px; max-width:900px; margin:auto;}
-button{ padding:10px 20px; border:none; border-radius:10px; background:#ff0055; color:white; font-weight:bold; cursor:pointer; margin-top:5px;}
-.card{ background:#222; padding:10px; border-radius:10px; margin:10px;}
-a{color:#00ff9d; text-decoration:none;}
-</style>
-</head>
-<body>
-<div class="box">
-<h2>Python Video Merge Tool</h2>
-{% if mergeable %}
-    <h3>Mergeable Files:</h3>
-    {% for v,a in mergeable %}
-    <div class="card">
-        Video: {{v}}<br>
-        Audio: {{a}}<br>
-        <button onclick="merge('{{v}}','{{a}}')">Merge Now</button>
-    </div>
-    {% endfor %}
-{% else %}
-    <p>No mergeable files found!</p>
-{% endif %}
-<p id="status"></p>
-<script>
-function merge(video,audio){
-    fetch("/merge",{
-        method:"POST",
-        headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({video,audio})
-    }).then(r=>r.json())
-      .then(d=>document.getElementById("status").innerHTML=d.msg)
-}
-</script>
-</div>
-</body>
-</html>
-"""
+if not os.path.exists(MERGED_FOLDER):
+    os.makedirs(MERGED_FOLDER)
 
 def scan_files():
     files = os.listdir(FOLDER)
     videos = {}
     audios = {}
     for f in files:
-        if f.endswith(".temp.webm"): continue
+        if f.endswith(".temp.webm"):  
+            continue
         name, ext = os.path.splitext(f)
         base_name = re.sub(r'\.f\d+[av]$', '', name)
-        if ext.lower() in [".mp4",".webm",".mkv"]: videos[base_name] = f
-        if ext.lower() in [".m4a",".mp3",".webm"]: audios[base_name] = f
+        ext = ext.lower()
+        if ext in [".mp4", ".webm", ".mkv"]:
+            videos[base_name] = f
+        if ext in [".m4a", ".mp3", ".webm"]:
+            audios[base_name] = f
     mergeable = []
     for n in videos:
         if n in audios:
@@ -68,28 +27,42 @@ def scan_files():
     return mergeable
 
 def merge_files(video_file, audio_file):
-    output_name = os.path.splitext(video_file)[0]+"_merged.mp4"
+    base_name = re.sub(r'\.f\d+[av]$', '', os.path.splitext(video_file)[0])
+    output_file = os.path.join(MERGED_FOLDER, f"{base_name}_merged.webm")
     video_path = os.path.join(FOLDER, video_file)
     audio_path = os.path.join(FOLDER, audio_file)
-    output_path = os.path.join(FOLDER, output_name)
-    cmd = [FFMPEG, "-i", video_path, "-i", audio_path, "-c", "copy", "-y", output_path]
-    process = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    if process.returncode == 0:
-        return f"Merged successfully: {output_name}"
-    else:
-        return f"Merge failed for {video_file}"
 
-@app.route("/")
-def index():
-    mergeable = scan_files()
-    return render_template_string(HTML, mergeable=mergeable)
+    print(f"Merging:\n Video: {video_file}\n Audio: {audio_file}\n -> Output: {output_file}")
+    
+    cmd = [
+        "ffmpeg",
+        "-i", video_path,
+        "-i", audio_path,
+        "-c", "copy",
+        "-y",
+        output_file
+    ]
+    try:
+        subprocess.run(cmd, check=True)
+        print("Merge completed ✅")
+        os.remove(video_path)
+        os.remove(audio_path)
+        print("Original files deleted 🗑️\n")
+    except subprocess.CalledProcessError as e:
+        print("Merge failed ❌", e)
 
-@app.route("/merge", methods=["POST"])
-def merge_route():
-    data = request.json
-    msg = merge_files(data["video"], data["audio"])
-    return jsonify({"msg": msg})
+def main():
+    while True:
+        merge_list = scan_files()
+        if not merge_list:
+            print("No mergeable files found! Waiting 10s...")
+            time.sleep(10)
+            continue
+        for video, audio in merge_list:
+            merge_files(video, audio)
+        time.sleep(5)
 
-if __name__=="__main__":
-    print(f"Server running on http://0.0.0.0:{PORT}")
-    app.run(host="0.0.0.0", port=PORT)
+if __name__ == "__main__":
+    print(f"Scanning folder: {FOLDER}")
+    print(f"Merged output folder: {MERGED_FOLDER}\n")
+    main()
