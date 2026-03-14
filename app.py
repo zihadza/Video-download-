@@ -4,14 +4,14 @@ import subprocess
 app = Flask(__name__)
 
 PORT = 3030
-SAVE_PATH = "/storage/emulated/0/Zihad/%(title)s.webm"
+SAVE_PATH = "/storage/emulated/0/Zihad/%(title)s.%(ext)s"
 
 HTML = """
 <!DOCTYPE html>
 <html>
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>WebM Video Downloader</title>
+<title>Video Downloader</title>
 
 <style>
 body{
@@ -73,7 +73,7 @@ max-height:250px;
 <option value="1080">1080p</option>
 </select>
 
-<button type="submit">Download WebM</button>
+<button type="submit">Download</button>
 
 </form>
 
@@ -102,7 +102,7 @@ def home():
 
             cmd=[
             "yt-dlp",
-            "-f",f"best[ext=webm][height<={quality}]",
+            "-f",f"bestvideo[ext=webm][height<={quality}]/best[ext=webm]/best",
             "--no-part",
             "-o",SAVE_PATH,
             url
@@ -113,7 +113,6 @@ def home():
             log=result.stdout + result.stderr
 
         except Exception as e:
-
             log=str(e)
 
     return render_template_string(HTML,log=log)
