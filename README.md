@@ -40,7 +40,7 @@ pip install --upgrade pip
 # Install required Python packages
 pip install flask
 pip install yt-dlp
-
+```bash
 2️⃣ Clone Project
 Bash
 Copy code
