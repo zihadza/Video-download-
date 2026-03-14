@@ -63,10 +63,11 @@ max-height:200px;
 
 <form method="POST">
 
-<input name="url" placeholder="(Youtube-link)Paste video URL Youtube" required>
+<input name="url" placeholder="Paste Video URL" required>
 
 <select name="quality">
 <option value="360">360p</option>
+<option value="480">480p</option>
 <option value="720">720p</option>
 <option value="1080">1080p</option>
 </select>
@@ -119,6 +120,7 @@ def home():
                 cmd=[
                 "yt-dlp",
                 "-f",f"bestvideo[height<={quality}]+bestaudio/best",
+                "--merge-output-format","mp4",
                 "-o",SAVE_PATH,
                 url
                 ]
