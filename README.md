@@ -20,36 +20,23 @@ Download YouTube videos in multiple resolutions with a simple web interface.
 
 ---
 
-## 🛠 Installation & Setup
+## 🛠 Step-by-Step Installation & Setup
 
-Copy and paste each block in terminal:
+### 1️⃣ Update & Install Packages
 
 ```bash
-# 1️⃣ Update Termux / Linux
+# Update Termux / Linux
 pkg update && pkg upgrade -y
+
+# Install Python & Git
 pkg install python git -y
 
-# 2️⃣ Install Python packages
-pip install --upgrade pip
-pip install flask
-pip install yt-dlp
-
-# 3️⃣ Optional: Install NodeJS
+# Optional: NodeJS for full YouTube extraction
 pkg install nodejs -y
 
-# 4️⃣ Prepare folders
-mkdir -p /storage/emulated/0/Zihad
-cd /storage/emulated/0/Zihad
+# Upgrade pip
+pip install --upgrade pip
 
-# 5️⃣ Remove old copy if exists
-rm -rf Video-download-
-
-# 6️⃣ Clone the GitHub repo
-git clone https://github.com/zihadza/Video-download-.git
-cd Video-download-
-
-# 7️⃣ Run the server
-python app.py
-
-# 8️⃣ Open in browser
-http://localhost:3030
+# Install required Python packages
+pip install flask
+pip install yt-dlp
