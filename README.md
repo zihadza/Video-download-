@@ -57,3 +57,13 @@ rm -rf Video-download-
 # Clone GitHub repo
 git clone https://github.com/zihadza/Video-download-.git
 cd Video-download-
+```
+🛠 Step 3️⃣: Run Python Server
+Bash
+Copy code
+# Run the Flask app
+```bash
+python app.py
+```
+⚠️ Make sure port 3030 is free.
+Optional: NodeJS recommended for better YouTube extraction.
