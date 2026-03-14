@@ -4,7 +4,7 @@ import subprocess
 app = Flask(__name__)
 
 PORT = 3030
-SAVE_PATH = "/storage/emulated/0/Zihad/%(title)s.%(ext)s"
+SAVE_PATH = "/storage/emulated/0/Zihad/%(title)s.webm"
 
 HTML = """
 <!DOCTYPE html>
@@ -102,8 +102,7 @@ def home():
 
             cmd=[
             "yt-dlp",
-            "-f",f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]",
-            "--merge-output-format","webm",
+            "-f",f"best[ext=webm][height<={quality}]",
             "--no-part",
             "-o",SAVE_PATH,
             url
