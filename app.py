@@ -4,14 +4,14 @@ import subprocess
 app = Flask(__name__)
 
 PORT = 3030
-SAVE_PATH = "/storage/emulated/0/Zihad/%(title)s.%(ext)s"
+SAVE_PATH = "/storage/emulated/0/Zihad/%(title)s.webm"
 
 HTML = """
 <!DOCTYPE html>
 <html>
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Media Downloader</title>
+<title>WebM Video Downloader</title>
 
 <style>
 body{
@@ -59,7 +59,7 @@ max-height:200px;
 <body>
 
 <div class="box">
-<h2>Media Downloader</h2>
+<h2>WebM Video Downloader</h2>
 
 <form method="POST">
 
@@ -72,12 +72,7 @@ max-height:200px;
 <option value="1080">1080p</option>
 </select>
 
-<select name="type">
-<option value="video">Video</option>
-<option value="mp3">MP3</option>
-</select>
-
-<button type="submit">Download</button>
+<button type="submit">Download WebM</button>
 
 </form>
 
@@ -101,30 +96,17 @@ def home():
 
         url=request.form["url"]
         quality=request.form["quality"]
-        dtype=request.form["type"]
 
         try:
 
-            if dtype=="mp3":
-
-                cmd=[
-                "yt-dlp",
-                "-x",
-                "--audio-format","mp3",
-                "-o",SAVE_PATH,
-                url
-                ]
-
-            else:
-
-                cmd=[
-                "yt-dlp",
-                "-f",f"bestvideo[height<={quality}][ext=webm]+bestaudio[ext=webm]/best[ext=webm]",
-                "--merge-output-format","webm",
-                "--no-part",
-                "-o",SAVE_PATH,
-                url
-                ]
+            cmd=[
+            "yt-dlp",
+            "-f",f"bestvideo[ext=webm][height<={quality}]+bestaudio[ext=webm]/best[ext=webm]",
+            "--merge-output-format","webm",
+            "--no-part",
+            "-o",SAVE_PATH,
+            url
+            ]
 
             result=subprocess.run(cmd,capture_output=True,text=True)
 
