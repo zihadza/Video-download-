@@ -3,7 +3,7 @@ import os, subprocess, re
 
 app = Flask(__name__)
 PORT = 5050
-FOLDER = os.path.dirname(os.path.abspath(__file__))
+FOLDER = "/storage/emulated/0/Zihad"
 FFMPEG = "ffmpeg"
 
 HTML = """
@@ -56,10 +56,9 @@ def scan_files():
     videos = {}
     audios = {}
     for f in files:
-        if f.endswith(".temp.webm"):  # ignore temp files
+        if f.endswith(".temp.webm"):
             continue
         name, ext = os.path.splitext(f)
-        # remove .f12345a or .f12345v pattern from name
         name_clean = re.sub(r'\.f\d+[av]$', '', name)
         if ext.lower() in [".mp4",".webm",".mkv"]:
             videos[name_clean] = f
@@ -89,9 +88,9 @@ def index():
 @app.route("/merge",methods=["POST"])
 def merge_route():
     data = request.json
-    msg = merge_files(data["video"],data["audio"])
+    msg = merge_files(data["video"], data["audio"])
     return jsonify({"msg":msg})
 
 if __name__=="__main__":
     print(f"Server running on http://0.0.0.0:{PORT}")
-    app.run(host="0.0.0.0",port=PORT)
+    app.run(host="0.0.0.0", port=PORT)
