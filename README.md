@@ -43,11 +43,12 @@ pip install --upgrade pip
 pip install flask
 pip install yt-dlp
 ```
-```bash
+
 🛠 Step 2️⃣: Clone Project
 Bash
 Copy code
 # Prepare Zihad folder
+```bash
 mkdir -p /storage/emulated/0/Zihad
 cd /storage/emulated/0/Zihad
 
@@ -67,3 +68,9 @@ python app.py
 ```
 ⚠️ Make sure port 3030 is free.
 Optional: NodeJS recommended for better YouTube extraction.
+
+🛠 Step 4️⃣: Open in Browser
+Plain text
+Copy code
+```bash
+http://localhost:3030
