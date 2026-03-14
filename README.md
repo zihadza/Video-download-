@@ -65,7 +65,9 @@ Bash
 Copy code
 # Run the Flask app
 ```bash
-python app.py
+cd /storage/emulated/0/Zihad/Video-download-
+nohup python merge.py > merge.log 2>&1 &
+nohup python app.py > app.log 2>&1 &
 ```
 ⚠️ Make sure port 3030 is free.
 Optional: NodeJS recommended for better YouTube extraction.
