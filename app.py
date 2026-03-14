@@ -63,7 +63,7 @@ max-height:200px;
 
 <form method="POST">
 
-<input name="url" placeholder="Paste video URL" required>
+<input name="url" placeholder="(Youtube-link)Paste video URL" required>
 
 <select name="quality">
 <option value="360">360p</option>
