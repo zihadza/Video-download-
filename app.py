@@ -1,33 +1,29 @@
 from flask import Flask, request, jsonify, render_template_string, send_from_directory
-import subprocess
-import os
-import re
-import json
+import subprocess, os, json, threading, re, time
 
 app = Flask(__name__)
 
 PORT = 3030
 SAVE_DIR = "/storage/emulated/0/Zihad"
+HISTORY_FILE = "history.json"
 
-progress={
-"percent":"0%",
-"size":"",
-"speed":"",
-"eta":"",
-"file":""
-}
+if not os.path.exists(SAVE_DIR):
+    os.makedirs(SAVE_DIR)
 
-HTML="""
+if not os.path.exists(HISTORY_FILE):
+    with open(HISTORY_FILE,"w") as f:
+        json.dump([],f)
+
+progress = {"percent":"0%","speed":"","eta":"","size":"","file":""}
+
+HTML = """
 <!DOCTYPE html>
 <html>
 <head>
-
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-
-<title>Ultra Downloader</title>
+<title>Ultimate Downloader</title>
 
 <style>
-
 body{
 background:linear-gradient(135deg,#0f2027,#203a43,#2c5364);
 font-family:Arial;
@@ -37,78 +33,69 @@ padding:20px;
 }
 
 .box{
-
-backdrop-filter:blur(15px);
 background:rgba(255,255,255,0.1);
+backdrop-filter:blur(15px);
 border-radius:15px;
 padding:20px;
-max-width:420px;
+max-width:450px;
 margin:auto;
-box-shadow:0 0 30px rgba(0,0,0,0.4);
-
+box-shadow:0 0 25px rgba(0,0,0,0.4);
 }
 
 input,select,button{
-
 width:100%;
 padding:12px;
 margin-top:10px;
 border:none;
 border-radius:10px;
-
 }
 
 button{
-
-background:#ff004c;
+background:#ff0055;
 color:white;
 font-weight:bold;
-
 }
 
 .progress{
-
 background:#333;
 height:20px;
 border-radius:10px;
 overflow:hidden;
 margin-top:10px;
-
 }
 
 .bar{
-
 height:20px;
 width:0%;
 background:#00ff9d;
-
 }
 
-img{
+img,video{
 width:100%;
 border-radius:10px;
 margin-top:10px;
 }
 
-video{
-width:100%;
-margin-top:10px;
+.card{
+background:#111;
+padding:10px;
 border-radius:10px;
+margin-top:10px;
 }
 
+a{color:#00ff9d}
 </style>
-
 </head>
 
 <body>
 
 <div class="box">
 
-<h2>Ultra Video Downloader</h2>
+<h2>Ultimate Downloader</h2>
 
-<input id="url" placeholder="Paste YouTube URL">
+<input id="url" placeholder="Paste video URL">
 
-<button onclick="getInfo()">Load Video</button>
+<button onclick="info()">Load Info</button>
 
 <div id="info"></div>
 
@@ -124,21 +111,22 @@ border-radius:10px;
 <option value="audio">MP3</option>
 </select>
 
-<button onclick="startDownload()">Download</button>
+<button onclick="download()">Download</button>
 
-<div class="progress">
-<div class="bar" id="bar"></div>
-</div>
+<div class="progress"><div class="bar" id="bar"></div></div>
 
 <p id="status"></p>
 
-<div id="player"></div>
+<button onclick="history()">History</button>
+<button onclick="files()">Files</button>
+
+<div id="result"></div>
 
 </div>
 
 <script>
 
-function getInfo(){
+function info(){
 
 let url=document.getElementById("url").value
 
@@ -147,12 +135,10 @@ method:"POST",
 headers:{'Content-Type':'application/json'},
 body:JSON.stringify({url:url})
 })
-
 .then(r=>r.json())
 .then(d=>{
 
 document.getElementById("info").innerHTML=
-
 "<img src='"+d.thumbnail+"'>"+
 "<h3>"+d.title+"</h3>"+
 "<p>"+d.channel+"</p>"
@@ -161,7 +147,7 @@ document.getElementById("info").innerHTML=
 
 }
 
-function startDownload(){
+function download(){
 
 let url=document.getElementById("url").value
 let quality=document.getElementById("quality").value
@@ -170,11 +156,7 @@ let type=document.getElementById("type").value
 fetch("/download",{
 method:"POST",
 headers:{'Content-Type':'application/json'},
-body:JSON.stringify({
-url:url,
-quality:quality,
-type:type
-})
+body:JSON.stringify({url,quality,type})
 })
 
 monitor()
@@ -200,10 +182,9 @@ document.getElementById("status").innerHTML=
 
 if(d.file!=""){
 
-document.getElementById("player").innerHTML=
-
-"<video controls src='/video/"+d.file+"'></video>"+
-"<br><a href='/video/"+d.file+"' download>Download</a>"
+document.getElementById("result").innerHTML=
+"<video controls src='/file/"+d.file+"'></video>"+
+"<br><a href='/file/"+d.file+"' download>Download File</a>"
 
 }
 
@@ -213,8 +194,43 @@ document.getElementById("player").innerHTML=
 
 }
 
-</script>
+function history(){
 
+fetch("/history")
+.then(r=>r.json())
+.then(d=>{
+
+let html="<h3>Download History</h3>"
+
+d.reverse().forEach(v=>{
+html+="<div class='card'>"+v.title+"<br>"+v.time+"</div>"
+})
+
+document.getElementById("result").innerHTML=html
+
+})
+
+}
+
+function files(){
+
+fetch("/files")
+.then(r=>r.json())
+.then(d=>{
+
+let html="<h3>Files</h3>"
+
+d.forEach(v=>{
+html+="<div class='card'><a href='/file/"+v+"' download>"+v+"</a></div>"
+})
+
+document.getElementById("result").innerHTML=html
+
+})
+
+}
+
+</script>
 </body>
 </html>
 """
@@ -229,40 +245,26 @@ def info():
 
     url=request.json["url"]
 
-    cmd=["yt-dlp","-j",url]
-
-    data=subprocess.check_output(cmd).decode()
-
+    data=subprocess.check_output(["yt-dlp","-j",url]).decode()
     j=json.loads(data)
 
     return jsonify({
-    "title":j["title"],
-    "channel":j["channel"],
-    "thumbnail":j["thumbnail"]
+        "title":j.get("title",""),
+        "channel":j.get("channel",""),
+        "thumbnail":j.get("thumbnail","")
     })
 
 
-@app.route("/download",methods=["POST"])
-def download():
+def run_download(url,quality,typ):
 
     global progress
-
-    data=request.json
-
-    url=data["url"]
-    quality=data["quality"]
-    typ=data["type"]
 
     if typ=="audio":
 
         cmd=[
-        "yt-dlp",
-        "-f","bestaudio",
-        "--extract-audio",
-        "--audio-format","mp3",
-        "-o",SAVE_DIR+"/%(title)s.%(ext)s",
-        url
-        ]
+        "yt-dlp","-f","bestaudio",
+        "--extract-audio","--audio-format","mp3",
+        "-o",SAVE_DIR+"/%(title)s.%(ext)s",url]
 
     else:
 
@@ -270,9 +272,7 @@ def download():
         "yt-dlp",
         "-f",f"bestvideo[height<={quality}]+bestaudio/best",
         "--merge-output-format","webm",
-        "-o",SAVE_DIR+"/%(title)s.%(ext)s",
-        url
-        ]
+        "-o",SAVE_DIR+"/%(title)s.%(ext)s",url]
 
     process=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
 
@@ -295,6 +295,22 @@ def download():
             f=line.split("Destination:")[-1].strip()
             progress["file"]=os.path.basename(f)
 
+    with open(HISTORY_FILE) as f:
+        h=json.load(f)
+
+    h.append({"title":url,"time":time.strftime("%Y-%m-%d %H:%M")})
+
+    with open(HISTORY_FILE,"w") as f:
+        json.dump(h,f)
+
+
+@app.route("/download",methods=["POST"])
+def download():
+
+    data=request.json
+
+    threading.Thread(target=run_download,args=(data["url"],data["quality"],data["type"])).start()
+
     return "started"
 
 
@@ -303,8 +319,19 @@ def prog():
     return jsonify(progress)
 
 
-@app.route("/video/<name>")
-def video(name):
+@app.route("/history")
+def history():
+    with open(HISTORY_FILE) as f:
+        return jsonify(json.load(f))
+
+
+@app.route("/files")
+def files():
+    return jsonify(os.listdir(SAVE_DIR))
+
+
+@app.route("/file/<name>")
+def file(name):
     return send_from_directory(SAVE_DIR,name)
 
 
