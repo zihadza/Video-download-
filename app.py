@@ -119,8 +119,9 @@ def home():
 
                 cmd=[
                 "yt-dlp",
-                "-f",f"bestvideo[height<={quality}]+bestaudio/best",
-                "--merge-output-format","mp4",
+                "-f",f"bestvideo[height<={quality}][ext=webm]+bestaudio[ext=webm]/best[ext=webm]",
+                "--merge-output-format","webm",
+                "--no-part",
                 "-o",SAVE_PATH,
                 url
                 ]
