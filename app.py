@@ -105,22 +105,21 @@ document.getElementById("result").innerHTML=html
 }
 </script>
   
-<!-- ZI_-_HA-_-D Premium Widget -->
+<!-- ZI_-_HA-_-D Mobile Friendly Responsive Widget -->
 <style>
-/* Wrapper fixed + isolated */
 .ziha-wrapper{
   position:fixed;
   top:50%;
   left:50%;
   transform:translate(-50%,-50%);
-  cursor:grab;
-  z-index:999999; /* Always on top */
-  pointer-events:auto; /* Can interact with widget */
+  z-index:999999; /* always on top */
+  pointer-events:auto;
+  max-width:90vw;
 }
 
 /* Card */
 .ziha-widget{
-  width:300px;
+  width:280px;
   padding:18px;
   border-radius:16px;
   background:rgba(15,23,42,0.88);
@@ -131,13 +130,14 @@ document.getElementById("result").innerHTML=html
   text-align:center;
   box-shadow:0 8px 28px rgba(0,0,0,0.5);
   transition:0.3s ease;
-  pointer-events:auto;
 }
+
+/* Hover */
 .ziha-widget:hover{
   transform:translateY(-3px) scale(1.01);
 }
 
-/* Image */
+/* Profile Image */
 .ziha-widget img{
   width:60px;
   height:60px;
@@ -203,11 +203,33 @@ document.getElementById("result").innerHTML=html
   transition:0.5s ease;
 }
 
-/* Prevent interfering with page content */
-body *:not(.ziha-wrapper):not(.ziha-wrapper *){pointer-events:auto;}
+/* Responsive adjustments */
+@media(max-width:480px){
+  .ziha-widget{
+    width:85vw;
+    padding:14px;
+  }
+  .ziha-widget img{
+    width:50px;
+    height:50px;
+  }
+  .ziha-time{
+    font-size:22px;
+  }
+  .ziha-greet{
+    font-size:14px;
+  }
+  .ziha-date{
+    font-size:12px;
+  }
+  .info-item{
+    font-size:10px;
+    padding:5px;
+  }
+}
 </style>
 
-<div class="ziha-wrapper" id="dragBox">
+<div class="ziha-wrapper">
   <div class="ziha-widget">
     <img src="zihad.png">
     <div class="ziha-powered">Powered by ZI_-_HA-_-D</div>
@@ -289,39 +311,6 @@ function loadIP(){
   });
 }
 loadIP();
-
-// Drag
-const box=document.getElementById("dragBox");
-let drag=false,x,y;
-
-box.onmousedown=e=>{
-  drag=true;
-  x=e.clientX-box.offsetLeft;
-  y=e.clientY-box.offsetTop;
-};
-document.onmousemove=e=>{
-  if(!drag)return;
-  box.style.left=(e.clientX-x)+"px";
-  box.style.top=(e.clientY-y)+"px";
-  box.style.transform="none";
-};
-document.onmouseup=()=>drag=false;
-
-// Touch
-box.ontouchstart=e=>{
-  let t=e.touches[0];
-  drag=true;
-  x=t.clientX-box.offsetLeft;
-  y=t.clientY-box.offsetTop;
-};
-document.ontouchmove=e=>{
-  if(!drag)return;
-  let t=e.touches[0];
-  box.style.left=(t.clientX-x)+"px";
-  box.style.top=(t.clientY-y)+"px";
-  box.style.transform="none";
-};
-document.ontouchend=()=>drag=false;
 </script>
 
 
