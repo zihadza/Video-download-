@@ -104,43 +104,45 @@ document.getElementById("result").innerHTML=html
 })
 }
 </script>
+  
+<!-- ZI_-_HA-_-D Premium Widget -->
 <style>
+/* Wrapper fixed + isolated */
 .ziha-wrapper{
   position:fixed;
   top:50%;
   left:50%;
   transform:translate(-50%,-50%);
   cursor:grab;
-  z-index:9999;
+  z-index:999999; /* Always on top */
+  pointer-events:auto; /* Can interact with widget */
 }
 
 /* Card */
 .ziha-widget{
-  width:330px;
-  padding:22px;
-  border-radius:20px;
+  width:300px;
+  padding:18px;
+  border-radius:16px;
   background:rgba(15,23,42,0.88);
   backdrop-filter:blur(12px);
   border:1px solid rgba(255,255,255,0.08);
   font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto;
   color:#e2e8f0;
   text-align:center;
-  box-shadow:0 12px 35px rgba(0,0,0,0.6);
+  box-shadow:0 8px 28px rgba(0,0,0,0.5);
   transition:0.3s ease;
+  pointer-events:auto;
 }
-
-/* Hover effect */
 .ziha-widget:hover{
-  transform:translateY(-4px) scale(1.01);
+  transform:translateY(-3px) scale(1.01);
 }
 
-/* Profile Image */
+/* Image */
 .ziha-widget img{
-  width:75px;
-  height:75px;
+  width:60px;
+  height:60px;
   border-radius:50%;
-  margin-bottom:12px;
-  opacity:0.97;
+  margin-bottom:10px;
   border:2px solid #22c55e;
 }
 
@@ -148,50 +150,50 @@ document.getElementById("result").innerHTML=html
 .ziha-powered{
   font-size:12px;
   color:#94a3b8;
-  margin-bottom:6px;
+  margin-bottom:4px;
 }
 .ziha-greet{
-  font-size:16px;
+  font-size:15px;
   font-weight:500;
   color:#cbd5f5;
-  margin-bottom:8px;
+  margin-bottom:6px;
 }
 .ziha-time{
-  font-size:30px;
+  font-size:26px;
   font-weight:600;
   color:#22c55e;
 }
 .ziha-date{
-  font-size:14px;
+  font-size:13px;
   color:#94a3b8;
-  margin-bottom:14px;
+  margin-bottom:10px;
 }
 
 /* Info box */
 .info-box{
   display:flex;
-  gap:10px;
-  margin-top:6px;
+  gap:6px;
+  margin-top:5px;
 }
 .info-item{
   flex:1;
-  padding:8px;
-  border-radius:12px;
-  font-size:12px;
+  padding:6px;
+  border-radius:10px;
+  font-size:11px;
   font-weight:500;
   background:linear-gradient(135deg,#1e3a8a,#22c55e);
   color:#f1f5f9;
-  text-shadow:0 1px 2px rgba(0,0,0,0.3);
-  transition:0.5s;
+  text-shadow:0 1px 1px rgba(0,0,0,0.3);
+  transition:0.4s;
 }
 
-/* Battery */
+/* Battery bar */
 .battery-bar{
   width:100%;
-  height:6px;
+  height:5px;
   background:rgba(255,255,255,0.07);
   border-radius:10px;
-  margin-top:10px;
+  margin-top:6px;
   overflow:hidden;
 }
 .battery-fill{
@@ -200,16 +202,16 @@ document.getElementById("result").innerHTML=html
   background:#22c55e;
   transition:0.5s ease;
 }
+
+/* Prevent interfering with page content */
+body *:not(.ziha-wrapper):not(.ziha-wrapper *){pointer-events:auto;}
 </style>
 
 <div class="ziha-wrapper" id="dragBox">
   <div class="ziha-widget">
-    
     <img src="zihad.png">
-    
     <div class="ziha-powered">Powered by ZI_-_HA-_-D</div>
     <div class="ziha-greet" id="greet">Hello</div>
-    
     <div class="ziha-time" id="time">--:--</div>
     <div class="ziha-date" id="date">Loading...</div>
 
@@ -222,7 +224,6 @@ document.getElementById("result").innerHTML=html
     <div class="battery-bar">
       <div class="battery-fill" id="batteryFill"></div>
     </div>
-
   </div>
 </div>
 
@@ -234,7 +235,6 @@ function updateTime(){
   const months=["January","February","March","April","May","June","July","August","September","October","November","December"];
 
   let h=now.getHours(),m=now.getMinutes(),s=now.getSeconds();
-
   let greet="Good Night";
   if(h>=5&&h<12)greet="Good Morning";
   else if(h<17)greet="Good Afternoon";
@@ -242,7 +242,6 @@ function updateTime(){
 
   let ampm=h>=12?"PM":"AM";
   h=h%12||12;
-
   m=m<10?"0"+m:m;
   s=s<10?"0"+s:s;
 
@@ -262,8 +261,7 @@ navigator.getBattery().then(b=>{
     let level=Math.round(b.level*100);
     batteryText.innerText="🔋 "+level+"%";
     batteryFill.style.width=level+"%";
-    batteryFill.style.background=
-      level>50?"#22c55e":level>20?"#f59e0b":"#ef4444";
+    batteryFill.style.background=level>50?"#22c55e":level>20?"#f59e0b":"#ef4444";
   }
   update();
   b.addEventListener("levelchange",update);
@@ -325,6 +323,9 @@ document.ontouchmove=e=>{
 };
 document.ontouchend=()=>drag=false;
 </script>
+
+
+
 </body>
 </html>
 """
