@@ -104,6 +104,227 @@ document.getElementById("result").innerHTML=html
 })
 }
 </script>
+<style>
+.ziha-wrapper{
+  position:fixed;
+  top:50%;
+  left:50%;
+  transform:translate(-50%,-50%);
+  cursor:grab;
+  z-index:9999;
+}
+
+/* Card */
+.ziha-widget{
+  width:330px;
+  padding:22px;
+  border-radius:20px;
+  background:rgba(15,23,42,0.88);
+  backdrop-filter:blur(12px);
+  border:1px solid rgba(255,255,255,0.08);
+  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto;
+  color:#e2e8f0;
+  text-align:center;
+  box-shadow:0 12px 35px rgba(0,0,0,0.6);
+  transition:0.3s ease;
+}
+
+/* Hover effect */
+.ziha-widget:hover{
+  transform:translateY(-4px) scale(1.01);
+}
+
+/* Profile Image */
+.ziha-widget img{
+  width:75px;
+  height:75px;
+  border-radius:50%;
+  margin-bottom:12px;
+  opacity:0.97;
+  border:2px solid #22c55e;
+}
+
+/* Text */
+.ziha-powered{
+  font-size:12px;
+  color:#94a3b8;
+  margin-bottom:6px;
+}
+.ziha-greet{
+  font-size:16px;
+  font-weight:500;
+  color:#cbd5f5;
+  margin-bottom:8px;
+}
+.ziha-time{
+  font-size:30px;
+  font-weight:600;
+  color:#22c55e;
+}
+.ziha-date{
+  font-size:14px;
+  color:#94a3b8;
+  margin-bottom:14px;
+}
+
+/* Info box */
+.info-box{
+  display:flex;
+  gap:10px;
+  margin-top:6px;
+}
+.info-item{
+  flex:1;
+  padding:8px;
+  border-radius:12px;
+  font-size:12px;
+  font-weight:500;
+  background:linear-gradient(135deg,#1e3a8a,#22c55e);
+  color:#f1f5f9;
+  text-shadow:0 1px 2px rgba(0,0,0,0.3);
+  transition:0.5s;
+}
+
+/* Battery */
+.battery-bar{
+  width:100%;
+  height:6px;
+  background:rgba(255,255,255,0.07);
+  border-radius:10px;
+  margin-top:10px;
+  overflow:hidden;
+}
+.battery-fill{
+  height:100%;
+  width:50%;
+  background:#22c55e;
+  transition:0.5s ease;
+}
+</style>
+
+<div class="ziha-wrapper" id="dragBox">
+  <div class="ziha-widget">
+    
+    <img src="zihad.png">
+    
+    <div class="ziha-powered">Powered by ZI_-_HA-_-D</div>
+    <div class="ziha-greet" id="greet">Hello</div>
+    
+    <div class="ziha-time" id="time">--:--</div>
+    <div class="ziha-date" id="date">Loading...</div>
+
+    <div class="info-box">
+      <div class="info-item" id="batteryText">🔋 --%</div>
+      <div class="info-item" id="net">🌐 --</div>
+      <div class="info-item" id="ip">🌍 --</div>
+    </div>
+
+    <div class="battery-bar">
+      <div class="battery-fill" id="batteryFill"></div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+// Time
+function updateTime(){
+  const now=new Date();
+  const days=["রবি","সোম","মঙ্গল","বুধ","বৃহস্পতি","শুক্র","শনি"];
+  const months=["January","February","March","April","May","June","July","August","September","October","November","December"];
+
+  let h=now.getHours(),m=now.getMinutes(),s=now.getSeconds();
+
+  let greet="Good Night";
+  if(h>=5&&h<12)greet="Good Morning";
+  else if(h<17)greet="Good Afternoon";
+  else if(h<20)greet="Good Evening";
+
+  let ampm=h>=12?"PM":"AM";
+  h=h%12||12;
+
+  m=m<10?"0"+m:m;
+  s=s<10?"0"+s:s;
+
+  time.innerText=`${h}:${m}:${s} ${ampm}`;
+  date.innerText=`${days[now.getDay()]}, ${now.getDate()} ${months[now.getMonth()]}`;
+  greetEl.innerText=greet;
+}
+const time=document.getElementById("time");
+const date=document.getElementById("date");
+const greetEl=document.getElementById("greet");
+setInterval(updateTime,1000);
+updateTime();
+
+// Battery
+navigator.getBattery().then(b=>{
+  function update(){
+    let level=Math.round(b.level*100);
+    batteryText.innerText="🔋 "+level+"%";
+    batteryFill.style.width=level+"%";
+    batteryFill.style.background=
+      level>50?"#22c55e":level>20?"#f59e0b":"#ef4444";
+  }
+  update();
+  b.addEventListener("levelchange",update);
+});
+
+// Internet
+function net(){
+  document.getElementById("net").innerText=
+    navigator.onLine?"🌐 Online":"Offline";
+}
+window.addEventListener("online",net);
+window.addEventListener("offline",net);
+net();
+
+// IP fallback
+function loadIP(){
+  fetch("https://api.ipify.org?format=json")
+  .then(r=>r.json())
+  .then(d=>{document.getElementById("ip").innerText="🌍 "+d.ip;})
+  .catch(()=>{
+    fetch("https://api64.ipify.org?format=json")
+    .then(r=>r.json())
+    .then(d=>{document.getElementById("ip").innerText="🌍 "+d.ip;})
+    .catch(()=>{document.getElementById("ip").innerText="🌍 N/A";});
+  });
+}
+loadIP();
+
+// Drag
+const box=document.getElementById("dragBox");
+let drag=false,x,y;
+
+box.onmousedown=e=>{
+  drag=true;
+  x=e.clientX-box.offsetLeft;
+  y=e.clientY-box.offsetTop;
+};
+document.onmousemove=e=>{
+  if(!drag)return;
+  box.style.left=(e.clientX-x)+"px";
+  box.style.top=(e.clientY-y)+"px";
+  box.style.transform="none";
+};
+document.onmouseup=()=>drag=false;
+
+// Touch
+box.ontouchstart=e=>{
+  let t=e.touches[0];
+  drag=true;
+  x=t.clientX-box.offsetLeft;
+  y=t.clientY-box.offsetTop;
+};
+document.ontouchmove=e=>{
+  if(!drag)return;
+  let t=e.touches[0];
+  box.style.left=(t.clientX-x)+"px";
+  box.style.top=(t.clientY-y)+"px";
+  box.style.transform="none";
+};
+document.ontouchend=()=>drag=false;
+</script>
 </body>
 </html>
 """
