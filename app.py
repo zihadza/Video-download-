@@ -103,13 +103,13 @@ d.forEach(v=>{ html+="<div class='card'><a href='/file/"+v+"' download>"+v+"</a>
 document.getElementById("result").innerHTML=html
 })
 }
-</script>
-  
+</script></body>
+  <br><br><br><br><br><br><br><br><br><br><br><br><br><br>
 <!-- ZI_-_HA-_-D Mobile Friendly Responsive Widget -->
 <style>
 .ziha-wrapper{
   position:fixed;
-  top:90%;
+  top:85%;
   left:50%;
   transform:translate(-50%,-50%);
   z-index:999999; /* always on top */
@@ -315,7 +315,7 @@ loadIP();
 
 
 
-</body>
+
 </html>
 """
 
