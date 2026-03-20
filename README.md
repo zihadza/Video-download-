@@ -89,7 +89,7 @@ http://localhost:3030
 
 ---
 <p align="center">
-  <img src="images/logo.png" width="300"/>
+  <img src="Screenshot_2026-03-20-11-17-46-796_com.android.chrome.jpg" width="300"/>
 </p>
 ## ⚡ বৈশিষ্ট্যসমূহ
 
