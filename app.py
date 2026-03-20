@@ -109,7 +109,7 @@ document.getElementById("result").innerHTML=html
 <style>
 .ziha-wrapper{
   position:fixed;
-  top:50%;
+  top:90%;
   left:50%;
   transform:translate(-50%,-50%);
   z-index:999999; /* always on top */
