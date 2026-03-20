@@ -231,7 +231,7 @@ document.getElementById("result").innerHTML=html
 
 <div class="ziha-wrapper">
   <div class="ziha-widget">
-    <img src="https://github.com/zihadza/Video-download-/blob/9d7b01a7e12c4f815d607c9e20c435ea102072b3/zihad.png">
+    <img src="https://raw.githubusercontent.com/zihadza/Video-download-/9d7b01a7e12c4f815d607c9e20c435ea102072b3/zihad.png">
     <div class="ziha-powered">Powered by ZI_-_HA-_-D</div>
     <div class="ziha-greet" id="greet">Hello</div>
     <div class="ziha-time" id="time">--:--</div>
