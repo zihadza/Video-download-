@@ -109,7 +109,8 @@ http://localhost:3030
    - Merge হওয়া ভিডিও **original quality বজায় থাকে** এবং `.mp4` ফরম্যাটে থাকে।
 
 4. **File Location & Folder Structure:**
-   - সব ডাউনলোড করা ফাইল মূল ফোল্ডারে থাকে:  
+   - সব ডাউনলোড করা ফাইল মূল ফোল্ডারে থাকে:
+   - আপনি ফাইল লোকেশন চালু করুন এবং ফাইল কে অনুমোদন দিন 
      ```
      /storage/emulated/0/Zihad/Video-download-
      ```
