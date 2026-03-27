@@ -45,6 +45,7 @@ pip install --upgrade pip
 pip install flask
 pip install yt-dlp
 pkg install ffmpeg
+termux-setup-storage
 ```
 
 🛠 Step 2️⃣: Clone Project
