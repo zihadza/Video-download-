@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify, render_template_string, send_from_directory
-import subprocess, os, json, threading, re, time
+import subprocess, os, json, threading, re, time, urllib.parse
 
 app = Flask(__name__)
 
@@ -17,7 +17,7 @@ if not os.path.exists(HISTORY_FILE):
 
 progress = {"percent":"0%","speed":"","eta":"","size":"","file":""}
 
-HTML = """
+HTML = """ 
 <!DOCTYPE html>
 <html>
 <head>
@@ -180,10 +180,13 @@ document.getElementById("result").innerHTML=html
 def home():
     return render_template_string(HTML)
 
+# ✅ Fixed search route (multi-word)
 @app.route("/search", methods=["POST"])
 def search():
     query = request.json["query"]
-    url = f"https://www.googleapis.com/youtube/v3/search?part=snippet&q={query}&key={API_KEY}&maxResults=10&type=video"
+    encoded_query = urllib.parse.quote(query)  # encode spaces
+    url = f"https://www.googleapis.com/youtube/v3/search?part=snippet&q={encoded_query}&key={API_KEY}&maxResults=10&type=video&order=relevance"
+    
     data = json.loads(subprocess.check_output(["curl", url]).decode())
 
     videos = []
@@ -219,8 +222,14 @@ def run_download(url,quality,typ):
 
     for line in process.stdout:
         if "[download]" in line:
-            p=re.search(r'(\\d+\\.\\d+%)',line)
+            p=re.search(r'(\d+\.\d+%)',line)
+            s=re.search(r'of\s+(\S+)',line)
+            sp=re.search(r'at\s+(\S+)',line)
+            e=re.search(r'ETA\s+(\S+)',line)
             if p: progress["percent"]=p.group(1)
+            if s: progress["size"]=s.group(1)
+            if sp: progress["speed"]=sp.group(1)
+            if e: progress["eta"]=e.group(1)
 
         if "Destination:" in line:
             f=line.split("Destination:")[-1].strip()
@@ -257,4 +266,6 @@ def files():
 def file(name):
     return send_from_directory(SAVE_DIR,name)
 
-app.run(host="0.0.0.0", port=5050)
+# ✅ port changed to 6060
+if __name__=="__main__":
+    app.run(host="0.0.0.0", port=6060)
