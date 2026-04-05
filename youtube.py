@@ -17,27 +17,26 @@ if not os.path.exists(HISTORY_FILE):
 
 progress = {"percent":"0%","speed":"","eta":"","size":"","file":""}
 
-HTML = """ 
+HTML = """
 <!DOCTYPE html>
 <html>
 <head>
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Ultimate Downloader</title>
 <style>
-body{background:#0f2027;color:white;font-family:Arial;text-align:center}
+body{background:#0f2027;color:white;font-family:Arial;text-align:center;margin:0;padding:0;}
 .box{max-width:420px;margin:auto;padding:15px}
 input,button,select{width:100%;padding:10px;margin-top:8px;border-radius:8px;border:none}
-button{background:#ff0055;color:white}
+button{background:#ff0055;color:white;cursor:pointer}
 .card{background:#111;padding:10px;margin-top:10px;border-radius:10px}
 img{width:100%;border-radius:10px}
 .progress{background:#333;height:15px;border-radius:10px;margin-top:10px}
 .bar{height:15px;background:#00ff9d;width:0%}
+.video-container{margin-top:10px}
 </style>
 </head>
-
 <body>
 <div class="box">
-
 <h2>Ultimate Downloader</h2>
 
 <input id="search" placeholder="Search YouTube..." onkeyup="autoSearch()">
@@ -70,49 +69,67 @@ img{width:100%;border-radius:10px}
 
 <div id="result"></div>
 
+<div class="video-container" id="video-player"></div>
 </div>
 
 <script>
 let t
+let nextPageToken = null
+let loadingMore = false
+let currentQuery = ""
 
 function autoSearch(){
 clearTimeout(t)
-t=setTimeout(searchYT,500)
+t=setTimeout(()=>{
+    nextPageToken=null
+    document.getElementById("result").innerHTML=""
+    searchYT()
+},500)
 }
 
 function searchYT(){
-let q=document.getElementById("search").value
-
+let q=document.getElementById("search").value.trim()
+if(!q) return;
+currentQuery=q
 fetch("/search",{
 method:"POST",
 headers:{'Content-Type':'application/json'},
-body:JSON.stringify({query:q})
+body:JSON.stringify({query:q, pageToken: nextPageToken})
 })
 .then(r=>r.json())
 .then(d=>{
 let html=""
-d.forEach(v=>{
+d.items.forEach(v=>{
 html+=`
 <div class='card'>
 <img src="${v.thumbnail}">
 <h4>${v.title}</h4>
-<button onclick="play('${v.videoId}')">Play</button>
+<button onclick="play('${v.videoId}','${v.title}')">Play</button>
 <button onclick="setURL('${v.videoId}')">Use</button>
 </div>`
 })
-document.getElementById("result").innerHTML=html
+document.getElementById("result").insertAdjacentHTML('beforeend', html)
+nextPageToken=d.nextPageToken
+loadingMore=false
 })
 }
 
-function play(id){
-document.getElementById("result").innerHTML=
+window.onscroll = function() {
+    if ((window.innerHeight + window.scrollY) >= document.body.offsetHeight - 100 && !loadingMore && nextPageToken) {
+        loadingMore = true
+        searchYT()
+    }
+};
+
+function play(id,title){
+document.getElementById("video-player").innerHTML=
 `<iframe width="100%" height="250"
-src="https://www.youtube.com/embed/${id}" allowfullscreen></iframe>`
+src="https://www.youtube.com/embed/${id}?autoplay=1" allowfullscreen></iframe>`
+document.getElementById("url").value="https://www.youtube.com/watch?v="+id
 }
 
 function setURL(id){
-document.getElementById("url").value=
-"https://www.youtube.com/watch?v="+id
+document.getElementById("url").value="https://www.youtube.com/watch?v="+id
 }
 
 function info(){
@@ -144,7 +161,7 @@ document.getElementById("status").innerHTML=
 d.percent+" | "+d.size+" | "+d.speed+" | "+d.eta
 
 if(d.file!=""){
-document.getElementById("result").innerHTML=
+document.getElementById("video-player").innerHTML=
 "<video controls src='/file/"+d.file+"'></video>"
 }
 })
@@ -159,6 +176,7 @@ html+="<div class='card'>"+v.title+"</div>"
 })
 document.getElementById("result").innerHTML=html
 })
+
 }
 
 function files(){
@@ -180,13 +198,16 @@ document.getElementById("result").innerHTML=html
 def home():
     return render_template_string(HTML)
 
-# ✅ Fixed search route (multi-word)
 @app.route("/search", methods=["POST"])
 def search():
-    query = request.json["query"]
-    encoded_query = urllib.parse.quote(query)  # encode spaces
+    data = request.json
+    query = data.get("query","")
+    pageToken = data.get("pageToken","")
+    encoded_query = urllib.parse.quote(query)
     url = f"https://www.googleapis.com/youtube/v3/search?part=snippet&q={encoded_query}&key={API_KEY}&maxResults=10&type=video&order=relevance"
-    
+    if pageToken:
+        url += f"&pageToken={pageToken}"
+
     data = json.loads(subprocess.check_output(["curl", url]).decode())
 
     videos = []
@@ -197,7 +218,7 @@ def search():
             "thumbnail": item["snippet"]["thumbnails"]["high"]["url"]
         })
 
-    return jsonify(videos)
+    return jsonify({"items": videos, "nextPageToken": data.get("nextPageToken","")})
 
 @app.route("/info",methods=["POST"])
 def info():
@@ -266,6 +287,5 @@ def files():
 def file(name):
     return send_from_directory(SAVE_DIR,name)
 
-# ✅ port changed to 6060
 if __name__=="__main__":
-    app.run(host="0.0.0.0", port=6060)
+    app.run(host="0.0.0.0", port=7070)
