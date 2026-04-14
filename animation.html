@@ -1,0 +1,650 @@
+<!doctype html>
+<html lang="ru"> 
+ <head> 
+  <meta charset="UTF-8"> 
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"> 
+  <title>Дополнительные анимации</title> 
+  <link rel="stylesheet" href="styles.css"> 
+  <style>
+  * {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Arial', sans-serif;
+    background: #000;
+    color: white;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    overflow: hidden;
+}
+
+.controls {
+    position: fixed;
+    top: 20px;
+    display: flex;
+    gap: 10px;
+    z-index: 100;
+    flex-wrap: wrap;
+    justify-content: center;
+    max-width: 90%;
+}
+
+button {
+    background: rgba(255, 255, 255, 0.1);
+    color: white;
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    padding: 10px 20px;
+    border-radius: 30px;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    backdrop-filter: blur(5px);
+    font-size: 14px;
+    margin: 5px;
+}
+
+button:hover {
+    background: rgba(255, 255, 255, 0.2);
+    transform: translateY(-2px);
+    box-shadow: 0 5px 15px rgba(0, 0, 0, 0.3);
+}
+
+.animation-container {
+    position: relative;
+    width: 100%;
+    height: 100%;
+}
+
+canvas {
+    position: absolute;
+    top: 0;
+    left: 0;
+    width: 100%;
+    height: 100%;
+    display: block;
+}
+
+.animation-title {
+    position: fixed;
+    bottom: 40px;
+    left: 0;
+    width: 100%;
+    text-align: center;
+    font-size: 2.5rem;
+    font-weight: bold;
+    text-transform: uppercase;
+    letter-spacing: 3px;
+    color: white;
+    text-shadow: 0 0 10px currentColor;
+    opacity: 0;
+    transition: opacity 0.5s ease;
+    pointer-events: none;
+}
+
+.animation-title.visible {
+    opacity: 1;
+}
+
+@media (max-width: 768px) {
+    .controls {
+        top: 10px;
+    }
+    
+    button {
+        padding: 8px 15px;
+        font-size: 12px;
+    }
+    
+    .animation-title {
+        font-size: 1.5rem;
+        bottom: 20px;
+    }
+}
+  </style>
+  
+ </head> 
+ <body> 
+  <div class="controls"> <button data-animation="magnetic">Магнитные частицы</button> <button data-animation="fluid">Флюид арт</button> <button data-animation="neon">Неоновые линии</button> <button data-animation="geometric">Геометрический шторм</button> <button data-animation="ink">Чернильные капли</button> 
+  </div> 
+  <div class="animation-container"> 
+   <canvas id="canvas"></canvas> 
+   <div class="animation-title"></div> 
+  </div> 
+  <script>
+  document.addEventListener('DOMContentLoaded', function() {
+    const canvas = document.getElementById('canvas');
+    const ctx = canvas.getContext('2d');
+    const titleElement = document.querySelector('.animation-title');
+    const buttons = document.querySelectorAll('button');
+    
+    let currentAnimation = null;
+    let animationFrameId = null;
+    let mouseX = 0;
+    let mouseY = 0;
+    let isMouseDown = false;
+    
+    // Установка размеров canvas
+    function resizeCanvas() {
+        canvas.width = window.innerWidth;
+        canvas.height = window.innerHeight;
+        if (currentAnimation && currentAnimation.init) currentAnimation.init();
+    }
+    
+    window.addEventListener('resize', resizeCanvas);
+    resizeCanvas();
+    
+    // Отслеживание мыши
+    canvas.addEventListener('mousemove', function(e) {
+        mouseX = e.clientX;
+        mouseY = e.clientY;
+    });
+    
+    canvas.addEventListener('mousedown', function() {
+        isMouseDown = true;
+    });
+    
+    canvas.addEventListener('mouseup', function() {
+        isMouseDown = false;
+    });
+    
+    canvas.addEventListener('touchmove', function(e) {
+        e.preventDefault();
+        mouseX = e.touches[0].clientX;
+        mouseY = e.touches[0].clientY;
+    }, { passive: false });
+    
+    canvas.addEventListener('touchstart', function() {
+        isMouseDown = true;
+    });
+    
+    canvas.addEventListener('touchend', function() {
+        isMouseDown = false;
+    });
+    
+    // Анимации
+    const animations = {
+        magnetic: {
+            title: "Магнитные частицы",
+            particles: [],
+            init: function() {
+                this.particles = [];
+                const count = Math.floor((canvas.width * canvas.height) / 10000);
+                
+                for (let i = 0; i < count; i++) {
+                    this.particles.push({
+                        x: Math.random() * canvas.width,
+                        y: Math.random() * canvas.height,
+                        size: Math.random() * 3 + 1,
+                        color: `hsl(${Math.random() * 60 + 180}, 80%, 60%)`,
+                        vx: 0,
+                        vy: 0,
+                        angle: Math.random() * Math.PI * 2,
+                        speed: Math.random() * 0.2 + 0.1
+                    });
+                }
+            },
+            update: function() {
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.05)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                
+                this.particles.forEach(particle => {
+                    // Магнитное притяжение к курсору
+                    const dx = mouseX - particle.x;
+                    const dy = mouseY - particle.y;
+                    const distance = Math.sqrt(dx * dx + dy * dy);
+                    
+                    if (distance < 150 && isMouseDown) {
+                        const force = (150 - distance) / 50;
+                        particle.vx += dx / distance * force * 0.2;
+                        particle.vy += dy / distance * force * 0.2;
+                    }
+                    
+                    // Случайное движение
+                    particle.angle += (Math.random() - 0.5) * 0.2;
+                    particle.vx += Math.cos(particle.angle) * particle.speed * 0.1;
+                    particle.vy += Math.sin(particle.angle) * particle.speed * 0.1;
+                    
+                    // Трение
+                    particle.vx *= 0.95;
+                    particle.vy *= 0.95;
+                    
+                    // Обновление позиции
+                    particle.x += particle.vx;
+                    particle.y += particle.vy;
+                    
+                    // Границы
+                    if (particle.x < 0 || particle.x > canvas.width) particle.vx *= -1;
+                    if (particle.y < 0 || particle.y > canvas.height) particle.vy *= -1;
+                    
+                    // Отрисовка
+                    ctx.fillStyle = particle.color;
+                    ctx.beginPath();
+                    ctx.arc(particle.x, particle.y, particle.size, 0, Math.PI * 2);
+                    ctx.fill();
+                    
+                    // Соединение частиц
+                    this.particles.forEach(other => {
+                        const ox = other.x - particle.x;
+                        const oy = other.y - particle.y;
+                        const odistance = Math.sqrt(ox * ox + oy * oy);
+                        
+                        if (odistance < 100) {
+                            ctx.strokeStyle = `${particle.color.replace(')', `, ${1 - odistance / 100})`)}`;
+                            ctx.lineWidth = 0.5;
+                            ctx.beginPath();
+                            ctx.moveTo(particle.x, particle.y);
+                            ctx.lineTo(other.x, other.y);
+                            ctx.stroke();
+                        }
+                    });
+                });
+            }
+        },
+        
+        fluid: {
+            title: "Флюид арт",
+            cells: [],
+            columns: 0,
+            rows: 0,
+            cellSize: 20,
+            init: function() {
+                this.cellSize = Math.max(15, Math.min(30, canvas.width / 50));
+                this.columns = Math.ceil(canvas.width / this.cellSize) + 1;
+                this.rows = Math.ceil(canvas.height / this.cellSize) + 1;
+                this.cells = [];
+                
+                for (let y = 0; y < this.rows; y++) {
+                    for (let x = 0; x < this.columns; x++) {
+                        this.cells.push({
+                            x: x * this.cellSize,
+                            y: y * this.cellSize,
+                            vx: 0,
+                            vy: 0,
+                            px: x * this.cellSize,
+                            py: y * this.cellSize
+                        });
+                    }
+                }
+            },
+            update: function() {
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.1)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                
+                // Обновление скорости на основе положения мыши
+                const mouseCol = Math.floor(mouseX / this.cellSize);
+                const mouseRow = Math.floor(mouseY / this.cellSize);
+                
+                this.cells.forEach(cell => {
+                    // Влияние мыши
+                    const dx = mouseX - cell.x;
+                    const dy = mouseY - cell.y;
+                    const distance = Math.sqrt(dx * dx + dy * dy);
+                    
+                    if (distance < 200 && isMouseDown) {
+                        const force = (200 - distance) / 200;
+                        cell.vx += dx / distance * force * 2;
+                        cell.vy += dy / distance * force * 2;
+                    }
+                    
+                    // Трение
+                    cell.vx *= 0.9;
+                    cell.vy *= 0.9;
+                    
+                    // Сохранение предыдущей позиции
+                    cell.px = cell.x;
+                    cell.py = cell.y;
+                    
+                    // Обновление позиции
+                    cell.x += cell.vx;
+                    cell.y += cell.vy;
+                });
+                
+                // Отрисовка флюид-эффекта
+                ctx.lineWidth = 2;
+                
+                for (let y = 0; y < this.rows - 1; y++) {
+                    for (let x = 0; x < this.columns - 1; x++) {
+                        const i = y * this.columns + x;
+                        const cell = this.cells[i];
+                        const right = this.cells[i + 1];
+                        const bottom = this.cells[i + this.columns];
+                        const bottomRight = this.cells[i + this.columns + 1];
+                        
+                        const hue = (x / this.columns * 60 + y / this.rows * 60 + Date.now() * 0.01) % 360;
+                        
+                        // Треугольник 1
+                        ctx.fillStyle = `hsla(${hue}, 80%, 50%, 0.3)`;
+                        ctx.beginPath();
+                        ctx.moveTo(cell.x, cell.y);
+                        ctx.lineTo(right.x, right.y);
+                        ctx.lineTo(bottomRight.x, bottomRight.y);
+                        ctx.closePath();
+                        ctx.fill();
+                        
+                        // Треугольник 2
+                        ctx.fillStyle = `hsla(${hue + 60}, 80%, 50%, 0.3)`;
+                        ctx.beginPath();
+                        ctx.moveTo(cell.x, cell.y);
+                        ctx.lineTo(bottom.x, bottom.y);
+                        ctx.lineTo(bottomRight.x, bottomRight.y);
+                        ctx.closePath();
+                        ctx.fill();
+                    }
+                }
+            }
+        },
+        
+        neon: {
+            title: "Неоновые линии",
+            lines: [],
+            init: function() {
+                this.lines = [];
+                const lineCount = 10 + Math.floor(canvas.width / 100);
+                
+                for (let i = 0; i < lineCount; i++) {
+                    this.lines.push({
+                        points: [],
+                        color: `hsl(${Math.random() * 360}, 100%, 70%)`,
+                        length: 10 + Math.random() * 20,
+                        speed: 0.5 + Math.random() * 2,
+                        angle: Math.random() * Math.PI * 2,
+                        x: Math.random() * canvas.width,
+                        y: Math.random() * canvas.height
+                    });
+                }
+            },
+            update: function() {
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.1)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                
+                this.lines.forEach(line => {
+                    // Обновление позиции
+                    line.x += Math.cos(line.angle) * line.speed;
+                    line.y += Math.sin(line.angle) * line.speed;
+                    
+                    // Отскок от границ
+                    if (line.x < 0 || line.x > canvas.width) {
+                        line.angle = Math.PI - line.angle;
+                    }
+                    if (line.y < 0 || line.y > canvas.height) {
+                        line.angle = -line.angle;
+                    }
+                    
+                    // Добавление новой точки
+                    line.points.push({ x: line.x, y: line.y });
+                    
+                    // Удаление старых точек
+                    if (line.points.length > line.length) {
+                        line.points.shift();
+                    }
+                    
+                    // Отрисовка линии
+                    if (line.points.length > 1) {
+                        ctx.strokeStyle = line.color;
+                        ctx.lineWidth = 2;
+                        ctx.lineJoin = 'round';
+                        ctx.lineCap = 'round';
+                        ctx.beginPath();
+                        
+                        line.points.forEach((point, i) => {
+                            const alpha = i / line.points.length;
+                            ctx.globalAlpha = alpha;
+                            
+                            if (i === 0) {
+                                ctx.moveTo(point.x, point.y);
+                            } else {
+                                ctx.lineTo(point.x, point.y);
+                            }
+                        });
+                        
+                        ctx.stroke();
+                        ctx.globalAlpha = 1;
+                    }
+                });
+            }
+        },
+        
+        geometric: {
+            title: "Геометрический шторм",
+            shapes: [],
+            init: function() {
+                this.shapes = [];
+                const shapeCount = 10 + Math.floor(canvas.width / 50);
+                
+                for (let i = 0; i < shapeCount; i++) {
+                    const type = Math.floor(Math.random() * 3); // 0 - круг, 1 - квадрат, 2 - треугольник
+                    const size = 10 + Math.random() * 30;
+                    
+                    this.shapes.push({
+                        type: type,
+                        x: Math.random() * canvas.width,
+                        y: Math.random() * canvas.height,
+                        size: size,
+                        rotation: Math.random() * Math.PI * 2,
+                        rotationSpeed: (Math.random() - 0.5) * 0.02,
+                        vx: (Math.random() - 0.5) * 2,
+                        vy: (Math.random() - 0.5) * 2,
+                        color: `hsl(${Math.random() * 360}, 80%, 60%)`,
+                        vertices: type === 2 ? this.generateTriangleVertices(size) : null
+                    });
+                }
+            },
+            generateTriangleVertices: function(size) {
+                const vertices = [];
+                for (let i = 0; i < 3; i++) {
+                    const angle = (i / 3) * Math.PI * 2;
+                    vertices.push({
+                        x: Math.cos(angle) * size,
+                        y: Math.sin(angle) * size
+                    });
+                }
+                return vertices;
+            },
+            update: function() {
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.1)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                
+                this.shapes.forEach(shape => {
+                    // Обновление позиции
+                    shape.x += shape.vx;
+                    shape.y += shape.vy;
+                    shape.rotation += shape.rotationSpeed;
+                    
+                    // Отскок от границ
+                    if (shape.x < 0 || shape.x > canvas.width) shape.vx *= -1;
+                    if (shape.y < 0 || shape.y > canvas.height) shape.vy *= -1;
+                    
+                    // Влияние мыши
+                    const dx = mouseX - shape.x;
+                    const dy = mouseY - shape.y;
+                    const distance = Math.sqrt(dx * dx + dy * dy);
+                    
+                    if (distance < 150 && isMouseDown) {
+                        const force = (150 - distance) / 150;
+                        shape.vx += dx / distance * force * 0.5;
+                        shape.vy += dy / distance * force * 0.5;
+                    }
+                    
+                    // Отрисовка формы
+                    ctx.fillStyle = shape.color;
+                    ctx.save();
+                    ctx.translate(shape.x, shape.y);
+                    ctx.rotate(shape.rotation);
+                    
+                    switch (shape.type) {
+                        case 0: // Круг
+                            ctx.beginPath();
+                            ctx.arc(0, 0, shape.size, 0, Math.PI * 2);
+                            ctx.fill();
+                            break;
+                            
+                        case 1: // Квадрат
+                            ctx.fillRect(-shape.size, -shape.size, shape.size * 2, shape.size * 2);
+                            break;
+                            
+                        case 2: // Треугольник
+                            ctx.beginPath();
+                            ctx.moveTo(shape.vertices[0].x, shape.vertices[0].y);
+                            ctx.lineTo(shape.vertices[1].x, shape.vertices[1].y);
+                            ctx.lineTo(shape.vertices[2].x, shape.vertices[2].y);
+                            ctx.closePath();
+                            ctx.fill();
+                            break;
+                    }
+                    
+                    ctx.restore();
+                });
+            }
+        },
+        
+        ink: {
+            title: "Чернильные капли",
+            drops: [],
+            lastDrop: 0,
+            init: function() {
+                this.drops = [];
+                this.lastDrop = 0;
+            },
+            update: function(timestamp) {
+                ctx.fillStyle = 'rgba(0, 0, 0, 0.05)';
+                ctx.fillRect(0, 0, canvas.width, canvas.height);
+                
+                // Создание новых капель
+                if (timestamp - this.lastDrop > 300) {
+                    this.lastDrop = timestamp;
+                    
+                    if (isMouseDown || Math.random() < 0.3) {
+                        const x = isMouseDown ? mouseX : Math.random() * canvas.width;
+                        const y = isMouseDown ? mouseY : Math.random() * canvas.height;
+                        const color = `hsl(${Math.random() * 360}, 80%, 50%)`;
+                        
+                        this.drops.push({
+                            x: x,
+                            y: y,
+                            size: 5 + Math.random() * 15,
+                            color: color,
+                            life: 100 + Math.random() * 100,
+                            maxLife: 100 + Math.random() * 100,
+                            vx: (Math.random() - 0.5) * 2,
+                            vy: (Math.random() - 0.5) * 2,
+                            particles: []
+                        });
+                    }
+                }
+                
+                // Обновление и отрисовка капель
+                for (let i = this.drops.length - 1; i >= 0; i--) {
+                    const drop = this.drops[i];
+                    
+                    // Обновление жизни
+                    drop.life--;
+                    
+                    if (drop.life <= 0) {
+                        this.drops.splice(i, 1);
+                        continue;
+                    }
+                    
+                    // Обновление позиции
+                    drop.x += drop.vx;
+                    drop.y += drop.vy;
+                    
+                    // Трение
+                    drop.vx *= 0.98;
+                    drop.vy *= 0.98;
+                    
+                    // Гравитация
+                    drop.vy += 0.05;
+                    
+                    // Границы
+                    if (drop.x < 0 || drop.x > canvas.width) drop.vx *= -0.5;
+                    if (drop.y < 0 || drop.y > canvas.height) drop.vy *= -0.5;
+                    
+                    // Создание частиц
+                    if (Math.random() < 0.3) {
+                        drop.particles.push({
+                            x: drop.x,
+                            y: drop.y,
+                            size: Math.random() * 3 + 1,
+                            vx: (Math.random() - 0.5) * 2,
+                            vy: (Math.random() - 0.5) * 2,
+                            life: 30 + Math.random() * 50
+                        });
+                    }
+                    
+                    // Отрисовка основной капли
+                    const alpha = drop.life / drop.maxLife;
+                    ctx.fillStyle = `${drop.color.replace(')', `, ${alpha})`)}`;
+                    ctx.beginPath();
+                    ctx.arc(drop.x, drop.y, drop.size * alpha, 0, Math.PI * 2);
+                    ctx.fill();
+                    
+                    // Обновление и отрисовка частиц
+                    for (let j = drop.particles.length - 1; j >= 0; j--) {
+                        const p = drop.particles[j];
+                        
+                        p.x += p.vx;
+                        p.y += p.vy;
+                        p.life--;
+                        
+                        if (p.life <= 0) {
+                            drop.particles.splice(j, 1);
+                            continue;
+                        }
+                        
+                        const pAlpha = p.life / 80;
+                        ctx.fillStyle = `${drop.color.replace(')', `, ${pAlpha})`)}`;
+                        ctx.beginPath();
+                        ctx.arc(p.x, p.y, p.size * pAlpha, 0, Math.PI * 2);
+                        ctx.fill();
+                    }
+                }
+            }
+        }
+    };
+    
+    // Управление анимациями
+    function startAnimation(animationName) {
+        if (currentAnimation && currentAnimation === animations[animationName]) return;
+        
+        // Остановка текущей анимации
+        if (animationFrameId) {
+            cancelAnimationFrame(animationFrameId);
+        }
+        
+        // Установка новой анимации
+        currentAnimation = animations[animationName];
+        currentAnimation.init();
+        
+        // Обновление заголовка
+        titleElement.textContent = currentAnimation.title;
+        titleElement.style.color = animations[animationName].color || '#fff';
+        titleElement.classList.add('visible');
+        
+        // Запуск анимации
+        function animate(timestamp) {
+            currentAnimation.update(timestamp);
+            animationFrameId = requestAnimationFrame(animate);
+        }
+        
+        animationFrameId = requestAnimationFrame(animate);
+    }
+    
+    // Обработчики кнопок
+    buttons.forEach(button => {
+        button.addEventListener('click', function() {
+            const animationName = this.getAttribute('data-animation');
+            startAnimation(animationName);
+        });
+    });
+    
+    // Запуск первой анимации по умолчанию
+    startAnimation('magnetic');
+});
+  </script> 
+ </body>
+</html>
