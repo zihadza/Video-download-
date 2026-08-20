@@ -75,7 +75,6 @@ body {
   background: linear-gradient(90deg, #ff2d55, #00f5d4);
   -webkit-background-clip: text;
   -webkit-text-fill-color: transparent;
-  letter-spacing: -0.5px;
 }
 
 .header p {
@@ -133,7 +132,6 @@ input, select {
   font-size: 15px;
   margin-top: 10px;
   outline: none;
-  transition: 0.3s;
 }
 
 input:focus, select:focus {
@@ -169,15 +167,12 @@ button:active {
   box-shadow: 0 6px 20px rgba(59, 130, 246, 0.25);
 }
 
-.progress-box {
-  margin-top: 6px;
-}
-
 .progress-bg {
   height: 9px;
   background: rgba(255,255,255,0.08);
   border-radius: 20px;
   overflow: hidden;
+  margin-top: 6px;
 }
 
 .progress-bar {
@@ -251,19 +246,6 @@ button:active {
   border-radius: 10px;
 }
 
-.video-box {
-  width: 100%;
-  border-radius: 16px;
-  margin-top: 10px;
-  background: #000;
-  overflow: hidden;
-}
-
-.video-box video {
-  width: 100%;
-  display: block;
-}
-
 .bottom-actions {
   display: flex;
   gap: 10px;
@@ -296,7 +278,7 @@ button:active {
 
   <div class="header">
     <h1>Zihad Downloader</h1>
-    <p>Premium Multi-Platform Video Tool</p>
+    <p>YouTube + Bilibili Premium Search</p>
   </div>
 
   <div class="card">
@@ -306,7 +288,11 @@ button:active {
     </div>
 
     <div id="searchSection">
-      <input type="text" id="searchInput" placeholder="কীওয়ার্ড লিখুন (YouTube সার্চ)...">
+      <select id="searchPlatform">
+        <option value="youtube">YouTube সার্চ</option>
+        <option value="bilibili">Bilibili সার্চ</option>
+      </select>
+      <input type="text" id="searchInput" placeholder="কীওয়ার্ড লিখুন...">
       <button onclick="doSearch()">সার্চ করুন</button>
     </div>
 
@@ -330,12 +316,10 @@ button:active {
   </div>
 
   <div class="card">
-    <div class="progress-box">
-      <div class="progress-bg">
-        <div class="progress-bar" id="progressBar"></div>
-      </div>
-      <div class="status" id="statusText">রেডি...</div>
+    <div class="progress-bg">
+      <div class="progress-bar" id="progressBar"></div>
     </div>
+    <div class="status" id="statusText">রেডি...</div>
   </div>
 
   <div id="results"></div>
@@ -365,6 +349,7 @@ function switchTab(tab) {
 
 function doSearch() {
   const query = document.getElementById('searchInput').value.trim();
+  const platform = document.getElementById('searchPlatform').value;
   if (!query) return alert('কিছু লিখুন');
 
   document.getElementById('results').innerHTML = '<div class="loading">সার্চ করা হচ্ছে...</div>';
@@ -372,7 +357,7 @@ function doSearch() {
   fetch('/search', {
     method: 'POST',
     headers: {'Content-Type': 'application/json'},
-    body: JSON.stringify({query})
+    body: JSON.stringify({query, platform})
   })
   .then(res => res.json())
   .then(data => {
@@ -451,12 +436,8 @@ function startDownload(url) {
 function playDirect(url) {
   document.getElementById('results').innerHTML = `
     <div class="card">
-      <div class="video-box">
-        <video controls autoplay>
-          <source src="/stream?url=${encodeURIComponent(url)}">
-        </video>
-      </div>
-      <button onclick="startDownload('${url}')" style="margin-top:14px;">এই ভিডিওটি ডাউনলোড করুন</button>
+      <p style="color:#94a3b8; margin-bottom:12px;">ডাইরেক্ট প্লে সীমিত। ডাউনলোড করে প্লে করুন।</p>
+      <button onclick="startDownload('${url}')">ডাউনলোড করুন</button>
     </div>`;
 }
 
@@ -477,11 +458,9 @@ function monitorProgress() {
           clearInterval(interval);
           document.getElementById('results').innerHTML = `
             <div class="card">
-              <div class="video-box">
-                <video controls src="/file/${data.file}"></video>
-              </div>
-              <br>
-              <a href="/file/${data.file}" download style="color:#00f5d4; font-weight:600; font-size:15px;">
+              <video controls style="width:100%; border-radius:14px;" src="/file/${data.file}"></video>
+              <br><br>
+              <a href="/file/${data.file}" download style="color:#00f5d4; font-weight:600;">
                 ফাইল ডাউনলোড করুন
               </a>
             </div>`;
@@ -543,18 +522,25 @@ def home():
 @app.route("/search", methods=["POST"])
 def search():
     query = request.json.get("query", "").strip()
+    platform = request.json.get("platform", "youtube")
+
     if not query:
         return jsonify({"error": "কিছু লিখুন"})
 
     try:
+        if platform == "bilibili":
+            search_prefix = f"bilisearch12:{query}"
+        else:
+            search_prefix = f"ytsearch12:{query}"
+
         cmd = [
             "yt-dlp",
-            f"ytsearch12:{query}",
+            search_prefix,
             "--dump-json",
             "--no-download",
             "--flat-playlist"
         ]
-        output = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=35).decode(errors="ignore")
+        output = subprocess.check_output(cmd, stderr=subprocess.STDOUT, timeout=40).decode(errors="ignore")
 
         results = []
         for line in output.strip().splitlines():
@@ -562,17 +548,17 @@ def search():
                 data = json.loads(line)
                 results.append({
                     "title": data.get("title", "Unknown"),
-                    "url": data.get("url") or data.get("webpage_url") or f"https://youtube.com/watch?v={data.get('id')}",
+                    "url": data.get("url") or data.get("webpage_url") or data.get("original_url", ""),
                     "thumbnail": data.get("thumbnail") or (data.get("thumbnails") or [{}])[-1].get("url", ""),
                     "duration": data.get("duration_string") or "",
-                    "uploader": data.get("uploader") or data.get("channel", "")
+                    "uploader": data.get("uploader") or data.get("channel") or data.get("uploader_id", "")
                 })
             except:
                 continue
 
         return jsonify({"results": results})
     except Exception as e:
-        return jsonify({"error": "সার্চ করতে সমস্যা হয়েছে"})
+        return jsonify({"error": f"সার্চ ব্যর্থ হয়েছে। Bilibili সার্চ অনেক সময় অঞ্চলভেদে সমস্যা করে।"})
 
 @app.route("/info", methods=["POST"])
 def info():
@@ -679,11 +665,6 @@ def get_files():
 def serve_file(name):
     return send_from_directory(SAVE_DIR, name)
 
-@app.route("/stream")
-def stream():
-    # সাধারণ প্লে সাপোর্ট (সীমিত)
-    return jsonify({"message": "ডাইরেক্ট স্ট্রিম সীমিত। ডাউনলোড করে প্লে করুন।"})
-
 if __name__ == "__main__":
-    print(f"Server running on http://0.0.0.0:{PORT}")
+    print(f"Server running → http://0.0.0.0:{PORT}")
     app.run(host="0.0.0.0", port=PORT, debug=False)
