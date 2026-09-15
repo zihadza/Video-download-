@@ -1,396 +1,632 @@
 from flask import Flask, request, jsonify, render_template_string, send_from_directory
-import subprocess, os, json, threading, re, time
+import subprocess
+import os
+import json
+import threading
+import re
+import time
+import html
+from datetime import datetime
 
 app = Flask(__name__)
 
+# ============================================================
+# CONFIG
+# ============================================================
 PORT = 3030
 SAVE_DIR = "/storage/emulated/0/Zihad/Video-download-"
-HISTORY_FILE = os.path.join(SAVE_DIR,"history.json")
+HISTORY_FILE = os.path.join(SAVE_DIR, "history.json")
 
 if not os.path.exists(SAVE_DIR):
-    os.makedirs(SAVE_DIR)
+    os.makedirs(SAVE_DIR, exist_ok=True)
 
 if not os.path.exists(HISTORY_FILE):
-    with open(HISTORY_FILE,"w") as f:
-        json.dump([],f)
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        json.dump([], f, ensure_ascii=False, indent=2)
 
-progress = {"percent":"0%","speed":"","eta":"","size":"","file":""}
+# ============================================================
+# GLOBAL DOWNLOAD STATE
+# ============================================================
+progress = {
+    "percent": "0%", "speed": "", "eta": "", "size": "",
+    "downloaded": "", "file": "", "title": "", "status": "idle",
+    "error": "", "type": "", "quality": "", "started": "", "finished": ""
+}
+progress_lock = threading.Lock()
 
-HTML = """ <!DOCTYPE html>
-<html>
+def update_progress(**kwargs):
+    global progress
+    with progress_lock:
+        for key, value in kwargs.items():
+            if key in progress:
+                progress[key] = value
+
+def load_history():
+    try:
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+            if isinstance(data, list): return data
+            return []
+    except Exception: return []
+
+def save_history(history):
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception: return False
+
+# ============================================================
+# PREMIUM HTML - ULTIMATE REDESIGN
+# ============================================================
+HTML = r"""
+<!DOCTYPE html>
+<html lang="en">
 <head>
-<meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>Ultimate Downloader</title>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<meta name="theme-color" content="#080f1e">
+<title>Zihad Downloader • Premium</title>
+<link href="https://fonts.googleapis.com/css2?family=Outfit:wght@400;500;600;700;800;900&display=swap" rel="stylesheet">
+<link href="https://cdn.jsdelivr.net/npm/remixicon@4.2.0/fonts/remixicon.css" rel="stylesheet">
 <style>
-body{background:linear-gradient(135deg,#0f2027,#203a43,#2c5364); font-family:Arial;color:white;text-align:center;padding:20px;}
-.box{background:rgba(255,255,255,0.1);backdrop-filter:blur(15px);border-radius:15px;padding:20px;max-width:450px;margin:auto;box-shadow:0 0 25px rgba(0,0,0,0.4);}
-input,select,button{width:100%;padding:12px;margin-top:10px;border:none;border-radius:10px;}
-button{background:#ff0055;color:white;font-weight:bold;}
-.progress{background:#333;height:20px;border-radius:10px;overflow:hidden;margin-top:10px;}
-.bar{height:20px;width:0%;background:#00ff9d;}
-img,video{width:100%;border-radius:10px;margin-top:10px;}
-.card{background:#111;padding:10px;border-radius:10px;margin-top:10px;}
-a{color:#00ff9d}
+*{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+:root{
+  --bg:#060d1a;
+  --card:rgba(255,255,255,0.06);
+  --card-2:rgba(255,255,255,0.04);
+  --border:rgba(255,255,255,0.08);
+  --text:#f8fafc; --muted:#8fa3b8;
+  --accent:#00d2ff; --accent2:#7c3aed; --success:#22c55e;
+}
+html,body{margin:0;padding:0;width:100%;min-height:100%}
+body{
+    background:#060d1a;
+    background-image:
+      radial-gradient(600px at 0% 0%, rgba(0,210,255,.18), transparent 60%),
+      radial-gradient(600px at 100% 0%, rgba(124,58,237,.20), transparent 60%),
+      radial-gradient(800px at 50% 100%, rgba(0,210,255,.08), transparent 70%);
+    color:var(--text);
+    font-family:"Outfit",-apple-system,BlinkMacSystemFont,sans-serif;
+    overflow-x:hidden; padding-bottom:110px;
+}
+
+/* ORBS */
+.bg-orb{position:fixed;width:300px;height:300px;border-radius:50%;filter:blur(80px);opacity:.35;pointer-events:none;z-index:-1;animation:floatOrb 8s ease-in-out infinite}
+.orb-one{background:linear-gradient(135deg,#00d2ff,#3a7bd5);top:-80px;left:-80px}
+.orb-two{background:linear-gradient(135deg,#7c3aed,#ff6ec7);bottom:10%;right:-80px;animation-delay:2s}
+@keyframes floatOrb{0%,100%{transform:translateY(0) scale(1)}50%{transform:translateY(-25px) scale(1.05)}}
+
+/* HEADER */
+.app-header{
+    position:sticky;top:0;z-index:100;
+    padding:14px 16px;
+    background:rgba(6,13,26,0.7);
+    backdrop-filter:blur(24px) saturate(180%); -webkit-backdrop-filter:blur(24px) saturate(180%);
+    border-bottom:1px solid var(--border);
+}
+.header-row{display:flex;align-items:center;justify-content:space-between;max-width:600px;margin:0 auto;width:100%}
+.brand{display:flex;align-items:center;gap:12px}
+.brand-icon{
+    width:44px;height:44px;border-radius:13px;
+    display:flex;align-items:center;justify-content:center;
+    background:linear-gradient(135deg,#00c6ff,#0072ff 55%,#7c3aed);
+    box-shadow:0 8px 20px rgba(0,132,255,.35), inset 0 1px 0 rgba(255,255,255,.3);
+    font-size:20px;font-weight:800;color:#fff;
+}
+.brand-title{font-size:17px;font-weight:800;letter-spacing:-.02em}
+.brand-sub{font-size:11px;color:var(--muted);font-weight:500;margin-top:1px}
+.icon-btn{
+    width:42px;height:42px;border-radius:13px;border:1px solid var(--border);
+    background:var(--card);color:#fff;display:flex;align-items:center;justify-content:center;
+    font-size:18px;cursor:pointer;transition:.3s cubic-bezier(.16,1,.3,1);
+}
+.icon-btn:active{transform:scale(.92)}
+
+/* CONTAINER */
+.container{width:100%;max-width:600px;margin:0 auto;padding:18px 14px 10px}
+
+/* HERO */
+.hero{
+    padding:22px 20px;border-radius:28px;position:relative;overflow:hidden;
+    background:linear-gradient(135deg, rgba(255,255,255,.08), rgba(255,255,255,.02));
+    border:1px solid var(--border);
+    backdrop-filter:blur(20px); -webkit-backdrop-filter:blur(20px);
+    box-shadow:0 20px 50px rgba(0,0,0,.3);
+}
+.hero::before{
+    content:"";position:absolute;inset:0;
+    background:radial-gradient(400px at 100% 0%, rgba(0,210,255,.15), transparent);
+    pointer-events:none;
+}
+.hero-label{
+    display:inline-flex;align-items:center;gap:7px;padding:6px 12px;border-radius:100px;
+    background:rgba(34,197,94,.12);border:1px solid rgba(34,197,94,.2);
+    color:#86efac;font-size:10px;font-weight:700;letter-spacing:.08em;
+}
+.status-dot{width:7px;height:7px;border-radius:50%;background:var(--success);box-shadow:0 0 10px var(--success);animation:blink 1.5s infinite}
+.hero h1{margin:16px 0 8px;font-size:28px;line-height:1.05;letter-spacing:-.03em;font-weight:800}
+.hero h1 span{background:linear-gradient(135deg,#fff,#7dd3fc);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+.hero p{margin:0;color:var(--muted);font-size:13px;line-height:1.6;font-weight:400}
+
+/* CARD */
+.card{
+    margin-top:16px;padding:18px;border-radius:24px;
+    background:var(--card);border:1px solid var(--border);
+    backdrop-filter:blur(20px); -webkit-backdrop-filter:blur(20px);
+    box-shadow:0 15px 40px rgba(0,0,0,.2);
+    transition:.4s cubic-bezier(.16,1,.3,1);
+}
+.card:focus-within{border-color:rgba(0,210,255,.3);box-shadow:0 15px 40px rgba(0,0,0,.25), 0 0 0 4px rgba(0,210,255,.08)}
+.input-label{font-size:10px;font-weight:700;letter-spacing:.1em;color:var(--muted);margin-bottom:10px;display:block}
+.url-row{display:flex;gap:10px}
+.url-input{
+    flex:1;min-width:0;height:52px;border-radius:16px;
+    border:1px solid rgba(255,255,255,.08);outline:none;
+    background:rgba(0,0,0,.28);color:#fff;padding:0 16px;font-size:14px;font-weight:500;
+    transition:.3s;
+}
+.url-input:focus{border-color:var(--accent);background:rgba(0,0,0,.35)}
+.url-input::placeholder{color:#5d7288}
+.paste-btn{
+    width:52px;height:52px;flex:none;border:1px solid var(--border);border-radius:16px;
+    background:var(--card);color:#fff;font-size:20px;cursor:pointer;transition:.3s;
+}
+.paste-btn:active{transform:scale(.93)}
+
+/* BUTTONS */
+.primary-btn{
+    width:100%;min-height:54px;margin-top:14px;border:0;border-radius:16px;color:#fff;
+    font-weight:700;font-size:14px;cursor:pointer;
+    background:linear-gradient(135deg,#00b8ff,#087eff 50%,#7147ff);
+    box-shadow:0 12px 28px rgba(0,132,255,.3), inset 0 1px 0 rgba(255,255,255,.3);
+    transition:.3s cubic-bezier(.16,1,.3,1);
+    display:flex;align-items:center;justify-content:center;gap:8px;letter-spacing:-.01em;
+}
+.primary-btn:hover{transform:translateY(-1px);box-shadow:0 16px 35px rgba(0,132,255,.4)}
+.primary-btn:active{transform:scale(.98)}
+.primary-btn:disabled{opacity:.6;transform:none!important}
+
+/* OPTIONS */
+.options{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}
+.option{
+    background:rgba(0,0,0,.22);border:1px solid rgba(255,255,255,.06);
+    border-radius:16px;padding:12px 14px;transition:.3s;
+}
+.option span{font-size:9px;font-weight:700;letter-spacing:.1em;color:var(--muted);display:block;margin-bottom:6px}
+.option select{width:100%;border:0;outline:0;background:transparent;color:#fff;font-size:13px;font-weight:600;font-family:"Outfit"}
+
+/* INFO */
+.info-card{display:none;margin-top:16px;overflow:hidden;border-radius:24px;background:var(--card);border:1px solid var(--border);animation:slideUp.5s cubic-bezier(.16,1,.3,1)}
+@keyframes slideUp{from{opacity:0;transform:translateY(20px) scale(.98)}to{opacity:1;transform:translateY(0) scale(1)}}
+.info-image{width:100%;height:200px;object-fit:cover;display:block;background:#0f1a2a}
+.info-body{padding:16px}
+.info-title{font-size:15px;font-weight:700;line-height:1.4;letter-spacing:-.01em}
+.info-channel{color:var(--muted);font-size:12px;margin-top:6px;display:flex;align-items:center;gap:6px}
+
+/* PROGRESS */
+.progress-card{
+    display:none;margin-top:16px;padding:18px;border-radius:24px;
+    background:linear-gradient(135deg, rgba(0,198,255,.10), rgba(124,58,237,.10));
+    border:1px solid rgba(255,255,255,.1);backdrop-filter:blur(20px);
+    animation:slideUp.4s ease;
+}
+.progress-top{display:flex;justify-content:space-between;align-items:center}
+.progress-title{font-size:13px;font-weight:700}
+.progress-percent{font-size:22px;font-weight:800;color:#7dd3fc;font-variant-numeric:tabular-nums}
+.progress-track{width:100%;height:10px;margin-top:14px;border-radius:100px;background:rgba(255,255,255,.08);overflow:hidden;padding:2px}
+.progress-bar{
+    height:100%;width:0%;border-radius:100px;
+    background:linear-gradient(90deg,#00e5ff,#007bff,#8b5cf6);
+    box-shadow:0 0 18px rgba(0,198,255,.5);transition:width.6s cubic-bezier(.16,1,.3,1);
+    position:relative;overflow:hidden;
+}
+.progress-bar::after{
+    content:"";position:absolute;inset:0;
+    background:linear-gradient(90deg, transparent, rgba(255,255,255,.4), transparent);
+    animation:shimmer 1.5s infinite;
+}
+.stats{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin-top:14px}
+.stat{padding:10px 6px;border-radius:14px;background:rgba(0,0,0,.25);text-align:center;border:1px solid rgba(255,255,255,.05)}
+.stat-label{font-size:9px;color:var(--muted);font-weight:700;letter-spacing:.08em;margin-bottom:4px;display:block}
+.stat-value{font-size:11px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+
+/* RESULT */
+.result{display:none;margin-top:16px;animation:slideUp.5s cubic-bezier(.16,1,.3,1)}
+.result-video{width:100%;max-height:340px;border-radius:20px;background:#000;display:block}
+.download-file{
+    display:flex;align-items:center;justify-content:center;gap:8px;
+    min-height:54px;margin-top:12px;border-radius:16px;text-decoration:none;color:#fff;font-weight:700;
+    background:linear-gradient(135deg,#16a34a,#0ea5e9);box-shadow:0 10px 25px rgba(22,163,74,.3);
+    transition:.3s;
+}
+
+/* QUICK */
+.quick-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px}
+.quick{
+    min-height:92px;border-radius:22px;border:1px solid var(--border);
+    background:var(--card-2);color:#fff;cursor:pointer;text-align:left;padding:16px;
+    transition:.35s cubic-bezier(.16,1,.3,1);backdrop-filter:blur(10px);
+}
+.quick:hover{transform:translateY(-2px);background:rgba(255,255,255,.07);border-color:rgba(255,255,255,.12)}
+.quick:active{transform:scale(.97)}
+.quick-icon{width:36px;height:36px;border-radius:11px;display:flex;align-items:center;justify-content:center;font-size:18px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.06)}
+.quick-title{margin-top:12px;font-size:12px;font-weight:700;letter-spacing:-.01em}
+.quick-sub{color:var(--muted);font-size:10px;margin-top:3px}
+
+/* BOTTOM NAV */
+.bottom-nav{
+    position:fixed;left:12px;right:12px;bottom:12px;z-index:200;height:72px;border-radius:24px;
+    background:rgba(8,15,25,.85);border:1px solid rgba(255,255,255,.10);
+    backdrop-filter:blur(24px) saturate(180%);-webkit-backdrop-filter:blur(24px) saturate(180%);
+    box-shadow:0 20px 50px rgba(0,0,0,.5), inset 0 1px 0 rgba(255,255,255,.1);
+    display:flex;align-items:center;justify-content:space-around;
+    max-width:500px;margin:0 auto;
+}
+.nav-btn{
+    flex:1;height:56px;border:0;background:transparent;color:#5d7288;cursor:pointer;
+    display:flex;flex-direction:column;align-items:center;justify-content:center;gap:4px;transition:.3s;
+}
+.nav-btn i{font-size:22px;transition:.3s}
+.nav-btn span{font-size:9px;font-weight:700;letter-spacing:.05em}
+.nav-btn.active{color:#fff}
+.nav-btn.active i{transform:translateY(-1px);color:#7dd3fc;text-shadow:0 0 15px #00d2ff}
+.nav-btn.active span{color:#7dd3fc}
+
+/* MODAL */
+.modal{display:none;position:fixed;inset:0;z-index:500;background:rgba(0,0,0,.7);backdrop-filter:blur(12px);padding:14px;align-items:flex-end;justify-content:center}
+.modal-box{
+    width:100%;max-width:600px;max-height:82vh;overflow:auto;border-radius:28px 28px 20px 20px;
+    background:#0b1522;border:1px solid rgba(255,255,255,.1);padding:20px;
+    animation:modalUp.4s cubic-bezier(.16,1,.3,1);box-shadow:0 30px 80px rgba(0,0,0,.6);
+}
+@keyframes modalUp{from{transform:translateY(100%) scale(.96);opacity:0}to{transform:translateY(0) scale(1);opacity:1}}
+.modal-header{display:flex;align-items:center;justify-content:space-between;margin-bottom:16px}
+.modal-title{font-size:18px;font-weight:800;letter-spacing:-.02em}
+.close{width:38px;height:38px;border:1px solid var(--border);border-radius:12px;background:var(--card);color:#fff;font-size:18px;cursor:pointer}
+.list-item{padding:14px;border-radius:16px;background:rgba(255,255,255,.04);border:1px solid rgba(255,255,255,.06);margin-top:10px;transition:.2s}
+.list-item:hover{background:rgba(255,255,255,.06)}
+.list-title{font-size:12px;font-weight:600;word-break:break-word;line-height:1.4}
+.list-time{color:var(--muted);font-size:10px;margin-top:6px;display:flex;align-items:center;gap:6px}
+.file-link{color:#7dd3fc;text-decoration:none;font-size:12px;word-break:break-word;font-weight:600;display:flex;align-items:center;gap:8px}
+.empty{text-align:center;padding:45px 15px;color:var(--muted);font-size:13px}
+
+/* TOAST */
+.toast{
+    position:fixed;left:50%;bottom:100px;transform:translateX(-50%) translateY(20px);
+    z-index:999;min-width:260px;max-width:90vw;padding:14px 18px;border-radius:16px;
+    background:rgba(13,24,38,.95);border:1px solid rgba(255,255,255,.12);
+    box-shadow:0 15px 40px rgba(0,0,0,.4);color:#fff;text-align:center;font-size:13px;font-weight:500;
+    opacity:0;pointer-events:none;transition:.4s cubic-bezier(.16,1,.3,1);backdrop-filter:blur(20px);
+}
+.toast.show{opacity:1;transform:translateX(-50%) translateY(0)}
+.spinner{display:inline-block;width:16px;height:16px;border:2px solid rgba(255,255,255,.3);border-top-color:#fff;border-radius:50%;animation:spin.7s linear infinite;vertical-align:middle;margin-right:8px}
+@keyframes spin{to{transform:rotate(360deg)}}@keyframes blink{0%,100%{opacity:1}50%{opacity:.4}}@keyframes shimmer{0%{transform:translateX(-100%)}100%{transform:translateX(200%)}}
+@media(min-width:700px){.container{padding-top:26px}.hero h1{font-size:36px}}
 </style>
 </head>
 <body>
-<div class="box">
-<h2>Ultimate Downloader</h2>
-<input id="url" placeholder="Paste video URL">
-<button onclick="info()">Load Info</button>
-<div id="info"></div>
-<select id="quality">
-<option value="360">360p</option>
-<option value="480">480p</option>
-<option value="720">720p</option>
-<option value="1080">1080p</option>
-</select>
-<select id="type">
-<option value="video">Video</option>
-<option value="audio">MP3</option>
-</select>
-<button onclick="download()">Download</button>
-<div class="progress"><div class="bar" id="bar"></div></div>
-<p id="status"></p>
-<button onclick="history()">History</button> <button onclick="files()">Files</button>
-<div id="result"></div>
-</div>
-<script>
-function info(){
-let url=document.getElementById("url").value
-fetch("/info",{ method:"POST", headers:{'Content-Type':'application/json'}, body:JSON.stringify({url:url}) })
-.then(r=>r.json())
-.then(d=>{
-document.getElementById("info").innerHTML= "<img src='"+d.thumbnail+"'>"+ "<h3>"+d.title+"</h3>"+ "<p>"+d.channel+"</p>"
-})
-}
-function download(){
-let url=document.getElementById("url").value
-let quality=document.getElementById("quality").value
-let type=document.getElementById("type").value
-fetch("/download",{ method:"POST", headers:{'Content-Type':'application/json'}, body:JSON.stringify({url,quality,type}) })
-monitor()
-}
-function monitor(){
-setInterval(()=>{
-fetch("/progress")
-.then(r=>r.json())
-.then(d=>{
-document.getElementById("bar").style.width=d.percent
-document.getElementById("status").innerHTML=
-"Progress: "+d.percent+ "<br>Size: "+d.size+ "<br>Speed: "+d.speed+ "<br>ETA: "+d.eta
-if(d.file!=""){
-document.getElementById("result").innerHTML= "<video controls src='/file/"+d.file+"'></video>"+ "<br><a href='/file/"+d.file+"' download>Download File</a>"
-}
-})
-},1000)
-}
-function history(){
-fetch("/history")
-.then(r=>r.json())
-.then(d=>{
-let html="<h3>Download History</h3>"
-d.reverse().forEach(v=>{ html+="<div class='card'>"+v.title+"<br>"+v.time+"</div>" })
-document.getElementById("result").innerHTML=html
-})
-}
-function files(){
-fetch("/files")
-.then(r=>r.json())
-.then(d=>{
-let html="<h3>Files</h3>"
-d.forEach(v=>{ html+="<div class='card'><a href='/file/"+v+"' download>"+v+"</a></div>" })
-document.getElementById("result").innerHTML=html
-})
-}
-</script></body>
-  <br><br><br><br><br><br><br><br><br><br><br><br><br><br>
-<!-- ZI_-_HA-_-D Mobile Friendly Responsive Widget -->
-<style>
-.ziha-wrapper{
-  position:fixed;
-  top:85%;
-  left:50%;
-  transform:translate(-50%,-50%);
-  z-index:999999; /* always on top */
-  pointer-events:auto;
-  max-width:90vw;
-}
+<div class="bg-orb orb-one"></div><div class="bg-orb orb-two"></div>
 
-/* Card */
-.ziha-widget{
-  width:280px;
-  padding:18px;
-  border-radius:16px;
-  background:rgba(15,23,42,0.88);
-  backdrop-filter:blur(12px);
-  border:1px solid rgba(255,255,255,0.08);
-  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto;
-  color:#e2e8f0;
-  text-align:center;
-  box-shadow:0 8px 28px rgba(0,0,0,0.5);
-  transition:0.3s ease;
-}
-
-/* Hover */
-.ziha-widget:hover{
-  transform:translateY(-3px) scale(1.01);
-}
-
-/* Profile Image */
-.ziha-widget img{
-  width:60px;
-  height:60px;
-  border-radius:50%;
-  margin-bottom:10px;
-  border:2px solid #22c55e;
-}
-
-/* Text */
-.ziha-powered{
-  font-size:12px;
-  color:#94a3b8;
-  margin-bottom:4px;
-}
-.ziha-greet{
-  font-size:15px;
-  font-weight:500;
-  color:#cbd5f5;
-  margin-bottom:6px;
-}
-.ziha-time{
-  font-size:26px;
-  font-weight:600;
-  color:#22c55e;
-}
-.ziha-date{
-  font-size:13px;
-  color:#94a3b8;
-  margin-bottom:10px;
-}
-
-/* Info box */
-.info-box{
-  display:flex;
-  gap:6px;
-  margin-top:5px;
-}
-.info-item{
-  flex:1;
-  padding:6px;
-  border-radius:10px;
-  font-size:11px;
-  font-weight:500;
-  background:linear-gradient(135deg,#1e3a8a,#22c55e);
-  color:#f1f5f9;
-  text-shadow:0 1px 1px rgba(0,0,0,0.3);
-  transition:0.4s;
-}
-
-/* Battery bar */
-.battery-bar{
-  width:100%;
-  height:5px;
-  background:rgba(255,255,255,0.07);
-  border-radius:10px;
-  margin-top:6px;
-  overflow:hidden;
-}
-.battery-fill{
-  height:100%;
-  width:50%;
-  background:#22c55e;
-  transition:0.5s ease;
-}
-
-/* Responsive adjustments */
-@media(max-width:480px){
-  .ziha-widget{
-    width:85vw;
-    padding:14px;
-  }
-  .ziha-widget img{
-    width:50px;
-    height:50px;
-  }
-  .ziha-time{
-    font-size:22px;
-  }
-  .ziha-greet{
-    font-size:14px;
-  }
-  .ziha-date{
-    font-size:12px;
-  }
-  .info-item{
-    font-size:10px;
-    padding:5px;
-  }
-}
-</style>
-
-<div class="ziha-wrapper">
-  <div class="ziha-widget">
-    <img src="https://raw.githubusercontent.com/zihadza/Video-download-/9d7b01a7e12c4f815d607c9e20c435ea102072b3/zihad.png">
-    <div class="ziha-powered">Powered by ZI_-_HA-_-D</div>
-    <div class="ziha-greet" id="greet">Hello</div>
-    <div class="ziha-time" id="time">--:--</div>
-    <div class="ziha-date" id="date">Loading...</div>
-
-    <div class="info-box">
-      <div class="info-item" id="batteryText">🔋 --%</div>
-      <div class="info-item" id="net">🌐 --</div>
-      <div class="info-item" id="ip">🌍 --</div>
+<header class="app-header">
+    <div class="header-row">
+        <div class="brand">
+            <div class="brand-icon"><i class="ri-download-2-fill"></i></div>
+            <div>
+                <div class="brand-title">Zihad Downloader</div>
+                <div class="brand-sub">Premium • Fast • Private</div>
+            </div>
+        </div>
+        <div style="display:flex;gap:8px">
+            <button class="icon-btn" onclick="refreshApp()"><i class="ri-refresh-line"></i></button>
+        </div>
     </div>
+</header>
 
-    <div class="battery-bar">
-      <div class="battery-fill" id="batteryFill"></div>
+<main class="container">
+    <section class="hero">
+        <div class="hero-label"><span class="status-dot"></span> SERVER ONLINE • PREMIUM</div>
+        <h1>Download anything, <span>beautifully.</span></h1>
+        <p>Paste any video link, choose quality in 4K / MP3 and get instant premium download with real-time progress.</p>
+    </section>
+
+    <section class="card">
+        <label class="input-label"><i class="ri-link"></i> VIDEO URL</label>
+        <div class="url-row">
+            <input id="url" class="url-input" type="url" autocomplete="off" placeholder="https://... paste video URL here">
+            <button class="paste-btn" onclick="pasteURL()"><i class="ri-clipboard-line"></i></button>
+        </div>
+        <button id="infoButton" class="primary-btn" onclick="loadInfo()"><i class="ri-search-eye-line"></i> Load Video Info</button>
+        <div class="options">
+            <div class="option"><span><i class="ri-hd-line"></i> QUALITY</span>
+                <select id="quality"><option value="360">360p • Low</option><option value="480">480p • SD</option><option value="720" selected>720p • HD</option><option value="1080">1080p • Full HD</option></select>
+            </div>
+            <div class="option"><span><i class="ri-film-line"></i> FORMAT</span>
+                <select id="type"><option value="video">🎬 Video MP4</option><option value="audio">🎵 Audio MP3</option></select>
+            </div>
+        </div>
+        <button id="downloadButton" class="primary-btn" style="background:linear-gradient(135deg,#0ea5e9,#6366f1)" onclick="startDownload()"><i class="ri-download-cloud-2-line"></i> Start Premium Download</button>
+    </section>
+
+    <section id="infoCard" class="info-card">
+        <img id="infoImage" class="info-image" src="" alt="Thumbnail">
+        <div class="info-body">
+            <div id="infoTitle" class="info-title">Loading...</div>
+            <div id="infoChannel" class="info-channel"><i class="ri-youtube-fill"></i> <span>Loading...</span></div>
+        </div>
+    </section>
+
+    <section id="progressCard" class="progress-card">
+        <div class="progress-top">
+            <div id="progressTitle" class="progress-title">Downloading...</div>
+            <div id="progressPercent" class="progress-percent">0%</div>
+        </div>
+        <div class="progress-track"><div id="progressBar" class="progress-bar"></div></div>
+        <div class="stats">
+            <div class="stat"><span class="stat-label">SIZE</span><span id="statSize" class="stat-value">—</span></div>
+            <div class="stat"><span class="stat-label">SPEED</span><span id="statSpeed" class="stat-value">—</span></div>
+            <div class="stat"><span class="stat-label">ETA</span><span id="statEta" class="stat-value">—</span></div>
+        </div>
+    </section>
+
+    <section id="result" class="result"></section>
+
+    <section class="quick-grid">
+        <button class="quick" onclick="showHistory()"><div class="quick-icon"><i class="ri-history-line"></i></div><div class="quick-title">History</div><div class="quick-sub">Previous downloads</div></button>
+        <button class="quick" onclick="showFiles()"><div class="quick-icon"><i class="ri-folder-3-line"></i></div><div class="quick-title">My Files</div><div class="quick-sub">Browse storage</div></button>
+    </section>
+</main>
+
+<nav class="bottom-nav">
+    <button class="nav-btn active" onclick="goHome()"><i class="ri-home-5-fill"></i><span>Home</span></button>
+    <button class="nav-btn" onclick="showHistory()"><i class="ri-time-line"></i><span>History</span></button>
+    <button class="nav-btn" onclick="showFiles()"><i class="ri-folder-3-line"></i><span>Files</span></button>
+    <button class="nav-btn" onclick="refreshApp()"><i class="ri-settings-3-line"></i><span>Refresh</span></button>
+</nav>
+
+<div id="modal" class="modal" onclick="closeModalOutside(event)">
+    <div class="modal-box">
+        <div class="modal-header"><div id="modalTitle" class="modal-title">Downloads</div><button class="close" onclick="closeModal()"><i class="ri-close-line"></i></button></div>
+        <div id="modalContent"></div>
     </div>
-  </div>
 </div>
+<div id="toast" class="toast"></div>
 
 <script>
-// Time
-function updateTime(){
-  const now=new Date();
-  const days=["রবি","সোম","মঙ্গল","বুধ","বৃহস্পতি","শুক্র","শনি"];
-  const months=["January","February","March","April","May","June","July","August","September","October","November","December"];
-
-  let h=now.getHours(),m=now.getMinutes(),s=now.getSeconds();
-  let greet="Good Night";
-  if(h>=5&&h<12)greet="Good Morning";
-  else if(h<17)greet="Good Afternoon";
-  else if(h<20)greet="Good Evening";
-
-  let ampm=h>=12?"PM":"AM";
-  h=h%12||12;
-  m=m<10?"0"+m:m;
-  s=s<10?"0"+s:s;
-
-  time.innerText=`${h}:${m}:${s} ${ampm}`;
-  date.innerText=`${days[now.getDay()]}, ${now.getDate()} ${months[now.getMonth()]}`;
-  greetEl.innerText=greet;
+let progressTimer=null,downloadActive=false;
+function el(id){return document.getElementById(id)}
+function toast(message){const box=el("toast");box.innerText=message;box.classList.add("show");setTimeout(()=>box.classList.remove("show"),2500)}
+async function pasteURL(){
+    try{
+        if(navigator.clipboard && navigator.clipboard.readText){
+            const text=await navigator.clipboard.readText();
+            if(text){el("url").value=text;toast("URL pasted ✨");}
+            else toast("Clipboard empty");
+        }else toast("Please paste manually");
+    }catch(e){toast("Clipboard permission denied");}
 }
-const time=document.getElementById("time");
-const date=document.getElementById("date");
-const greetEl=document.getElementById("greet");
-setInterval(updateTime,1000);
-updateTime();
-
-// Battery
-navigator.getBattery().then(b=>{
-  function update(){
-    let level=Math.round(b.level*100);
-    batteryText.innerText="🔋 "+level+"%";
-    batteryFill.style.width=level+"%";
-    batteryFill.style.background=level>50?"#22c55e":level>20?"#f59e0b":"#ef4444";
-  }
-  update();
-  b.addEventListener("levelchange",update);
-});
-
-// Internet
-function net(){
-  document.getElementById("net").innerText=
-    navigator.onLine?"🌐 Online":"Offline";
+function loadInfo(){
+    const url=el("url").value.trim();
+    if(!url){toast("⚠️ Enter a video URL first");el("url").focus();return;}
+    const button=el("infoButton");button.disabled=true;button.innerHTML='<span class="spinner"></span> Fetching Info...';
+    fetch("/info",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:url})})
+   .then(r=>r.json()).then(data=>{
+        if(!data.success) throw new Error(data.error||"Failed");
+        el("infoCard").style.display="block";
+        el("infoImage").src=data.thumbnail||"";
+        el("infoTitle").innerText=data.title||"Unknown title";
+        el("infoChannel").innerHTML='<i class="ri-youtube-fill"></i> '+ (data.channel||"Unknown");
+        toast("Info loaded successfully 🔥");
+    }).catch(err=>{toast(err.message||"Failed to load info")})
+   .finally(()=>{button.disabled=false;button.innerHTML='<i class="ri-search-eye-line"></i> Load Video Info';});
 }
-window.addEventListener("online",net);
-window.addEventListener("offline",net);
-net();
-
-// IP fallback
-function loadIP(){
-  fetch("https://api.ipify.org?format=json")
-  .then(r=>r.json())
-  .then(d=>{document.getElementById("ip").innerText="🌍 "+d.ip;})
-  .catch(()=>{
-    fetch("https://api64.ipify.org?format=json")
-    .then(r=>r.json())
-    .then(d=>{document.getElementById("ip").innerText="🌍 "+d.ip;})
-    .catch(()=>{document.getElementById("ip").innerText="🌍 N/A";});
-  });
+function startDownload(){
+    if(downloadActive){toast("A download is already running ⏳");return;}
+    const url=el("url").value.trim(),quality=el("quality").value,type=el("type").value;
+    if(!url){toast("Enter URL first");el("url").focus();return;}
+    downloadActive=true;
+    const button=el("downloadButton");button.disabled=true;button.innerHTML='<span class="spinner"></span> Starting...';
+    el("progressCard").style.display="block";el("result").style.display="none";el("result").innerHTML="";
+    el("progressBar").style.width="0%";el("progressPercent").innerText="0%";
+    el("progressTitle").innerText= type==="audio"? "Preparing MP3..." : "Preparing video...";
+    fetch("/download",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:url,quality:quality,type:type})})
+   .then(r=>r.json()).then(data=>{
+        if(!data.success) throw new Error(data.error||"Download failed");
+        toast("Download started 🚀");startProgressMonitor();
+    }).catch(err=>{
+        downloadActive=false;button.disabled=false;button.innerHTML='<i class="ri-download-cloud-2-line"></i> Start Premium Download';
+        toast(err.message||"Download failed");
+    });
 }
-loadIP();
+function startProgressMonitor(){if(progressTimer) clearInterval(progressTimer);checkProgress();progressTimer=setInterval(checkProgress,900);}
+function checkProgress(){
+    fetch("/progress").then(r=>r.json()).then(data=>{
+        let percent=parseFloat(String(data.percent).replace("%",""));if(isNaN(percent)) percent=0;
+        if(percent<0) percent=0; if(percent>100) percent=100;
+        el("progressBar").style.width=percent+"%";
+        el("progressPercent").innerText=percent.toFixed(percent===100?0:1)+"%";
+        el("statSize").innerText=data.size||"—";el("statSpeed").innerText=data.speed||"—";el("statEta").innerText=data.eta||"—";
+        if(data.title) el("progressTitle").innerText=data.title;
+        if(data.status==="error"){
+            stopProgressMonitor();downloadActive=false;el("downloadButton").disabled=false;
+            el("downloadButton").innerHTML='<i class="ri-download-cloud-2-line"></i> Start Premium Download';
+            toast(data.error||"Download failed");return;
+        }
+        if(data.status==="finished" && data.file){
+            stopProgressMonitor();downloadActive=false;el("downloadButton").disabled=false;
+            el("downloadButton").innerHTML='<i class="ri-download-cloud-2-line"></i> Start Premium Download';
+            el("progressBar").style.width="100%";el("progressPercent").innerText="100%";
+            showResult(data.file,data.type);toast("Download completed 🎉");
+        }
+    }).catch(()=>{});
+}
+function stopProgressMonitor(){if(progressTimer){clearInterval(progressTimer);progressTimer=null;}}
+function showResult(filename,type){
+    const result=el("result");result.style.display="block";const encoded=encodeURIComponent(filename);
+    if(type==="audio"){
+        result.innerHTML='<div class="card"><div style="font-size:36px;text-align:center;padding:12px">🎵</div><div style="text-align:center;font-weight:700;font-size:13px;word-break:break-word;">'+escapeHTML(filename)+'</div><a class="download-file" href="/file/'+encoded+'" download><i class="ri-download-line"></i> Download MP3</a></div>';
+    }else{
+        result.innerHTML='<div class="card"><video class="result-video" controls playsinline preload="metadata" src="/file/'+encoded+'"></video><a class="download-file" href="/file/'+encoded+'" download><i class="ri-download-line"></i> Save Video</a></div>';
+    }
+}
+function showHistory(){
+    fetch("/history").then(r=>r.json()).then(data=>{
+        el("modalTitle").innerText="Download History";
+        if(!Array.isArray(data)||data.length===0){el("modalContent").innerHTML='<div class="empty"><i class="ri-history-line" style="font-size:28px;display:block;margin-bottom:10px"></i>No download history yet</div>';}
+        else{
+            let out="";data.slice().reverse().forEach(item=>{
+                out+='<div class="list-item"><div class="list-title">'+escapeHTML(item.title||item.url||"Unknown")+'</div><div class="list-time"><i class="ri-time-line"></i> '+escapeHTML(item.time||"")+' • '+escapeHTML(item.type||"")+'</div></div>';
+            });el("modalContent").innerHTML=out;
+        }
+        openModal();
+    }).catch(()=>toast("Could not load history"));
+}
+function showFiles(){
+    fetch("/files").then(r=>r.json()).then(data=>{
+        el("modalTitle").innerText="My Files";
+        if(!Array.isArray(data)||data.length===0){el("modalContent").innerHTML='<div class="empty"><i class="ri-folder-3-line" style="font-size:28px;display:block;margin-bottom:10px"></i>No downloaded files</div>';}
+        else{
+            let out="";data.forEach(filename=>{
+                const enc=encodeURIComponent(filename);
+                out+='<div class="list-item"><a class="file-link" href="/file/'+enc+'" download><i class="ri-file-3-line"></i> '+escapeHTML(filename)+'</a></div>';
+            });el("modalContent").innerHTML=out;
+        }
+        openModal();
+    }).catch(()=>toast("Could not load files"));
+}
+function openModal(){el("modal").style.display="flex";}
+function closeModal(){el("modal").style.display="none";}
+function closeModalOutside(e){if(e.target===el("modal")) closeModal();}
+function goHome(){closeModal();window.scrollTo({top:0,behavior:"smooth"});}
+function refreshApp(){toast("Refreshing...");setTimeout(()=>window.location.reload(),400);}
+function escapeHTML(v){return String(v||"").replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;").replace(/"/g,"&quot;").replace(/'/g,"&#039;");}
+el("url").addEventListener("keydown",e=>{if(e.key==="Enter") loadInfo();});
 </script>
-
-
-
-
+</body>
 </html>
 """
 
 @app.route("/")
-def home():
-    return render_template_string(HTML)
+def home(): return render_template_string(HTML)
 
-@app.route("/info",methods=["POST"])
+@app.route("/info", methods=["POST"])
 def info():
-    url=request.json["url"]
-    data=subprocess.check_output(["yt-dlp","-j",url]).decode()
-    j=json.loads(data)
-    return jsonify({
-        "title":j.get("title",""),
-        "channel":j.get("channel",""),
-        "thumbnail":j.get("thumbnail","")
-    })
+    try:
+        data = request.get_json(silent=True) or {}
+        url = str(data.get("url", "")).strip()
+        if not url: return jsonify({"success": False,"error": "URL is required"}), 400
+        command = ["yt-dlp","--no-playlist","-j",url]
+        output = subprocess.check_output(command, stderr=subprocess.STDOUT).decode("utf-8", errors="replace")
+        first_line = output.strip().splitlines()[0]
+        j = json.loads(first_line)
+        return jsonify({"success": True,"title": j.get("title","Unknown title"),"channel": j.get("channel", j.get("uploader","Unknown channel")),"thumbnail": j.get("thumbnail","")})
+    except subprocess.CalledProcessError as e:
+        error_text = (e.output.decode("utf-8", errors="replace") if e.output else "yt-dlp error")
+        return jsonify({"success": False,"error": error_text[-1000:]}), 500
+    except Exception as e:
+        return jsonify({"success": False,"error": str(e)}), 500
 
-def run_download(url,quality,typ):
+def run_download(url, quality, typ):
     global progress
-    if typ=="audio":
-        cmd=[
-            "yt-dlp","-f","bestaudio",
-            "--extract-audio","--audio-format","mp3",
-            "-o",os.path.join(SAVE_DIR,"%(title)s.%(ext)s"),url
-        ]
-    else:
-        cmd=[
-            "yt-dlp",
-            "-f",f"bestvideo[height<={quality}]+bestaudio/best",
-            "--merge-output-format","webm",
-            "-o",os.path.join(SAVE_DIR,"%(title)s.%(ext)s"),url
-        ]
-    process=subprocess.Popen(cmd,stdout=subprocess.PIPE,stderr=subprocess.STDOUT,text=True)
-    for line in process.stdout:
-        if "[download]" in line:
-            p=re.search(r'(\d+\.\d+%)',line)
-            s=re.search(r'of\s+(\S+)',line)
-            sp=re.search(r'at\s+(\S+)',line)
-            e=re.search(r'ETA\s+(\S+)',line)
-            if p: progress["percent"]=p.group(1)
-            if s: progress["size"]=s.group(1)
-            if sp: progress["speed"]=sp.group(1)
-            if e: progress["eta"]=e.group(1)
-        if "Destination:" in line:
-            f=line.split("Destination:")[-1].strip()
-            progress["file"]=os.path.basename(f)
-    with open(HISTORY_FILE) as f:
-        h=json.load(f)
-    h.append({"title":url,"time":time.strftime("%Y-%m-%d %H:%M")})
-    with open(HISTORY_FILE,"w") as f:
-        json.dump(h,f)
+    start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    update_progress(percent="0%",speed="",eta="",size="",downloaded="",file="",title="Starting download...",status="downloading",error="",type=typ,quality=str(quality),started=start_time,finished="")
+    try:
+        if typ == "audio":
+            cmd = ["yt-dlp","--no-playlist","--newline","--extract-audio","--audio-format","mp3","--audio-quality","0","-o",os.path.join(SAVE_DIR,"%(title)s.%(ext)s"),url]
+        else:
+            cmd = ["yt-dlp","--no-playlist","--newline","-f","bestvideo[height<=%s]+bestaudio/best" % str(quality),"--merge-output-format","mp4","-o",os.path.join(SAVE_DIR,"%(title)s.%(ext)s"),url]
+        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        detected_file = ""
+        for line in process.stdout:
+            line=line.strip()
+            if "[download]" in line:
+                percent_match=re.search(r"(\d+(?:\.\d+)?)%",line)
+                size_match=re.search(r"of\s+([^\s]+)",line)
+                speed_match=re.search(r"at\s+([^\s]+)",line)
+                eta_match=re.search(r"ETA\s+([^\s]+)",line)
+                downloaded_match=re.search(r"\s([0-9.]+\w+)\s+of\s+",line)
+                if percent_match: update_progress(percent=percent_match.group(1)+"%")
+                if size_match: update_progress(size=size_match.group(1))
+                if speed_match: update_progress(speed=speed_match.group(1))
+                if eta_match: update_progress(eta=eta_match.group(1))
+                if downloaded_match: update_progress(downloaded=downloaded_match.group(1))
+            if "Destination:" in line: detected_file=(line.split("Destination:",1)[1].strip())
+            if "Merging formats into" in line:
+                match=re.search(r'Merging formats into\s+"(.+)"',line)
+                if match: detected_file=match.group(1).strip()
+            if "Downloading webpage" in line: update_progress(title="Fetching video...")
+            if "Downloading" in line and "video" in line.lower(): update_progress(title="Downloading video...")
+        process.wait()
+        if process.returncode!= 0: raise Exception("yt-dlp exited with code "+str(process.returncode))
+        final_file=""
+        if detected_file:
+            detected_file=os.path.basename(detected_file)
+            possible=os.path.join(SAVE_DIR,detected_file)
+            if os.path.isfile(possible): final_file=detected_file
+        if not final_file:
+            try:
+                files=[]
+                for filename in os.listdir(SAVE_DIR):
+                    full_path=os.path.join(SAVE_DIR,filename)
+                    if os.path.isfile(full_path): files.append((os.path.getmtime(full_path),filename))
+                if files:
+                    files.sort(reverse=True); final_file=files[0][1]
+            except Exception: final_file=""
+        history=load_history()
+        title=progress.get("title","")
+        if (not title or title in ["Starting download...","Downloading video...","Fetching video..."]): title=url
+        history.append({"title": title,"url": url,"file": final_file,"type": typ,"quality": str(quality),"time": datetime.now().strftime("%Y-%m-%d %H:%M")})
+        history=history[-100:]; save_history(history)
+        finish_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        update_progress(percent="100%",file=final_file,status="finished",finished=finish_time)
+    except Exception as e:
+        update_progress(status="error",error=str(e),finished=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
-@app.route("/download",methods=["POST"])
+@app.route("/download", methods=["POST"])
 def download():
-    data=request.json
-    threading.Thread(target=run_download,args=(data["url"],data["quality"],data["type"])).start()
-    return "started"
+    try:
+        data = request.get_json(silent=True) or {}
+        url=str(data.get("url","")).strip()
+        quality=str(data.get("quality","720")).strip()
+        typ=str(data.get("type","video")).strip()
+        if not url: return jsonify({"success": False,"error": "URL is required"}), 400
+        if quality not in ["360","480","720","1080"]: quality="720"
+        if typ not in ["video","audio"]: typ="video"
+        with progress_lock: current_status=progress.get("status","idle")
+        if current_status=="downloading": return jsonify({"success": False,"error": "Another download is already running"}), 409
+        thread=threading.Thread(target=run_download,args=(url,quality,typ),daemon=True)
+        thread.start()
+        return jsonify({"success": True,"message": "Download started"})
+    except Exception as e:
+        return jsonify({"success": False,"error": str(e)}), 500
 
 @app.route("/progress")
 def prog():
-    return jsonify(progress)
+    with progress_lock: return jsonify(dict(progress))
 
 @app.route("/history")
-def history():
-    with open(HISTORY_FILE) as f:
-        return jsonify(json.load(f))
+def history(): return jsonify(load_history())
 
 @app.route("/files")
 def files():
-    return jsonify(os.listdir(SAVE_DIR))
+    try:
+        result=[]
+        for filename in os.listdir(SAVE_DIR):
+            full_path=os.path.join(SAVE_DIR,filename)
+            if os.path.isfile(full_path): result.append(filename)
+        result.sort(key=lambda x: os.path.getmtime(os.path.join(SAVE_DIR,x)), reverse=True)
+        return jsonify(result)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
-@app.route("/file/<name>")
-def file(name):
-    return send_from_directory(SAVE_DIR,name)
+@app.route("/file/<path:name>")
+def file(name): return send_from_directory(SAVE_DIR,name,as_attachment=False)
 
-if __name__=="__main__":
-    app.run(host="0.0.0.0", port=3030)
+@app.route("/health")
+def health():
+    return jsonify({"status": "online","server": "Ultimate Downloader","port": PORT,"directory": SAVE_DIR,"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+
+if __name__ == "__main__":
+    print("\n====================================\n ZIHAD PREMIUM DOWNLOADER\n====================================\n")
+    print(f"Server: http://127.0.0.1:{PORT}\nSave: {SAVE_DIR}\n")
+    app.run(host="0.0.0.0",port=PORT,threaded=True)
