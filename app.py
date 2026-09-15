@@ -1,25 +1,21 @@
 from flask import Flask, request, jsonify, render_template_string, send_from_directory
-import subprocess
 import os
 import json
 import threading
 import re
-import time
-import html
 from datetime import datetime
+import yt_dlp
 
 app = Flask(__name__)
 
 # ============================================================
-# CONFIG
+# CONFIG - FIXED
 # ============================================================
 PORT = 3030
-SAVE_DIR = "/storage/emulated/0/Zihad/Video-download-"
+SAVE_DIR = "/storage/emulated/0/Zihad/VideoDownloader"
 HISTORY_FILE = os.path.join(SAVE_DIR, "history.json")
 
-if not os.path.exists(SAVE_DIR):
-    os.makedirs(SAVE_DIR, exist_ok=True)
-
+os.makedirs(SAVE_DIR, exist_ok=True)
 if not os.path.exists(HISTORY_FILE):
     with open(HISTORY_FILE, "w", encoding="utf-8") as f:
         json.dump([], f, ensure_ascii=False, indent=2)
@@ -52,12 +48,30 @@ def load_history():
 def save_history(history):
     try:
         with open(HISTORY_FILE, "w", encoding="utf-8") as f:
-            json.dump(history, f, ensure_ascii=False, indent=2)
+            json.dump(history[-100:], f, ensure_ascii=False, indent=2)
         return True
     except Exception: return False
 
+def my_hook(d):
+    if d['status'] == 'downloading':
+        p_str = d.get('_percent_str', '0%').replace('%','').strip()
+        try:
+            p_float = float(p_str)
+        except:
+            p_float = 0
+        update_progress(
+            percent=f"{p_float}%",
+            speed=d.get('_speed_str',''),
+            eta=d.get('_eta_str',''),
+            size=d.get('_total_bytes_str','') or d.get('_total_bytes_estimate_str',''),
+            downloaded=d.get('_downloaded_bytes_str',''),
+            status="downloading"
+        )
+    elif d['status'] == 'finished':
+        update_progress(file=os.path.basename(d.get('filename','')))
+
 # ============================================================
-# PREMIUM HTML - ULTIMATE REDESIGN
+# HTML - YOUR PREMIUM DESIGN (SAME)
 # ============================================================
 HTML = r"""
 <!DOCTYPE html>
@@ -90,14 +104,10 @@ body{
     font-family:"Outfit",-apple-system,BlinkMacSystemFont,sans-serif;
     overflow-x:hidden; padding-bottom:110px;
 }
-
-/* ORBS */
 .bg-orb{position:fixed;width:300px;height:300px;border-radius:50%;filter:blur(80px);opacity:.35;pointer-events:none;z-index:-1;animation:floatOrb 8s ease-in-out infinite}
 .orb-one{background:linear-gradient(135deg,#00d2ff,#3a7bd5);top:-80px;left:-80px}
 .orb-two{background:linear-gradient(135deg,#7c3aed,#ff6ec7);bottom:10%;right:-80px;animation-delay:2s}
 @keyframes floatOrb{0%,100%{transform:translateY(0) scale(1)}50%{transform:translateY(-25px) scale(1.05)}}
-
-/* HEADER */
 .app-header{
     position:sticky;top:0;z-index:100;
     padding:14px 16px;
@@ -122,11 +132,7 @@ body{
     font-size:18px;cursor:pointer;transition:.3s cubic-bezier(.16,1,.3,1);
 }
 .icon-btn:active{transform:scale(.92)}
-
-/* CONTAINER */
 .container{width:100%;max-width:600px;margin:0 auto;padding:18px 14px 10px}
-
-/* HERO */
 .hero{
     padding:22px 20px;border-radius:28px;position:relative;overflow:hidden;
     background:linear-gradient(135deg, rgba(255,255,255,.08), rgba(255,255,255,.02));
@@ -148,8 +154,6 @@ body{
 .hero h1{margin:16px 0 8px;font-size:28px;line-height:1.05;letter-spacing:-.03em;font-weight:800}
 .hero h1 span{background:linear-gradient(135deg,#fff,#7dd3fc);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
 .hero p{margin:0;color:var(--muted);font-size:13px;line-height:1.6;font-weight:400}
-
-/* CARD */
 .card{
     margin-top:16px;padding:18px;border-radius:24px;
     background:var(--card);border:1px solid var(--border);
@@ -173,8 +177,6 @@ body{
     background:var(--card);color:#fff;font-size:20px;cursor:pointer;transition:.3s;
 }
 .paste-btn:active{transform:scale(.93)}
-
-/* BUTTONS */
 .primary-btn{
     width:100%;min-height:54px;margin-top:14px;border:0;border-radius:16px;color:#fff;
     font-weight:700;font-size:14px;cursor:pointer;
@@ -186,8 +188,6 @@ body{
 .primary-btn:hover{transform:translateY(-1px);box-shadow:0 16px 35px rgba(0,132,255,.4)}
 .primary-btn:active{transform:scale(.98)}
 .primary-btn:disabled{opacity:.6;transform:none!important}
-
-/* OPTIONS */
 .options{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:14px}
 .option{
     background:rgba(0,0,0,.22);border:1px solid rgba(255,255,255,.06);
@@ -195,16 +195,12 @@ body{
 }
 .option span{font-size:9px;font-weight:700;letter-spacing:.1em;color:var(--muted);display:block;margin-bottom:6px}
 .option select{width:100%;border:0;outline:0;background:transparent;color:#fff;font-size:13px;font-weight:600;font-family:"Outfit"}
-
-/* INFO */
 .info-card{display:none;margin-top:16px;overflow:hidden;border-radius:24px;background:var(--card);border:1px solid var(--border);animation:slideUp.5s cubic-bezier(.16,1,.3,1)}
 @keyframes slideUp{from{opacity:0;transform:translateY(20px) scale(.98)}to{opacity:1;transform:translateY(0) scale(1)}}
 .info-image{width:100%;height:200px;object-fit:cover;display:block;background:#0f1a2a}
 .info-body{padding:16px}
 .info-title{font-size:15px;font-weight:700;line-height:1.4;letter-spacing:-.01em}
 .info-channel{color:var(--muted);font-size:12px;margin-top:6px;display:flex;align-items:center;gap:6px}
-
-/* PROGRESS */
 .progress-card{
     display:none;margin-top:16px;padding:18px;border-radius:24px;
     background:linear-gradient(135deg, rgba(0,198,255,.10), rgba(124,58,237,.10));
@@ -230,8 +226,6 @@ body{
 .stat{padding:10px 6px;border-radius:14px;background:rgba(0,0,0,.25);text-align:center;border:1px solid rgba(255,255,255,.05)}
 .stat-label{font-size:9px;color:var(--muted);font-weight:700;letter-spacing:.08em;margin-bottom:4px;display:block}
 .stat-value{font-size:11px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-
-/* RESULT */
 .result{display:none;margin-top:16px;animation:slideUp.5s cubic-bezier(.16,1,.3,1)}
 .result-video{width:100%;max-height:340px;border-radius:20px;background:#000;display:block}
 .download-file{
@@ -240,8 +234,6 @@ body{
     background:linear-gradient(135deg,#16a34a,#0ea5e9);box-shadow:0 10px 25px rgba(22,163,74,.3);
     transition:.3s;
 }
-
-/* QUICK */
 .quick-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:16px}
 .quick{
     min-height:92px;border-radius:22px;border:1px solid var(--border);
@@ -253,8 +245,6 @@ body{
 .quick-icon{width:36px;height:36px;border-radius:11px;display:flex;align-items:center;justify-content:center;font-size:18px;background:rgba(255,255,255,.06);border:1px solid rgba(255,255,255,.06)}
 .quick-title{margin-top:12px;font-size:12px;font-weight:700;letter-spacing:-.01em}
 .quick-sub{color:var(--muted);font-size:10px;margin-top:3px}
-
-/* BOTTOM NAV */
 .bottom-nav{
     position:fixed;left:12px;right:12px;bottom:12px;z-index:200;height:72px;border-radius:24px;
     background:rgba(8,15,25,.85);border:1px solid rgba(255,255,255,.10);
@@ -272,8 +262,6 @@ body{
 .nav-btn.active{color:#fff}
 .nav-btn.active i{transform:translateY(-1px);color:#7dd3fc;text-shadow:0 0 15px #00d2ff}
 .nav-btn.active span{color:#7dd3fc}
-
-/* MODAL */
 .modal{display:none;position:fixed;inset:0;z-index:500;background:rgba(0,0,0,.7);backdrop-filter:blur(12px);padding:14px;align-items:flex-end;justify-content:center}
 .modal-box{
     width:100%;max-width:600px;max-height:82vh;overflow:auto;border-radius:28px 28px 20px 20px;
@@ -290,8 +278,6 @@ body{
 .list-time{color:var(--muted);font-size:10px;margin-top:6px;display:flex;align-items:center;gap:6px}
 .file-link{color:#7dd3fc;text-decoration:none;font-size:12px;word-break:break-word;font-weight:600;display:flex;align-items:center;gap:8px}
 .empty{text-align:center;padding:45px 15px;color:var(--muted);font-size:13px}
-
-/* TOAST */
 .toast{
     position:fixed;left:50%;bottom:100px;transform:translateX(-50%) translateY(20px);
     z-index:999;min-width:260px;max-width:90vw;padding:14px 18px;border-radius:16px;
@@ -307,7 +293,6 @@ body{
 </head>
 <body>
 <div class="bg-orb orb-one"></div><div class="bg-orb orb-two"></div>
-
 <header class="app-header">
     <div class="header-row">
         <div class="brand">
@@ -322,14 +307,12 @@ body{
         </div>
     </div>
 </header>
-
 <main class="container">
     <section class="hero">
-        <div class="hero-label"><span class="status-dot"></span> SERVER ONLINE • PREMIUM</div>
+        <div class="hero-label"><span class="status-dot"></span> SERVER ONLINE • PREMIUM V2</div>
         <h1>Download anything, <span>beautifully.</span></h1>
         <p>Paste any video link, choose quality in 4K / MP3 and get instant premium download with real-time progress.</p>
     </section>
-
     <section class="card">
         <label class="input-label"><i class="ri-link"></i> VIDEO URL</label>
         <div class="url-row">
@@ -339,7 +322,7 @@ body{
         <button id="infoButton" class="primary-btn" onclick="loadInfo()"><i class="ri-search-eye-line"></i> Load Video Info</button>
         <div class="options">
             <div class="option"><span><i class="ri-hd-line"></i> QUALITY</span>
-                <select id="quality"><option value="360">360p • Low</option><option value="480">480p • SD</option><option value="720" selected>720p • HD</option><option value="1080">1080p • Full HD</option></select>
+                <select id="quality"><option value="360">360p • Low</option><option value="480">480p • SD</option><option value="720" selected>720p • HD</option><option value="1080">1080p • Full HD</option><option value="2160">2160p • 4K</option></select>
             </div>
             <div class="option"><span><i class="ri-film-line"></i> FORMAT</span>
                 <select id="type"><option value="video">🎬 Video MP4</option><option value="audio">🎵 Audio MP3</option></select>
@@ -347,7 +330,6 @@ body{
         </div>
         <button id="downloadButton" class="primary-btn" style="background:linear-gradient(135deg,#0ea5e9,#6366f1)" onclick="startDownload()"><i class="ri-download-cloud-2-line"></i> Start Premium Download</button>
     </section>
-
     <section id="infoCard" class="info-card">
         <img id="infoImage" class="info-image" src="" alt="Thumbnail">
         <div class="info-body">
@@ -355,7 +337,6 @@ body{
             <div id="infoChannel" class="info-channel"><i class="ri-youtube-fill"></i> <span>Loading...</span></div>
         </div>
     </section>
-
     <section id="progressCard" class="progress-card">
         <div class="progress-top">
             <div id="progressTitle" class="progress-title">Downloading...</div>
@@ -368,22 +349,18 @@ body{
             <div class="stat"><span class="stat-label">ETA</span><span id="statEta" class="stat-value">—</span></div>
         </div>
     </section>
-
     <section id="result" class="result"></section>
-
     <section class="quick-grid">
         <button class="quick" onclick="showHistory()"><div class="quick-icon"><i class="ri-history-line"></i></div><div class="quick-title">History</div><div class="quick-sub">Previous downloads</div></button>
         <button class="quick" onclick="showFiles()"><div class="quick-icon"><i class="ri-folder-3-line"></i></div><div class="quick-title">My Files</div><div class="quick-sub">Browse storage</div></button>
     </section>
 </main>
-
 <nav class="bottom-nav">
     <button class="nav-btn active" onclick="goHome()"><i class="ri-home-5-fill"></i><span>Home</span></button>
     <button class="nav-btn" onclick="showHistory()"><i class="ri-time-line"></i><span>History</span></button>
     <button class="nav-btn" onclick="showFiles()"><i class="ri-folder-3-line"></i><span>Files</span></button>
     <button class="nav-btn" onclick="refreshApp()"><i class="ri-settings-3-line"></i><span>Refresh</span></button>
 </nav>
-
 <div id="modal" class="modal" onclick="closeModalOutside(event)">
     <div class="modal-box">
         <div class="modal-header"><div id="modalTitle" class="modal-title">Downloads</div><button class="close" onclick="closeModal()"><i class="ri-close-line"></i></button></div>
@@ -391,7 +368,6 @@ body{
     </div>
 </div>
 <div id="toast" class="toast"></div>
-
 <script>
 let progressTimer=null,downloadActive=false;
 function el(id){return document.getElementById(id)}
@@ -410,7 +386,7 @@ function loadInfo(){
     if(!url){toast("⚠️ Enter a video URL first");el("url").focus();return;}
     const button=el("infoButton");button.disabled=true;button.innerHTML='<span class="spinner"></span> Fetching Info...';
     fetch("/info",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:url})})
-   .then(r=>r.json()).then(data=>{
+  .then(r=>r.json()).then(data=>{
         if(!data.success) throw new Error(data.error||"Failed");
         el("infoCard").style.display="block";
         el("infoImage").src=data.thumbnail||"";
@@ -418,7 +394,7 @@ function loadInfo(){
         el("infoChannel").innerHTML='<i class="ri-youtube-fill"></i> '+ (data.channel||"Unknown");
         toast("Info loaded successfully 🔥");
     }).catch(err=>{toast(err.message||"Failed to load info")})
-   .finally(()=>{button.disabled=false;button.innerHTML='<i class="ri-search-eye-line"></i> Load Video Info';});
+  .finally(()=>{button.disabled=false;button.innerHTML='<i class="ri-search-eye-line"></i> Load Video Info';});
 }
 function startDownload(){
     if(downloadActive){toast("A download is already running ⏳");return;}
@@ -430,7 +406,7 @@ function startDownload(){
     el("progressBar").style.width="0%";el("progressPercent").innerText="0%";
     el("progressTitle").innerText= type==="audio"? "Preparing MP3..." : "Preparing video...";
     fetch("/download",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({url:url,quality:quality,type:type})})
-   .then(r=>r.json()).then(data=>{
+  .then(r=>r.json()).then(data=>{
         if(!data.success) throw new Error(data.error||"Download failed");
         toast("Download started 🚀");startProgressMonitor();
     }).catch(err=>{
@@ -450,7 +426,7 @@ function checkProgress(){
         if(data.status==="error"){
             stopProgressMonitor();downloadActive=false;el("downloadButton").disabled=false;
             el("downloadButton").innerHTML='<i class="ri-download-cloud-2-line"></i> Start Premium Download';
-            toast(data.error||"Download failed");return;
+            toast("❌ "+(data.error||"Download failed"));return;
         }
         if(data.status==="finished" && data.file){
             stopProgressMonitor();downloadActive=false;el("downloadButton").disabled=false;
@@ -515,72 +491,81 @@ def info():
         data = request.get_json(silent=True) or {}
         url = str(data.get("url", "")).strip()
         if not url: return jsonify({"success": False,"error": "URL is required"}), 400
-        command = ["yt-dlp","--no-playlist","-j",url]
-        output = subprocess.check_output(command, stderr=subprocess.STDOUT).decode("utf-8", errors="replace")
-        first_line = output.strip().splitlines()[0]
-        j = json.loads(first_line)
-        return jsonify({"success": True,"title": j.get("title","Unknown title"),"channel": j.get("channel", j.get("uploader","Unknown channel")),"thumbnail": j.get("thumbnail","")})
-    except subprocess.CalledProcessError as e:
-        error_text = (e.output.decode("utf-8", errors="replace") if e.output else "yt-dlp error")
-        return jsonify({"success": False,"error": error_text[-1000:]}), 500
+
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'noplaylist': True,
+            'skip_download': True,
+            'extractor_args': {'youtube': {'player_client': ['android', 'web']}},
+        }
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            j = ydl.extract_info(url, download=False)
+            return jsonify({
+                "success": True,
+                "title": j.get("title","Unknown title"),
+                "channel": j.get("channel", j.get("uploader","Unknown channel")),
+                "thumbnail": j.get("thumbnail","")
+            })
     except Exception as e:
-        return jsonify({"success": False,"error": str(e)}), 500
+        return jsonify({"success": False,"error": str(e)[:1000]}), 500
 
 def run_download(url, quality, typ):
-    global progress
     start_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     update_progress(percent="0%",speed="",eta="",size="",downloaded="",file="",title="Starting download...",status="downloading",error="",type=typ,quality=str(quality),started=start_time,finished="")
     try:
+        # BEST OPTIONS TO BYPASS YOUTUBE BLOCK
+        ydl_opts = {
+            'outtmpl': os.path.join(SAVE_DIR, '%(title)s.%(ext)s'),
+            'noplaylist': True,
+            'progress_hooks': [my_hook],
+            'nocheckcertificate': True,
+            'extractor_args': {'youtube': {'player_client': ['android', 'web', 'ios']}},
+            'http_headers': {'User-Agent': 'Mozilla/5.0 (Linux; Android 10) AppleWebKit/537.36'},
+        }
+
         if typ == "audio":
-            cmd = ["yt-dlp","--no-playlist","--newline","--extract-audio","--audio-format","mp3","--audio-quality","0","-o",os.path.join(SAVE_DIR,"%(title)s.%(ext)s"),url]
+            ydl_opts.update({
+                'format': 'bestaudio/best',
+                'postprocessors': [{'key': 'FFmpegExtractAudio','preferredcodec': 'mp3','preferredquality': '192'}]
+            })
         else:
-            cmd = ["yt-dlp","--no-playlist","--newline","-f","bestvideo[height<=%s]+bestaudio/best" % str(quality),"--merge-output-format","mp4","-o",os.path.join(SAVE_DIR,"%(title)s.%(ext)s"),url]
-        process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
-        detected_file = ""
-        for line in process.stdout:
-            line=line.strip()
-            if "[download]" in line:
-                percent_match=re.search(r"(\d+(?:\.\d+)?)%",line)
-                size_match=re.search(r"of\s+([^\s]+)",line)
-                speed_match=re.search(r"at\s+([^\s]+)",line)
-                eta_match=re.search(r"ETA\s+([^\s]+)",line)
-                downloaded_match=re.search(r"\s([0-9.]+\w+)\s+of\s+",line)
-                if percent_match: update_progress(percent=percent_match.group(1)+"%")
-                if size_match: update_progress(size=size_match.group(1))
-                if speed_match: update_progress(speed=speed_match.group(1))
-                if eta_match: update_progress(eta=eta_match.group(1))
-                if downloaded_match: update_progress(downloaded=downloaded_match.group(1))
-            if "Destination:" in line: detected_file=(line.split("Destination:",1)[1].strip())
-            if "Merging formats into" in line:
-                match=re.search(r'Merging formats into\s+"(.+)"',line)
-                if match: detected_file=match.group(1).strip()
-            if "Downloading webpage" in line: update_progress(title="Fetching video...")
-            if "Downloading" in line and "video" in line.lower(): update_progress(title="Downloading video...")
-        process.wait()
-        if process.returncode!= 0: raise Exception("yt-dlp exited with code "+str(process.returncode))
+            # Fixed format - 720 na thakleo jeta ache seta namabe, fail korbe na
+            ydl_opts.update({
+                'format': f'bv*[height<={quality}]+ba/b[height<={quality}]/b/bv*+ba/b',
+                'merge_output_format': 'mp4',
+            })
+
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(url, download=False)
+            update_progress(title=info.get('title', url))
+            ydl.download([url])
+
+        # Find latest file
         final_file=""
-        if detected_file:
-            detected_file=os.path.basename(detected_file)
-            possible=os.path.join(SAVE_DIR,detected_file)
-            if os.path.isfile(possible): final_file=detected_file
-        if not final_file:
-            try:
-                files=[]
-                for filename in os.listdir(SAVE_DIR):
-                    full_path=os.path.join(SAVE_DIR,filename)
-                    if os.path.isfile(full_path): files.append((os.path.getmtime(full_path),filename))
-                if files:
-                    files.sort(reverse=True); final_file=files[0][1]
-            except Exception: final_file=""
+        try:
+            files=[]
+            for filename in os.listdir(SAVE_DIR):
+                if filename.endswith('.json'): continue
+                full_path=os.path.join(SAVE_DIR,filename)
+                if os.path.isfile(full_path): files.append((os.path.getmtime(full_path),filename))
+            if files:
+                files.sort(reverse=True)
+                final_file=files[0][1]
+        except Exception: pass
+
         history=load_history()
         title=progress.get("title","")
         if (not title or title in ["Starting download...","Downloading video...","Fetching video..."]): title=url
         history.append({"title": title,"url": url,"file": final_file,"type": typ,"quality": str(quality),"time": datetime.now().strftime("%Y-%m-%d %H:%M")})
-        history=history[-100:]; save_history(history)
+        save_history(history)
+
         finish_time=datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         update_progress(percent="100%",file=final_file,status="finished",finished=finish_time)
+
     except Exception as e:
-        update_progress(status="error",error=str(e),finished=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
+        print(f"ERROR: {e}")
+        update_progress(status="error",error=str(e)[:800],finished=datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
 
 @app.route("/download", methods=["POST"])
 def download():
@@ -590,10 +575,12 @@ def download():
         quality=str(data.get("quality","720")).strip()
         typ=str(data.get("type","video")).strip()
         if not url: return jsonify({"success": False,"error": "URL is required"}), 400
-        if quality not in ["360","480","720","1080"]: quality="720"
+        if quality not in ["360","480","720","1080","2160"]: quality="720"
         if typ not in ["video","audio"]: typ="video"
+
         with progress_lock: current_status=progress.get("status","idle")
         if current_status=="downloading": return jsonify({"success": False,"error": "Another download is already running"}), 409
+
         thread=threading.Thread(target=run_download,args=(url,quality,typ),daemon=True)
         thread.start()
         return jsonify({"success": True,"message": "Download started"})
@@ -612,6 +599,7 @@ def files():
     try:
         result=[]
         for filename in os.listdir(SAVE_DIR):
+            if filename.endswith('.json'): continue
             full_path=os.path.join(SAVE_DIR,filename)
             if os.path.isfile(full_path): result.append(filename)
         result.sort(key=lambda x: os.path.getmtime(os.path.join(SAVE_DIR,x)), reverse=True)
@@ -624,9 +612,9 @@ def file(name): return send_from_directory(SAVE_DIR,name,as_attachment=False)
 
 @app.route("/health")
 def health():
-    return jsonify({"status": "online","server": "Ultimate Downloader","port": PORT,"directory": SAVE_DIR,"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+    return jsonify({"status": "online","server": "Zihad Downloader V2 Fixed","port": PORT,"directory": SAVE_DIR,"time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
 
 if __name__ == "__main__":
-    print("\n====================================\n ZIHAD PREMIUM DOWNLOADER\n====================================\n")
+    print("\n====================================\n ZIHAD PREMIUM DOWNLOADER V2 FIXED\n====================================\n")
     print(f"Server: http://127.0.0.1:{PORT}\nSave: {SAVE_DIR}\n")
     app.run(host="0.0.0.0",port=PORT,threaded=True)
