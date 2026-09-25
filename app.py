@@ -44,7 +44,6 @@ progress = {
     "title": ""
 }
 
-# ... (Apnar purono HTML code ekhane boshaben, seta change kora lage nai) ...
 HTML = r"""
 <!DOCTYPE html>
 <html>
@@ -716,12 +715,12 @@ def info():
     if not url:
         return jsonify({"title": "", "channel": "", "thumbnail": ""})
     try:
-        cmd = ["yt-dlp", "-j", "--no-playlist", "--no-check-certificate"]
+        cmd = ["yt-dlp", "-j", "--no-playlist", "--no-check-certificate",
+               "--extractor-args", "youtube:player_client=web_safari,web"]
         if os.path.exists(COOKIE_FILE):
             cmd.extend(["--cookies", COOKIE_FILE])
         cmd.append(url)
         
-        # Timeout 30 theke 90 kora holo
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
         
         if result.returncode != 0:
@@ -738,6 +737,7 @@ def info():
     except Exception as e:
         return jsonify({"title": "Error", "channel": str(e), "thumbnail": ""})
 
+
 @app.route("/geturl", methods=["POST"])
 def geturl():
     data = request.json or {}
@@ -752,17 +752,15 @@ def geturl():
         if typ == "audio":
             fmt = "bestaudio[ext=m4a]/bestaudio/best"
         else:
-            fmt = f"best[height<={quality}][ext=mp4]/best[height<={quality}]/best"
+            fmt = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
 
-        # Using android/ios client to bypass heavy JS checks and speed up extraction
-        # Timeout increased from 30 to 90 seconds
         url_cmd = [
             "yt-dlp", 
             "-f", fmt, 
             "-g", 
             "--no-playlist", 
             "--no-check-certificate",
-            "--extractor-args", "youtube:player_client=android,ios,web_safari",
+            "--extractor-args", "youtube:player_client=web_safari,web",
             url
         ]
         
@@ -778,13 +776,12 @@ def geturl():
         direct_out = result.stdout.strip()
         urls = [u for u in direct_out.split("\n") if u.strip()]
 
-        # Metadata fetching
         meta_cmd = [
             "yt-dlp", 
             "-j", 
             "--no-playlist", 
             "--no-check-certificate",
-            "--extractor-args", "youtube:player_client=android,ios,web_safari",
+            "--extractor-args", "youtube:player_client=web_safari,web",
             url
         ]
         if os.path.exists(COOKIE_FILE):
@@ -804,6 +801,7 @@ def geturl():
         return jsonify({"error": "Server timed out. Video is too large or server is too slow. Please try again."}), 504
     except Exception as e:
         return jsonify({"error": str(e)}), 500
+
 
 def parse_progress_line(line):
     info = {}
@@ -844,6 +842,7 @@ def parse_progress_line(line):
 
     return info
 
+
 def run_download(url, quality, typ):
     global progress
 
@@ -859,7 +858,8 @@ def run_download(url, quality, typ):
     })
 
     try:
-        cmd = ["yt-dlp", "-j", "--no-playlist", "--no-check-certificate"]
+        cmd = ["yt-dlp", "-j", "--no-playlist", "--no-check-certificate",
+               "--extractor-args", "youtube:player_client=web_safari,web"]
         if os.path.exists(COOKIE_FILE):
             cmd.extend(["--cookies", COOKIE_FILE])
         cmd.append(url)
@@ -876,7 +876,7 @@ def run_download(url, quality, typ):
             "--extract-audio", "--audio-format", "mp3",
             "--newline", "-o", SAVE_DIR + "/%(title)s.%(ext)s",
             "--no-playlist", "--no-check-certificate",
-            "--extractor-args", "youtube:player_client=android,ios,web_safari"
+            "--extractor-args", "youtube:player_client=web_safari,web"
         ]
         if os.path.exists(COOKIE_FILE):
             cmd.extend(["--cookies", COOKIE_FILE])
@@ -888,7 +888,7 @@ def run_download(url, quality, typ):
             "--merge-output-format", "mp4",
             "--newline", "-o", SAVE_DIR + "/%(title)s.%(ext)s",
             "--no-playlist", "--no-check-certificate",
-            "--extractor-args", "youtube:player_client=android,ios,web_safari"
+            "--extractor-args", "youtube:player_client=web_safari,web"
         ]
         if os.path.exists(COOKIE_FILE):
             cmd.extend(["--cookies", COOKIE_FILE])
