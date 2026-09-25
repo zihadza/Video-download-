@@ -1,7 +1,7 @@
 import os, re, subprocess, time
 
 # Main download folder
-FOLDER = "/storage/emulated/0/Zihad/Video-download-"
+FOLDER = "/app/downloads"
 MERGED_FOLDER = os.path.join(FOLDER, "merged")
 
 # Create merged folder if not exists
