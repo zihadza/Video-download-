@@ -1,4 +1,4 @@
 Flask
 yt-dlp
 gunicorn
-requests
+urllib3
