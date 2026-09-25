@@ -1,5 +1,5 @@
 from flask import Flask, request, jsonify, render_template_string, send_from_directory
-import subprocess, os, json, threading, re, time, urllib.parse
+import subprocess, os, json, threading, re, urllib.parse, urllib.request
 from datetime import datetime
 
 app = Flask(__name__)
@@ -44,6 +44,7 @@ progress = {
     "title": ""
 }
 
+# ... (Apnar purono HTML code ekhane boshaben, seta change kora lage nai) ...
 HTML = r"""
 <!DOCTYPE html>
 <html>
@@ -690,8 +691,9 @@ def search():
         url += f"&pageToken={pageToken}"
 
     try:
-        raw = subprocess.check_output(["curl", "-s", url], timeout=15).decode()
-        data = json.loads(raw)
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=15) as response:
+            data = json.loads(response.read().decode())
     except Exception as e:
         return jsonify({"items": [], "nextPageToken": "", "error": str(e)})
 
@@ -719,7 +721,9 @@ def info():
             cmd.extend(["--cookies", COOKIE_FILE])
         cmd.append(url)
         
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        # Timeout 30 theke 90 kora holo
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=90)
+        
         if result.returncode != 0:
             return jsonify({"title": "Error", "channel": result.stderr[:200], "thumbnail": ""})
             
@@ -729,6 +733,8 @@ def info():
             "channel": j.get("channel") or j.get("uploader", ""),
             "thumbnail": j.get("thumbnail", "")
         })
+    except subprocess.TimeoutExpired:
+        return jsonify({"title": "Timeout Error", "channel": "Server took too long", "thumbnail": ""})
     except Exception as e:
         return jsonify({"title": "Error", "channel": str(e), "thumbnail": ""})
 
@@ -748,12 +754,22 @@ def geturl():
         else:
             fmt = f"best[height<={quality}][ext=mp4]/best[height<={quality}]/best"
 
-        url_cmd = ["yt-dlp", "-f", fmt, "-g", "--no-playlist", "--no-check-certificate"]
+        # Using android/ios client to bypass heavy JS checks and speed up extraction
+        # Timeout increased from 30 to 90 seconds
+        url_cmd = [
+            "yt-dlp", 
+            "-f", fmt, 
+            "-g", 
+            "--no-playlist", 
+            "--no-check-certificate",
+            "--extractor-args", "youtube:player_client=android,ios,web_safari",
+            url
+        ]
+        
         if os.path.exists(COOKIE_FILE):
             url_cmd.extend(["--cookies", COOKIE_FILE])
-        url_cmd.append(url)
         
-        result = subprocess.run(url_cmd, capture_output=True, text=True, timeout=30)
+        result = subprocess.run(url_cmd, capture_output=True, text=True, timeout=90)
         
         if result.returncode != 0:
             error_msg = result.stderr or result.stdout or "Unknown yt-dlp error"
@@ -762,12 +778,19 @@ def geturl():
         direct_out = result.stdout.strip()
         urls = [u for u in direct_out.split("\n") if u.strip()]
 
-        meta_cmd = ["yt-dlp", "-j", "--no-playlist", "--no-check-certificate"]
+        # Metadata fetching
+        meta_cmd = [
+            "yt-dlp", 
+            "-j", 
+            "--no-playlist", 
+            "--no-check-certificate",
+            "--extractor-args", "youtube:player_client=android,ios,web_safari",
+            url
+        ]
         if os.path.exists(COOKIE_FILE):
             meta_cmd.extend(["--cookies", COOKIE_FILE])
-        meta_cmd.append(url)
-        
-        meta_result = subprocess.run(meta_cmd, capture_output=True, text=True, timeout=30)
+            
+        meta_result = subprocess.run(meta_cmd, capture_output=True, text=True, timeout=90)
         meta = json.loads(meta_result.stdout) if meta_result.returncode == 0 else {}
 
         return jsonify({
@@ -777,6 +800,8 @@ def geturl():
             "audio_url": urls[1] if len(urls) > 1 else "",
             "ext": meta.get("ext", "mp4")
         })
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "Server timed out. Video is too large or server is too slow. Please try again."}), 504
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -839,7 +864,7 @@ def run_download(url, quality, typ):
             cmd.extend(["--cookies", COOKIE_FILE])
         cmd.append(url)
         
-        meta = subprocess.check_output(cmd, timeout=20).decode()
+        meta = subprocess.check_output(cmd, timeout=60).decode()
         j = json.loads(meta)
         progress["title"] = (j.get("title") or "")[:70]
     except:
@@ -850,7 +875,8 @@ def run_download(url, quality, typ):
             "yt-dlp", "-f", "bestaudio",
             "--extract-audio", "--audio-format", "mp3",
             "--newline", "-o", SAVE_DIR + "/%(title)s.%(ext)s",
-            "--no-playlist", "--no-check-certificate"
+            "--no-playlist", "--no-check-certificate",
+            "--extractor-args", "youtube:player_client=android,ios,web_safari"
         ]
         if os.path.exists(COOKIE_FILE):
             cmd.extend(["--cookies", COOKIE_FILE])
@@ -861,7 +887,8 @@ def run_download(url, quality, typ):
             "-f", f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best",
             "--merge-output-format", "mp4",
             "--newline", "-o", SAVE_DIR + "/%(title)s.%(ext)s",
-            "--no-playlist", "--no-check-certificate"
+            "--no-playlist", "--no-check-certificate",
+            "--extractor-args", "youtube:player_client=android,ios,web_safari"
         ]
         if os.path.exists(COOKIE_FILE):
             cmd.extend(["--cookies", COOKIE_FILE])
