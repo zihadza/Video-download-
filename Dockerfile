@@ -9,6 +9,5 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY . .
 
-# Apnar main file ta youtube.py hole ei line ta hobe: youtube:app
-# Jodi app.py hoy, tahole app:app
-CMD ["gunicorn", "--bind", "0.0.0.0:8080", "youtube:app"]
+# Render-er $PORT use korun, jate automatic port assign hoy
+CMD gunicorn youtube:app --bind 0.0.0.0:$PORT --timeout 120
