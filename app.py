@@ -12,7 +12,7 @@ app = Flask(__name__)
 # CONFIG - FIXED
 # ============================================================
 PORT = 3030
-SAVE_DIR = "/storage/emulated/0/Zihad/VideoDownloader"
+SAVE_DIR = "/app/downloads"
 HISTORY_FILE = os.path.join(SAVE_DIR, "history.json")
 
 os.makedirs(SAVE_DIR, exist_ok=True)
