@@ -4,7 +4,7 @@ import subprocess, os, json, threading, re, time
 app = Flask(__name__)
 
 PORT = 1111
-SAVE_DIR = "/storage/emulated/0/Zihad/zihaddhorm"
+SAVE_DIR = "/app/downloads"
 HISTORY_FILE = os.path.join(SAVE_DIR, "history.json")
 
 os.makedirs(SAVE_DIR, exist_ok=True)
