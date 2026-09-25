@@ -6,7 +6,7 @@ app = Flask(__name__)
 
 API_KEY = "AIzaSyBL4Cv5baQVtp5g0VrYWNd71UkjIylh8-s"
 
-SAVE_DIR = "/storage/emulated/0/Zihad/Video-download-"
+SAVE_DIR = "/app/downloads"
 HISTORY_FILE = os.path.join(SAVE_DIR, "history.json")
 
 if not os.path.exists(SAVE_DIR):
