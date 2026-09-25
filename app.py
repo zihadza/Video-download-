@@ -6,9 +6,25 @@ app = Flask(__name__)
 
 API_KEY = "AIzaSyBL4Cv5baQVtp5g0VrYWNd71UkjIylh8-s"
 
-# ⚠️ Render e /app folder read-only, tai /tmp use kora hoyeche
+# Render e /tmp folder writable, tai ekhane save hobe
 SAVE_DIR = "/tmp/downloads"
 HISTORY_FILE = os.path.join(SAVE_DIR, "history.json")
+COOKIE_FILE = "/tmp/cookies.txt"
+
+# App start howar somoy environment variable theke cookies file banabo
+def setup_cookies():
+    cookie_data = os.environ.get("YOUTUBE_COOKIES", "")
+    if cookie_data:
+        try:
+            with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+                f.write(cookie_data)
+            print("✅ Cookies file created successfully.")
+        except Exception as e:
+            print("❌ Failed to write cookies:", e)
+    else:
+        print("⚠️ No YOUTUBE_COOKIES found in environment variables.")
+
+setup_cookies()
 
 if not os.path.exists(SAVE_DIR):
     os.makedirs(SAVE_DIR)
@@ -698,8 +714,16 @@ def info():
     if not url:
         return jsonify({"title": "", "channel": "", "thumbnail": ""})
     try:
-        data = subprocess.check_output(["yt-dlp", "-j", "--no-playlist", url], timeout=30).decode()
-        j = json.loads(data)
+        cmd = ["yt-dlp", "-j", "--no-playlist", "--no-check-certificate"]
+        if os.path.exists(COOKIE_FILE):
+            cmd.extend(["--cookies", COOKIE_FILE])
+        cmd.append(url)
+        
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        if result.returncode != 0:
+            return jsonify({"title": "Error", "channel": result.stderr[:200], "thumbnail": ""})
+            
+        j = json.loads(result.stdout)
         return jsonify({
             "title": j.get("title", ""),
             "channel": j.get("channel") or j.get("uploader", ""),
@@ -724,14 +748,10 @@ def geturl():
         else:
             fmt = f"best[height<={quality}][ext=mp4]/best[height<={quality}]/best"
 
-        url_cmd = [
-            "yt-dlp", 
-            "-f", fmt, 
-            "-g", 
-            "--no-playlist", 
-            "--no-check-certificate",
-            url
-        ]
+        url_cmd = ["yt-dlp", "-f", fmt, "-g", "--no-playlist", "--no-check-certificate"]
+        if os.path.exists(COOKIE_FILE):
+            url_cmd.extend(["--cookies", COOKIE_FILE])
+        url_cmd.append(url)
         
         result = subprocess.run(url_cmd, capture_output=True, text=True, timeout=30)
         
@@ -742,7 +762,11 @@ def geturl():
         direct_out = result.stdout.strip()
         urls = [u for u in direct_out.split("\n") if u.strip()]
 
-        meta_cmd = ["yt-dlp", "-j", "--no-playlist", "--no-check-certificate", url]
+        meta_cmd = ["yt-dlp", "-j", "--no-playlist", "--no-check-certificate"]
+        if os.path.exists(COOKIE_FILE):
+            meta_cmd.extend(["--cookies", COOKIE_FILE])
+        meta_cmd.append(url)
+        
         meta_result = subprocess.run(meta_cmd, capture_output=True, text=True, timeout=30)
         meta = json.loads(meta_result.stdout) if meta_result.returncode == 0 else {}
 
@@ -810,7 +834,12 @@ def run_download(url, quality, typ):
     })
 
     try:
-        meta = subprocess.check_output(["yt-dlp", "-j", "--no-playlist", url], timeout=20).decode()
+        cmd = ["yt-dlp", "-j", "--no-playlist", "--no-check-certificate"]
+        if os.path.exists(COOKIE_FILE):
+            cmd.extend(["--cookies", COOKIE_FILE])
+        cmd.append(url)
+        
+        meta = subprocess.check_output(cmd, timeout=20).decode()
         j = json.loads(meta)
         progress["title"] = (j.get("title") or "")[:70]
     except:
@@ -821,16 +850,22 @@ def run_download(url, quality, typ):
             "yt-dlp", "-f", "bestaudio",
             "--extract-audio", "--audio-format", "mp3",
             "--newline", "-o", SAVE_DIR + "/%(title)s.%(ext)s",
-            "--no-playlist", url
+            "--no-playlist", "--no-check-certificate"
         ]
+        if os.path.exists(COOKIE_FILE):
+            cmd.extend(["--cookies", COOKIE_FILE])
+        cmd.append(url)
     else:
         cmd = [
             "yt-dlp",
             "-f", f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best",
             "--merge-output-format", "mp4",
             "--newline", "-o", SAVE_DIR + "/%(title)s.%(ext)s",
-            "--no-playlist", url
+            "--no-playlist", "--no-check-certificate"
         ]
+        if os.path.exists(COOKIE_FILE):
+            cmd.extend(["--cookies", COOKIE_FILE])
+        cmd.append(url)
 
     process = subprocess.Popen(
         cmd,
