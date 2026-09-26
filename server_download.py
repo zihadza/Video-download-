@@ -1,4 +1,3 @@
-cat > server.py <<'PYEOF'
 from flask import Flask, jsonify, request, send_file
 from pathlib import Path
 import json, re, subprocess, shutil, os, threading, time, uuid
@@ -1328,4 +1327,4 @@ if __name__ == "__main__":
     print("====================================")
     print("")
     app.run(host="127.0.0.1", port=PORT, debug=False, threaded=True)
-PYEOF
+
