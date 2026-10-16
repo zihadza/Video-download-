@@ -47,7 +47,7 @@ SETTINGS_FILE       = BASE_DIR / "settings.json"
 APK_HISTORY_FILE    = BASE_DIR / "apk_history.json"
 SNIPPETS_FILE       = BASE_DIR / "snippets.json"
 
-PORT = 3095
+PORT = 3097
 TERMUX_PREFIX = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
 BUILDS = {}
 LOGCAT_PROCS = {}
