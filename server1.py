@@ -1,6 +1,6 @@
 # ============================================================
-# ZIHAD MOBILE IDE v10.0 — FULL EDITION
-# PART 1/3 : Core + Templates + Home Page
+# ZIHAD MOBILE IDE v12.0 — ULTIMATE EDITION
+# PART 1/3 : Imports + Config + Helpers + Templates + Home
 # ============================================================
 from flask import Flask, jsonify, request, send_file, Response
 from pathlib import Path
@@ -8,8 +8,14 @@ import json, re, subprocess, shutil, os, threading, time, uuid, zipfile, io, sys
 from datetime import datetime
 from werkzeug.utils import secure_filename
 
+try:
+    import pty, signal, select, termios, struct, fcntl
+    PTY_AVAILABLE = True
+except ImportError:
+    PTY_AVAILABLE = False
+
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024  # 200MB upload
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
 
 # ---------------- CONFIG ----------------
 BASE_DIR       = Path.home() / "Projects" / "ZihadIDE"
@@ -18,20 +24,36 @@ APKS_DIR       = BASE_DIR / "apks"
 HISTORY_DIR    = BASE_DIR / "history"
 BACKUP_DIR     = BASE_DIR / "backups"
 SIGNED_DIR     = BASE_DIR / "signed"
-TEMPLATES_DIR  = BASE_DIR / "template_gallery"
-for d in [PROJECTS_DIR, APKS_DIR, HISTORY_DIR, BACKUP_DIR, SIGNED_DIR, TEMPLATES_DIR]:
+PLUGINS_DIR    = BASE_DIR / "plugins"
+KANBAN_DIR     = BASE_DIR / "kanban"
+NOTES_DIR      = BASE_DIR / "notes"
+
+for d in [PROJECTS_DIR, APKS_DIR, HISTORY_DIR, BACKUP_DIR,
+          SIGNED_DIR, PLUGINS_DIR, KANBAN_DIR, NOTES_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 SAVED_COMMANDS_FILE = BASE_DIR / "saved_commands.json"
 RECENT_FILES_FILE   = BASE_DIR / "recent_files.json"
 KEYSTORE_FILE       = BASE_DIR / "keystore.json"
 ENV_FILE            = BASE_DIR / "env_vault.json"
+NOTIF_FILE          = BASE_DIR / "notifications.json"
+THEMES_FILE         = BASE_DIR / "custom_themes.json"
+ALIAS_FILE          = BASE_DIR / "aliases.json"
+MACROS_FILE         = BASE_DIR / "macros.json"
+BUILD_HISTORY       = BASE_DIR / "build_history.json"
+ERROR_FREQ_FILE     = BASE_DIR / "error_freq.json"
+BOOKMARKS_FILE      = BASE_DIR / "bookmarks.json"
+SETTINGS_FILE       = BASE_DIR / "settings.json"
+APK_HISTORY_FILE    = BASE_DIR / "apk_history.json"
+SNIPPETS_FILE       = BASE_DIR / "snippets.json"
 
-PORT = 3090
+PORT = 3095
 TERMUX_PREFIX = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
 BUILDS = {}
 LOGCAT_PROCS = {}
 PTY_SESSIONS = {}
+AUTO_BUILD_LOCK = {}
+AUTO_BUILD_DEBOUNCE = 4
 
 # ---------------- LANGUAGES ----------------
 LANGUAGES = {
@@ -58,7 +80,6 @@ LANGUAGES = {
     ".properties": {"name": "Properties", "run": None, "check": None},
 }
 
-# ---------------- GRADLE HINTS ----------------
 GRADLE_HINTS = {
     "SDK location not found": "Create local.properties with sdk.dir=... or install Android SDK",
     "Could not find": "Run `gradle --refresh-dependencies` or check internet",
@@ -73,10 +94,10 @@ GRADLE_HINTS = {
     "Execution failed": "See error above for detail",
     "OutOfMemory": "Increase org.gradle.jvmargs in gradle.properties",
     "MANIFEST": "AndroidManifest.xml has invalid entry",
-    "package ": "Package name conflict",
-    "minSdk": "minSdk must be >= 21",
     "Duplicate resources": "Multiple res files with same name",
     "library": "Missing library dependency",
+    "Could not connect": "Check internet / proxy",
+    "Timeout": "Retry with better internet",
 }
 
 def suggest_fix(line):
@@ -123,13 +144,11 @@ def human_size(n):
     return f"{n:.1f} TB"
 
 def backup_file_version(project_name, file_path, content):
-    """Save a backup version of file (max 20 versions kept)."""
     key = f"{project_name}__{str(file_path).replace('/', '_').replace(chr(92), '_')}"
     hist_dir = HISTORY_DIR / key
     hist_dir.mkdir(parents=True, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-    try:
-        (hist_dir / f"{ts}.bak").write_text(content, encoding="utf-8")
+    try: (hist_dir / f"{ts}.bak").write_text(content, encoding="utf-8")
     except: return
     versions = sorted(hist_dir.iterdir(), key=lambda x: -x.stat().st_mtime)
     for v in versions[20:]:
@@ -150,7 +169,27 @@ def get_saved_commands():
 def save_saved_commands(items):
     save_json(SAVED_COMMANDS_FILE, {"items": items[:60]})
 
-# ---------------- PROJECT CREATION (with all templates) ----------------
+def expand_alias(cmd):
+    aliases = load_json(ALIAS_FILE, {"items": {}}).get("items", {})
+    parts = cmd.split(None, 1)
+    if parts and parts[0] in aliases:
+        rest = parts[1] if len(parts) > 1 else ""
+        return aliases[parts[0]] + (" " + rest if rest else "")
+    return cmd
+
+def _push_notif(project, title, body, kind="info"):
+    notifs = load_json(NOTIF_FILE, {"items": []}).get("items", [])
+    notifs.insert(0, {
+        "id": str(uuid.uuid4())[:8],
+        "project": project, "title": title, "body": body,
+        "kind": kind, "ts": time.time(), "read": False
+    })
+    notifs = notifs[:200]
+    save_json(NOTIF_FILE, {"items": notifs})
+
+# ============================================================
+# PROJECT CREATION WITH ALL TEMPLATES
+# ============================================================
 def create_android_project(name, package, language, template="empty"):
     project = PROJECTS_DIR / name
     if project.exists():
@@ -167,7 +206,6 @@ def create_android_project(name, package, language, template="empty"):
               res_dir / "drawable", main_dir / "assets", main_dir / "jniLibs"]:
         d.mkdir(parents=True, exist_ok=True)
 
-    # ---- TEMPLATE: LOGIN ----
     def login_tpl():
         java = f'''package {package};
 import android.app.Activity; import android.os.Bundle;
@@ -202,7 +240,6 @@ public class MainActivity extends Activity {{
 </LinearLayout>'''
         return java, layout
 
-    # ---- TEMPLATE: LIST ----
     def list_tpl():
         java = f'''package {package};
 import android.app.Activity; import android.os.Bundle; import android.widget.*;
@@ -226,7 +263,6 @@ public class MainActivity extends Activity {{
 </LinearLayout>'''
         return java, layout
 
-    # ---- TEMPLATE: SPLASH ----
     def splash_tpl():
         java = f'''package {package};
 import android.app.Activity; import android.os.Bundle;
@@ -275,7 +311,6 @@ class HomeActivity : Activity() {{
         write_file(kotlin_dir / "HomeActivity.kt", home_kt)
         return java, layout
 
-    # ---- TEMPLATE: BOTTOM NAV ----
     def bottom_nav_tpl():
         java = f'''package {package};
 import android.app.Activity; import android.os.Bundle; import android.widget.TextView;
@@ -312,7 +347,6 @@ public class MainActivity extends Activity {{
 </LinearLayout>'''
         return java, layout
 
-    # ---- TEMPLATE: EMPTY ----
     def empty_tpl():
         java = f'''package {package};
 import android.app.Activity; import android.os.Bundle; import android.widget.TextView; import android.view.Gravity;
@@ -336,7 +370,6 @@ public class MainActivity extends Activity {{
                "bottom_nav": bottom_nav_tpl, "empty": empty_tpl}
     main_java, layout = tpl_map.get(template, empty_tpl)()
 
-    # Simple Kotlin variant
     main_kotlin = f'''package {package}
 import android.app.Activity
 import android.os.Bundle
@@ -468,25 +501,28 @@ org.gradle.parallel=true
     write_file(project / ".gitignore", "build/\n.gradle/\nlocal.properties\n*.iml\n.idea/\n")
     return project
 
-
 # ============================================================
-# HOME PAGE (with theme toggle + backup/restore)
+# HOME PAGE
 # ============================================================
 HOME_HTML = r'''<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<title>Zihad Mobile IDE v10</title>
+<title>Zihad Mobile IDE v12</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 <style>
-:root{--bg:#070b14;--card:rgba(17,24,39,.8);--border:rgba(55,65,81,.6);--primary:#3b82f6;--text:#f1f5f9;--muted:#94a3b8;--radius:18px}
-*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#070b14;--card:rgba(17,24,39,.85);--border:rgba(55,65,81,.6);--primary:#3b82f6;--text:#f1f5f9;--muted:#94a3b8;--radius:18px}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 body{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;min-height:100vh;background-image:radial-gradient(ellipse at 20% 20%,rgba(59,130,246,.12) 0%,transparent 50%),radial-gradient(ellipse at 80% 80%,rgba(139,92,246,.1) 0%,transparent 50%)}
 header{padding:16px 20px;background:rgba(15,23,42,.9);backdrop-filter:blur(20px);border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;position:sticky;top:0;z-index:50;gap:8px;flex-wrap:wrap}
-header h1{font-size:1.15rem;font-weight:700;background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent}
+header h1{font-size:1.15rem;font-weight:700;background:linear-gradient(135deg,#60a5fa,#a78bfa);-webkit-background-clip:text;-webkit-text-fill-color:transparent;display:flex;align-items:center;gap:8px}
+header h1 i{color:#60a5fa;-webkit-text-fill-color:initial}
 .container{padding:20px;max-width:720px;margin:0 auto}
 .card{background:var(--card);backdrop-filter:blur(16px);border:1px solid var(--border);border-radius:var(--radius);padding:20px;margin-bottom:18px;box-shadow:0 8px 32px rgba(0,0,0,.3)}
-h2{font-size:1.05rem;margin-bottom:12px;color:#e2e8f0}
+h2{font-size:1.05rem;margin-bottom:12px;color:#e2e8f0;display:flex;align-items:center;gap:8px}
+h2 i{color:#60a5fa}
 .status-dot{display:inline-block;width:9px;height:9px;border-radius:50%;background:#22c55e;margin-right:8px;box-shadow:0 0 10px #22c55e}
-button{border:0;border-radius:12px;padding:10px 14px;margin:4px;font-weight:600;font-size:13px;cursor:pointer;color:#fff}
+button{border:0;border-radius:12px;padding:11px 16px;margin:4px;font-weight:600;font-size:13px;cursor:pointer;color:#fff;display:inline-flex;align-items:center;gap:6px}
+button:active{transform:scale(.96)}
 .btn-primary{background:linear-gradient(135deg,#3b82f6,#2563eb)}
 .btn-success{background:linear-gradient(135deg,#22c55e,#16a34a)}
 .btn-danger{background:linear-gradient(135deg,#ef4444,#dc2626)}
@@ -498,9 +534,9 @@ input,select{width:100%;padding:14px 16px;margin:8px 0;border-radius:12px;border
 .badge{display:inline-block;padding:3px 10px;border-radius:20px;font-size:11px;font-weight:600;margin-left:6px;background:rgba(59,130,246,.2);color:#93c5fd}
 .hidden{display:none!important}
 .toast-container{position:fixed;bottom:24px;left:50%;transform:translateX(-50%);z-index:9999;display:flex;flex-direction:column;gap:8px;pointer-events:none}
-.toast{background:rgba(15,23,42,.95);border:1px solid var(--border);color:#fff;padding:12px 20px;border-radius:14px;font-size:13px}
+.toast{background:rgba(15,23,42,.95);border:1px solid var(--border);color:#fff;padding:12px 20px;border-radius:14px;font-size:13px;display:flex;align-items:center;gap:8px}
 .toast.success{border-color:rgba(34,197,94,.5)}.toast.error{border-color:rgba(239,68,68,.5)}
-.fab{position:fixed;bottom:28px;right:24px;width:58px;height:58px;border-radius:18px;background:linear-gradient(135deg,#3b82f6,#8b5cf6);display:flex;align-items:center;justify-content:center;font-size:28px;color:#fff;border:0;z-index:40}
+.fab{position:fixed;bottom:28px;right:24px;width:58px;height:58px;border-radius:50%;background:linear-gradient(135deg,#3b82f6,#8b5cf6);display:flex;align-items:center;justify-content:center;font-size:24px;color:#fff;border:0;z-index:40;box-shadow:0 8px 30px rgba(139,92,246,.6)}
 .template-grid{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin:12px 0}
 .template-card{background:rgba(8,15,28,.7);border:2px solid var(--border);border-radius:14px;padding:12px 8px;text-align:center;cursor:pointer;font-size:12px}
 .template-card.active{border-color:var(--primary);background:rgba(59,130,246,.12)}
@@ -514,13 +550,13 @@ body.light .project,body.light .apk-item,body.light .template-card{background:#f
 </style></head>
 <body>
 <header>
-  <h1>⚡ Zihad IDE v10</h1>
+  <h1><i class="fa-solid fa-bolt"></i> Zihad IDE v12</h1>
   <div style="display:flex;gap:2px;flex-wrap:wrap">
-    <button class="btn-ghost" onclick="toggleTheme()" id="themeBtn">🌙</button>
-    <button class="btn-ghost" onclick="location.href='/api/backup'">💾</button>
-    <button class="btn-ghost upload-btn" style="position:relative;overflow:hidden">📥<input type="file" style="position:absolute;inset:0;opacity:0;cursor:pointer;width:100%" onchange="restoreBackup(this)"></button>
-    <button class="btn-ghost" onclick="showApks()">📦</button>
-    <button class="btn-success" onclick="showCreate()">+ New</button>
+    <button class="btn-ghost" onclick="toggleTheme()" id="themeBtn"><i class="fa-solid fa-moon"></i></button>
+    <button class="btn-ghost" onclick="location.href='/api/backup'"><i class="fa-solid fa-floppy-disk"></i></button>
+    <button class="btn-ghost" style="position:relative;overflow:hidden"><i class="fa-solid fa-download"></i><input type="file" style="position:absolute;inset:0;opacity:0;cursor:pointer;width:100%" onchange="restoreBackup(this)"></button>
+    <button class="btn-ghost" onclick="showApks()"><i class="fa-solid fa-box-archive"></i></button>
+    <button class="btn-success" onclick="showCreate()"><i class="fa-solid fa-plus"></i> New</button>
   </div>
 </header>
 <div class="container">
@@ -529,7 +565,7 @@ body.light .project,body.light .apk-item,body.light .template-card{background:#f
     <p id="status" style="color:var(--muted);font-size:13px">Checking...</p>
   </div>
   <div class="card hidden" id="createBox">
-    <h2>📱 New Android Project</h2>
+    <h2><i class="fa-solid fa-mobile-screen"></i> New Android Project</h2>
     <input id="appName" placeholder="App Name">
     <input id="packageName" placeholder="com.zihad.myapp">
     <select id="language"><option value="java">Java</option><option value="kotlin">Kotlin</option></select>
@@ -539,44 +575,44 @@ body.light .project,body.light .apk-item,body.light .template-card{background:#f
       <div class="template-card" data-t="login" onclick="selectTemplate(this)"><span>🔐</span>Login</div>
       <div class="template-card" data-t="list" onclick="selectTemplate(this)"><span>📋</span>List</div>
       <div class="template-card" data-t="splash" onclick="selectTemplate(this)"><span>✨</span>Splash</div>
-      <div class="template-card" data-t="bottom_nav" onclick="selectTemplate(this)"><span>🧭</span>BottomNav</div>
+      <div class="template-card" data-t="bottom_nav" onclick="selectTemplate(this)"><span>🧭</span>Bottom Nav</div>
       <div class="template-card" data-t="empty" onclick="selectTemplate(this)"><span>⚡</span>Basic</div>
     </div>
     <div style="display:flex;gap:8px;margin-top:14px">
-      <button class="btn-success" style="flex:1" onclick="createProject()">🚀 Create</button>
+      <button class="btn-success" style="flex:1" onclick="createProject()"><i class="fa-solid fa-rocket"></i> Create</button>
       <button class="btn-ghost" onclick="hideCreate()">Cancel</button>
     </div>
     <div id="message" style="display:none;padding:12px;border-radius:12px;margin-top:12px"></div>
   </div>
   <div class="card hidden" id="apksBox">
-    <h2>📦 Built APKs</h2>
+    <h2><i class="fa-solid fa-box-archive"></i> Built APKs</h2>
     <div id="apksList">Loading...</div>
     <button class="btn-ghost" style="width:100%;margin-top:10px" onclick="hideApks()">Close</button>
   </div>
   <div class="card">
-    <h2>📂 Projects</h2>
+    <h2><i class="fa-solid fa-folder-tree"></i> Projects</h2>
     <div id="projects">Loading...</div>
   </div>
 </div>
-<button class="fab" onclick="showCreate()">+</button>
+<button class="fab" onclick="showCreate()"><i class="fa-solid fa-plus"></i></button>
 <div class="toast-container" id="toasts"></div>
 <script>
 var selectedTemplate="empty";
 if(localStorage.getItem("theme")==="light")document.body.classList.add("light");
-document.getElementById("themeBtn").innerText=document.body.classList.contains("light")?"☀️":"🌙";
-function toggleTheme(){document.body.classList.toggle("light");localStorage.setItem("theme",document.body.classList.contains("light")?"light":"dark");document.getElementById("themeBtn").innerText=document.body.classList.contains("light")?"☀️":"🌙";}
+document.getElementById("themeBtn").innerHTML=document.body.classList.contains("light")?'<i class="fa-solid fa-sun"></i>':'<i class="fa-solid fa-moon"></i>';
+function toggleTheme(){document.body.classList.toggle("light");localStorage.setItem("theme",document.body.classList.contains("light")?"light":"dark");document.getElementById("themeBtn").innerHTML=document.body.classList.contains("light")?'<i class="fa-solid fa-sun"></i>':'<i class="fa-solid fa-moon"></i>';}
 function selectTemplate(el){document.querySelectorAll(".template-card").forEach(function(c){c.classList.remove("active")});el.classList.add("active");selectedTemplate=el.dataset.t}
 function showCreate(){document.getElementById("createBox").classList.remove("hidden");document.getElementById("apksBox").classList.add("hidden")}
 function hideCreate(){document.getElementById("createBox").classList.add("hidden")}
 function showApks(){document.getElementById("apksBox").classList.remove("hidden");document.getElementById("createBox").classList.add("hidden");loadApks()}
 function hideApks(){document.getElementById("apksBox").classList.add("hidden")}
-function toast(msg,type){type=type||"success";var c=document.getElementById("toasts");var t=document.createElement("div");t.className="toast "+type;t.innerText=msg;c.appendChild(t);setTimeout(function(){t.remove()},3000)}
+function toast(msg,type){type=type||"success";var c=document.getElementById("toasts");var t=document.createElement("div");t.className="toast "+type;t.innerHTML=(type==="error"?'<i class="fa-solid fa-circle-xmark"></i>':'<i class="fa-solid fa-circle-check"></i>')+msg;c.appendChild(t);setTimeout(function(){t.remove()},3000)}
 function esc(t){var d=document.createElement("div");d.innerText=t;return d.innerHTML}
-async function status(){try{var r=await fetch("/api/status");var d=await r.json();document.getElementById("status").innerText="Port "+d.port+"  •  "+d.projects+" projects  •  "+d.language_count+" languages"}catch(e){document.getElementById("status").innerText="Offline"}}
-async function loadProjects(){try{var r=await fetch("/api/projects");var d=await r.json();var box=document.getElementById("projects");if(!d.projects.length){box.innerHTML='<p style="color:#94a3b8;text-align:center;padding:20px">No projects yet</p>';return}box.innerHTML="";d.projects.forEach(function(p){var div=document.createElement("div");div.className="project";div.innerHTML='<div class="project-info"><b>📱 '+esc(p.name)+'</b><span class="badge">'+esc(p.language||"?")+'</span><br><small style="color:#94a3b8">'+esc(p.package||"")+'</small></div><div><button class="btn-primary" onclick="location.href=\'/project/'+encodeURIComponent(p.name)+'\'">Open</button><button class="btn-danger" onclick="deleteProject(\''+esc(p.name)+'\')">🗑</button></div>';box.appendChild(div)})}catch(e){document.getElementById("projects").innerText="Error"}}
+async function status(){try{var r=await fetch("/api/status");var d=await r.json();document.getElementById("status").innerText="Port "+d.port+"  •  "+d.projects+" projects  •  "+d.language_count+" languages  •  v"+d.version}catch(e){document.getElementById("status").innerText="Offline"}}
+async function loadProjects(){try{var r=await fetch("/api/projects");var d=await r.json();var box=document.getElementById("projects");if(!d.projects.length){box.innerHTML='<p style="color:#94a3b8;text-align:center;padding:20px">No projects yet</p>';return}box.innerHTML="";d.projects.forEach(function(p){var div=document.createElement("div");div.className="project";div.innerHTML='<div class="project-info"><b><i class="fa-solid fa-mobile-screen-button"></i> '+esc(p.name)+'</b><span class="badge">'+esc(p.language||"?")+'</span><br><small style="color:#94a3b8">'+esc(p.package||"")+'</small></div><div><button class="btn-primary" onclick="location.href=\'/project/'+encodeURIComponent(p.name)+'\'"><i class="fa-solid fa-folder-open"></i> Open</button><button class="btn-danger" onclick="deleteProject(\''+esc(p.name)+'\')"><i class="fa-solid fa-trash"></i></button></div>';box.appendChild(div)})}catch(e){document.getElementById("projects").innerText="Error"}}
 async function createProject(){var n=document.getElementById("appName").value.trim();var p=document.getElementById("packageName").value.trim();var l=document.getElementById("language").value;if(!n||!p){msg("Name & Package required",1);return}try{var r=await fetch("/api/projects",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:n,package:p,language:l,template:selectedTemplate})});var d=await r.json();if(!r.ok){msg(d.error||"Failed",1);return}msg("Created!",0);toast("Project created");document.getElementById("appName").value="";document.getElementById("packageName").value="";hideCreate();loadProjects();status()}catch(e){msg("Error",1)}}
 async function deleteProject(name){if(!confirm("Delete "+name+"?"))return;try{var r=await fetch("/api/projects/"+encodeURIComponent(name),{method:"DELETE"});if(r.ok){toast("Deleted");loadProjects();status()}else toast("Failed","error")}catch(e){toast("Error","error")}}
-async function loadApks(){try{var r=await fetch("/api/apks");var d=await r.json();var box=document.getElementById("apksList");if(!d.apks||!d.apks.length){box.innerHTML='<p style="color:#94a3b8;text-align:center">No APKs</p>';return}box.innerHTML="";d.apks.forEach(function(a){var div=document.createElement("div");div.className="apk-item";div.innerHTML='<div><b>📦 '+esc(a.name)+'</b><br><small style="color:#94a3b8">'+esc(a.size)+' • '+esc(a.mtime)+'</small></div><div><button class="btn-success" onclick="location.href=\'/api/download-saved-apk/'+encodeURIComponent(a.name)+'\'">⬇</button><button class="btn-danger" onclick="deleteApk(\''+esc(a.name)+'\')">🗑</button></div>';box.appendChild(div)})}catch(e){document.getElementById("apksList").innerText="Error"}}
+async function loadApks(){try{var r=await fetch("/api/apks");var d=await r.json();var box=document.getElementById("apksList");if(!d.apks||!d.apks.length){box.innerHTML='<p style="color:#94a3b8;text-align:center">No APKs</p>';return}box.innerHTML="";d.apks.forEach(function(a){var div=document.createElement("div");div.className="apk-item";div.innerHTML='<div><b><i class="fa-solid fa-box-archive"></i> '+esc(a.name)+'</b><br><small style="color:#94a3b8">'+esc(a.size)+' • '+esc(a.mtime)+'</small></div><div><button class="btn-success" onclick="location.href=\'/api/download-saved-apk/'+encodeURIComponent(a.name)+'\'"><i class="fa-solid fa-download"></i></button><button class="btn-danger" onclick="deleteApk(\''+esc(a.name)+'\')"><i class="fa-solid fa-trash"></i></button></div>';box.appendChild(div)})}catch(e){document.getElementById("apksList").innerText="Error"}}
 async function deleteApk(name){if(!confirm("Delete?"))return;try{var r=await fetch("/api/apks/"+encodeURIComponent(name),{method:"DELETE"});if(r.ok){toast("Deleted");loadApks()}else toast("Failed","error")}catch(e){toast("Error","error")}}
 function msg(t,e){var m=document.getElementById("message");m.style.display="block";m.innerText=t;m.style.background=e?"rgba(127,29,29,.55)":"rgba(20,83,45,.55)"}
 async function restoreBackup(input){if(!input.files[0])return;if(!confirm("Restore backup? Existing projects may be overwritten."))return;var fd=new FormData();fd.append("file",input.files[0]);try{var r=await fetch("/api/restore",{method:"POST",body:fd});var d=await r.json();if(r.ok){toast("Restored!");loadProjects();status()}else toast(d.error||"Failed","error")}catch(e){toast("Error","error")}input.value=""}
@@ -586,8 +622,9 @@ status();loadProjects();
 '''
 
 # ============================================================
-# END OF PART 1 — Now paste PART 2 below this line
+# END OF PART 1 — Paste PART 2 BELOW THIS LINE
 # ============================================================
+
 # ============================================================
 # PART 2/3 : ALL FLASK ROUTES
 # ============================================================
@@ -602,7 +639,7 @@ def api_status():
     projects = [p for p in PROJECTS_DIR.iterdir() if p.is_dir()]
     langs = set(v["name"] for v in LANGUAGES.values())
     return jsonify({"server": "online", "port": PORT, "projects": len(projects),
-                    "language_count": len(langs), "version": "10.0"})
+                    "language_count": len(langs), "version": "12.0"})
 
 # ---------------- PROJECTS ----------------
 @app.route("/api/projects", methods=["GET"])
@@ -690,6 +727,52 @@ def project_files(name):
         return jsonify({"error": str(e)}), 500
     return jsonify({"project": name, "current": sub, "files": files})
 
+@app.route("/api/folder-size/<path:name>")
+def folder_size(name):
+    project = safe_project(name)
+    if project is None or not project.exists():
+        return jsonify({"error": "Invalid"}), 400
+    sub = request.args.get("path", "")
+    target = safe_subpath(project, sub)
+    if target is None or not target.exists():
+        return jsonify({"error": "Invalid"}), 400
+    try:
+        total = 0; count = 0
+        if target.is_file():
+            total = target.stat().st_size; count = 1
+        else:
+            for p in target.rglob("*"):
+                if p.is_file():
+                    try: total += p.stat().st_size; count += 1
+                    except: continue
+        return jsonify({"bytes": total, "human": human_size(total), "files": count})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/all-folder-sizes/<path:name>")
+def all_folder_sizes(name):
+    project = safe_project(name)
+    if project is None or not project.exists():
+        return jsonify({"error": "Invalid"}), 400
+    sub = request.args.get("path", "")
+    target = safe_subpath(project, sub)
+    if target is None or not target.is_dir():
+        return jsonify({"error": "Invalid"}), 400
+    result = {}
+    for p in target.iterdir():
+        try:
+            if p.is_file():
+                result[p.name] = human_size(p.stat().st_size)
+            else:
+                total = 0
+                for f in p.rglob("*"):
+                    if f.is_file():
+                        try: total += f.stat().st_size
+                        except: continue
+                result[p.name] = human_size(total)
+        except: continue
+    return jsonify({"sizes": result})
+
 @app.route("/api/search/<path:name>")
 def search_files(name):
     project = safe_project(name)
@@ -733,6 +816,12 @@ def file_content(name):
             try: backup_file_version(name, sub, target.read_text(encoding="utf-8", errors="replace"))
             except: pass
         target.write_text(new_content, encoding="utf-8")
+        # Trigger auto-build if enabled (in background)
+        try:
+            proj_settings = load_json(SETTINGS_FILE, {}).get(name, {})
+            if proj_settings.get("autoBuild"):
+                threading.Thread(target=trigger_auto_build, args=(name,), daemon=True).start()
+        except: pass
         return jsonify({"success": True})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -832,7 +921,6 @@ def rename_package():
         except: pass
     return jsonify({"success": True, "updated": count})
 
-# ---------------- BULK RENAME ----------------
 @app.route("/api/bulk-rename", methods=["POST"])
 def bulk_rename():
     data = request.get_json(silent=True) or {}
@@ -857,7 +945,6 @@ def bulk_rename():
             except: continue
     return jsonify({"success": True, "renamed": count})
 
-# ---------------- EXTRACT ZIP ----------------
 @app.route("/api/extract/<path:name>", methods=["POST"])
 def extract_zip(name):
     project = safe_project(name)
@@ -879,7 +966,6 @@ def extract_zip(name):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------------- FIREBASE INJECT ----------------
 @app.route("/api/firebase-inject", methods=["POST"])
 def firebase_inject():
     data = request.get_json(silent=True) or {}
@@ -889,12 +975,9 @@ def firebase_inject():
     json_str = data.get("json", "").strip()
     if not json_str:
         return jsonify({"error": "google-services.json content required"}), 400
-    try:
-        parsed = json.loads(json_str)
-    except:
-        return jsonify({"error": "Invalid JSON"}), 400
+    try: parsed = json.loads(json_str)
+    except: return jsonify({"error": "Invalid JSON"}), 400
     write_file(project / "app" / "google-services.json", json.dumps(parsed, indent=2))
-    # Update app/build.gradle
     app_gradle = project / "app" / "build.gradle"
     if app_gradle.exists():
         txt = app_gradle.read_text(encoding="utf-8")
@@ -902,7 +985,6 @@ def firebase_inject():
             txt = txt.replace('plugins {\n    id "com.android.application"\n}',
                               'plugins {\n    id "com.android.application"\n    id "com.google.gms.google-services"\n}')
             app_gradle.write_text(txt, encoding="utf-8")
-    # Update root build.gradle
     root_gradle = project / "build.gradle"
     if root_gradle.exists():
         txt = root_gradle.read_text(encoding="utf-8")
@@ -1031,6 +1113,7 @@ def run_command():
         return jsonify({"error": "Invalid"}), 400
     cmd = data.get("cmd", "").strip()
     if not cmd: return jsonify({"error": "Empty"}), 400
+    cmd = expand_alias(cmd)
     blocked = ["rm -rf /", "mkfs", "dd if=", ":(){", "shutdown", "reboot", "> /dev/sda"]
     for b in blocked:
         if b in cmd: return jsonify({"error": "Blocked"}), 403
@@ -1065,11 +1148,167 @@ def run_code():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ---------------- PRESET COMMANDS ----------------
+PRESET_COMMANDS = [
+    {"name": "Update System", "cmd": "pkg update -y && pkg upgrade -y", "icon": "fa-sync"},
+    {"name": "Install Git", "cmd": "pkg install -y git", "icon": "fa-code-branch"},
+    {"name": "Install Python", "cmd": "pkg install -y python", "icon": "fa-python"},
+    {"name": "Install Node.js", "cmd": "pkg install -y nodejs", "icon": "fa-node-js"},
+    {"name": "Install Nano", "cmd": "pkg install -y nano", "icon": "fa-pen"},
+    {"name": "Install Vim", "cmd": "pkg install -y vim", "icon": "fa-terminal"},
+    {"name": "Install OpenSSH", "cmd": "pkg install -y openssh", "icon": "fa-key"},
+    {"name": "Install Clang", "cmd": "pkg install -y clang", "icon": "fa-code"},
+    {"name": "Install Java (17)", "cmd": "pkg install -y openjdk-17", "icon": "fa-java"},
+    {"name": "Install Gradle", "cmd": "pkg install -y gradle", "icon": "fa-cubes"},
+    {"name": "Install AAPT2", "cmd": "pkg install -y aapt2", "icon": "fa-android"},
+    {"name": "Install Android tools", "cmd": "pkg install -y android-tools", "icon": "fa-mobile-alt"},
+    {"name": "Install ImageMagick", "cmd": "pkg install -y imagemagick", "icon": "fa-image"},
+    {"name": "Install sqlite", "cmd": "pkg install -y sqlite", "icon": "fa-database"},
+    {"name": "Install curl", "cmd": "pkg install -y curl", "icon": "fa-download"},
+    {"name": "Install wget", "cmd": "pkg install -y wget", "icon": "fa-cloud-download-alt"},
+    {"name": "Upgrade pip", "cmd": "pip install --upgrade pip", "icon": "fa-arrow-up"},
+    {"name": "List packages", "cmd": "pkg list-installed", "icon": "fa-list"},
+    {"name": "Disk usage", "cmd": "df -h", "icon": "fa-hdd"},
+    {"name": "Show PATH", "cmd": "echo $PATH", "icon": "fa-road"},
+    {"name": "Network test", "cmd": "ping -c 3 google.com", "icon": "fa-wifi"},
+    {"name": "Local IP", "cmd": "ifconfig 2>/dev/null || ip addr", "icon": "fa-network-wired"},
+    {"name": "Gradle version", "cmd": "gradle -v", "icon": "fa-cog"},
+    {"name": "Java version", "cmd": "java -version", "icon": "fa-java"},
+    {"name": "Node version", "cmd": "node -v", "icon": "fa-node-js"},
+    {"name": "Python version", "cmd": "python --version", "icon": "fa-python"},
+    {"name": "Git status", "cmd": "git status", "icon": "fa-code-branch"},
+    {"name": "Clear cache", "cmd": "rm -rf ~/.cache/*", "icon": "fa-broom"},
+    {"name": "Kill all python", "cmd": "pkill -f python", "icon": "fa-skull"},
+    {"name": "Show top", "cmd": "top -b -n 1 | head -20", "icon": "fa-chart-line"},
+]
+
+@app.route("/api/preset-commands")
+def preset_commands():
+    return jsonify({"commands": PRESET_COMMANDS})
+
+# ---------------- SYSTEM INFO ----------------
+@app.route("/api/system-info")
+def system_info():
+    info = {}
+    try:
+        with open("/proc/meminfo") as f:
+            m = f.read()
+            for line in m.splitlines():
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    info[k.strip()] = v.strip()
+    except: pass
+    try:
+        du = shutil.disk_usage(str(BASE_DIR))
+        info["disk_total"] = human_size(du.total)
+        info["disk_used"] = human_size(du.used)
+        info["disk_free"] = human_size(du.free)
+        info["disk_percent"] = round(du.used / du.total * 100, 1)
+    except: pass
+    try:
+        with open("/proc/uptime") as f:
+            up = float(f.read().split()[0])
+            info["uptime"] = f"{int(up//3600)}h {int((up%3600)//60)}m"
+    except: pass
+    import platform
+    info["python"] = platform.python_version()
+    info["machine"] = platform.machine()
+    return jsonify(info)
+
+@app.route("/api/proc-list")
+def proc_list():
+    procs = []
+    try:
+        r = subprocess.run(["ps", "-eo", "pid,user,comm,%cpu,%mem"],
+                           capture_output=True, text=True, timeout=10)
+        lines = r.stdout.splitlines()
+        if lines:
+            for l in lines[1:60]:
+                procs.append(l)
+    except: pass
+    return jsonify({"procs": procs})
+
+@app.route("/api/proc-kill", methods=["POST"])
+def proc_kill():
+    data = request.get_json(silent=True) or {}
+    pid = str(data.get("pid", "")).strip()
+    if not pid.isdigit(): return jsonify({"error": "Invalid PID"}), 400
+    try:
+        os.kill(int(pid), signal.SIGTERM)
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ---------------- REAL PTY ----------------
+@app.route("/api/pty/start", methods=["POST"])
+def pty_start():
+    if not PTY_AVAILABLE:
+        return jsonify({"error": "PTY not available"}), 500
+    try:
+        sid = str(uuid.uuid4())
+        pid, fd = pty.fork()
+        if pid == 0:
+            os.environ["TERM"] = "xterm-256color"
+            os.environ["PS1"] = "\\[\\e[1;34m\\]zihad\\[\\e[0m\\]:\\[\\e[1;32m\\]\\w\\[\\e[0m\\]$ "
+            shell = "bash" if shutil.which("bash") else "sh"
+            os.execvp(shell, [shell])
+        else:
+            PTY_SESSIONS[sid] = {"pid": pid, "fd": fd, "output": [], "started": time.time()}
+            def reader():
+                try:
+                    while sid in PTY_SESSIONS:
+                        try:
+                            r, _, _ = select.select([fd], [], [], 0.5)
+                            if r:
+                                data = os.read(fd, 4096)
+                                if not data: break
+                                text = data.decode("utf-8", errors="replace")
+                                PTY_SESSIONS[sid]["output"].append(text)
+                                if len(PTY_SESSIONS[sid]["output"]) > 3000:
+                                    PTY_SESSIONS[sid]["output"] = PTY_SESSIONS[sid]["output"][-2000:]
+                        except OSError: break
+                except: pass
+            threading.Thread(target=reader, daemon=True).start()
+            return jsonify({"success": True, "session": sid})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/pty/input/<sid>", methods=["POST"])
+def pty_input(sid):
+    S = PTY_SESSIONS.get(sid)
+    if not S: return jsonify({"error": "Not found"}), 404
+    data = request.get_json(silent=True) or {}
+    text = data.get("text", "")
+    try:
+        os.write(S["fd"], text.encode("utf-8"))
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/pty/output/<sid>")
+def pty_output(sid):
+    S = PTY_SESSIONS.get(sid)
+    if not S: return jsonify({"error": "Not found"}), 404
+    since = int(request.args.get("since", 0))
+    lines = S["output"][since:]
+    return jsonify({"output": "".join(lines), "total": len(S["output"])})
+
+@app.route("/api/pty/stop/<sid>", methods=["POST"])
+def pty_stop(sid):
+    S = PTY_SESSIONS.pop(sid, None)
+    if S:
+        try: os.kill(S["pid"], signal.SIGTERM)
+        except: pass
+        try: os.close(S["fd"])
+        except: pass
+    return jsonify({"success": True})
+
 # ---------------- BUILD ----------------
 def build_worker(build_id, project, env):
     B = BUILDS[build_id]
     cmd = "gradle assembleDebug --no-daemon --console=plain --parallel"
     try:
+        B["started"] = B.get("started", time.time())
         proc = subprocess.Popen(cmd, shell=True, cwd=str(project), env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                                 text=True, bufsize=1)
@@ -1085,16 +1324,54 @@ def build_worker(build_id, project, env):
         B["apk_path"] = str(apks[0]) if apks else None
         B["status"] = "done"
         B["success"] = (proc.returncode == 0 and B["apk_path"] is not None)
+        B["finished"] = time.time()
+        B["duration"] = B["finished"] - B["started"]
         if B["success"] and B["apk_path"]:
             try:
                 src = Path(B["apk_path"])
-                shutil.copy2(src, APKS_DIR / (project.name + "-" + src.name))
+                dst = APKS_DIR / (project.name + "-" + src.name)
+                shutil.copy2(src, dst)
+                B["apk_saved"] = str(dst)
+                B["apk_size"] = dst.stat().st_size
+                _push_notif(project.name, "✅ Build successful",
+                            f"APK ready ({human_size(B['apk_size'])})", "success")
+                _record_build(project.name, True, B["duration"], B["apk_size"], 0)
             except: pass
+        else:
+            err_count = sum(1 for l in B["output"] if "error:" in l.lower())
+            _push_notif(project.name, "❌ Build failed",
+                        f"Check log ({err_count} errors)", "error")
+            _record_build(project.name, False, B["duration"], 0, err_count)
+            _record_error_patterns(project.name, B["output"])
     except Exception as e:
         B["output"].append("[build error] " + str(e))
         B["status"] = "done"
         B["success"] = False
         B["returncode"] = -1
+        _push_notif(project.name, "❌ Build crashed", str(e), "error")
+
+def _record_build(project, success, duration, apk_size, error_count):
+    hist = load_json(BUILD_HISTORY, {})
+    proj = hist.get(project, [])
+    proj.insert(0, {
+        "ts": time.time(), "success": success,
+        "duration": round(duration, 2),
+        "apk_size": apk_size, "errors": error_count
+    })
+    hist[project] = proj[:100]
+    save_json(BUILD_HISTORY, hist)
+
+def _record_error_patterns(project, lines):
+    freq = load_json(ERROR_FREQ_FILE, {})
+    proj = freq.get(project, {})
+    for line in lines:
+        m = re.search(r'(error|warning)[:\s]+(.+?)(?:$|")', line, re.IGNORECASE)
+        if m:
+            key = m.group(2).strip()[:80]
+            if not key: continue
+            proj[key] = proj.get(key, 0) + 1
+    freq[project] = dict(sorted(proj.items(), key=lambda x: -x[1])[:50])
+    save_json(ERROR_FREQ_FILE, freq)
 
 @app.route("/api/build-start", methods=["POST"])
 def build_start():
@@ -1110,7 +1387,7 @@ def build_start():
     env["PATH"] = str(sdk / "platform-tools") + ":" + TERMUX_PREFIX + "/bin:" + env.get("PATH", "")
     build_id = str(uuid.uuid4())
     BUILDS[build_id] = {"output": [], "status": "running", "apk_path": None,
-                        "returncode": None, "success": None}
+                        "returncode": None, "success": None, "started": time.time()}
     t = threading.Thread(target=build_worker, args=(build_id, project, env), daemon=True)
     t.start()
     return jsonify({"build_id": build_id, "status": "started"})
@@ -1123,8 +1400,33 @@ def build_poll(build_id):
     return jsonify({
         "lines": B["output"][since:], "total": len(B["output"]),
         "status": B["status"], "success": B.get("success"),
-        "apk_path": B.get("apk_path"), "returncode": B.get("returncode")
+        "apk_path": B.get("apk_path"), "returncode": B.get("returncode"),
+        "duration": B.get("duration"), "apk_size": B.get("apk_size")
     })
+
+@app.route("/api/build-history/<path:name>")
+def build_history(name):
+    hist = load_json(BUILD_HISTORY, {})
+    return jsonify({"history": hist.get(name, [])})
+
+@app.route("/api/apk-size-graph/<path:name>")
+def apk_size_graph(name):
+    hist = load_json(BUILD_HISTORY, {}).get(name, [])
+    points = [{"ts": h["ts"], "size": h["apk_size"]} for h in hist if h.get("apk_size")]
+    return jsonify({"points": points})
+
+@app.route("/api/error-frequency/<path:name>")
+def error_frequency(name):
+    freq = load_json(ERROR_FREQ_FILE, {})
+    return jsonify({"freq": freq.get(name, {})})
+
+@app.route("/api/build-chart/<path:name>")
+def build_chart(name):
+    hist = load_json(BUILD_HISTORY, {}).get(name, [])[:20]
+    return jsonify({"chart": [
+        {"ts": h["ts"], "duration": h["duration"], "success": h["success"]}
+        for h in hist
+    ]})
 
 @app.route("/api/download-apk/<path:name>")
 def download_apk(name):
@@ -1168,21 +1470,99 @@ def cache_clean():
                 shutil.rmtree(d)
                 cleared.append(name)
             except: pass
-    gcache = Path.home() / ".gradle" / "caches" / "transforms-3"
-    if data.get("deep") and gcache.exists():
-        try:
-            shutil.rmtree(gcache)
-            cleared.append("~/.gradle/transforms-3")
-        except: pass
+    if data.get("deep"):
+        gcache = Path.home() / ".gradle" / "caches" / "transforms-3"
+        if gcache.exists():
+            try:
+                shutil.rmtree(gcache)
+                cleared.append("~/.gradle/transforms-3")
+            except: pass
     return jsonify({"success": True, "cleared": cleared})
+
+# ---------------- AUTO BUILD ----------------
+def trigger_auto_build(project_name):
+    proj_settings = load_json(SETTINGS_FILE, {}).get(project_name, {})
+    if not proj_settings.get("autoBuild"): return
+    last = AUTO_BUILD_LOCK.get(project_name, 0)
+    if time.time() - last < AUTO_BUILD_DEBOUNCE: return
+    AUTO_BUILD_LOCK[project_name] = time.time()
+    project = safe_project(project_name)
+    if not project: return
+    env = os.environ.copy()
+    sdk = Path.home() / "android-sdk"
+    if sdk.exists():
+        env["ANDROID_HOME"] = str(sdk)
+        env["ANDROID_SDK_ROOT"] = str(sdk)
+    env["PATH"] = str(sdk / "platform-tools") + ":" + TERMUX_PREFIX + "/bin:" + env.get("PATH", "")
+    build_id = "auto-" + str(uuid.uuid4())[:8]
+    BUILDS[build_id] = {
+        "output": [], "status": "running", "apk_path": None,
+        "returncode": None, "success": None, "auto": True,
+        "project": project_name, "started": time.time()
+    }
+    _push_notif(project_name, "🔨 Auto-build started",
+                "Watching for changes...", "info")
+    threading.Thread(target=build_worker, args=(build_id, project, env), daemon=True).start()
+    return build_id
+
+# ---------------- SETTINGS ----------------
+@app.route("/api/settings/<path:name>", methods=["GET", "POST"])
+def settings_mgr(name):
+    all_s = load_json(SETTINGS_FILE, {})
+    if request.method == "GET":
+        return jsonify(all_s.get(name, {
+            "autoBuild": False, "notifications": True,
+            "theme": "dracula", "gestures": True,
+            "tabSize": 4, "fontSize": 13
+        }))
+    data = request.get_json(silent=True) or {}
+    cur = all_s.get(name, {})
+    cur.update(data)
+    all_s[name] = cur
+    save_json(SETTINGS_FILE, all_s)
+    return jsonify({"success": True, "settings": cur})
+
+# ---------------- NOTIFICATIONS ----------------
+@app.route("/api/notifications")
+def notif_list():
+    since = float(request.args.get("since", 0))
+    items = load_json(NOTIF_FILE, {"items": []}).get("items", [])
+    unread = sum(1 for n in items if not n.get("read"))
+    new_items = [n for n in items if n["ts"] > since]
+    return jsonify({"items": items[:50], "new": new_items, "unread": unread})
+
+@app.route("/api/notifications/read", methods=["POST"])
+def notif_read():
+    data = request.get_json(silent=True) or {}
+    nid = data.get("id")
+    notifs = load_json(NOTIF_FILE, {"items": []}).get("items", [])
+    if nid:
+        for n in notifs:
+            if n["id"] == nid: n["read"] = True
+    else:
+        for n in notifs: n["read"] = True
+    save_json(NOTIF_FILE, {"items": notifs})
+    return jsonify({"success": True})
+
+@app.route("/api/notifications/clear", methods=["POST"])
+def notif_clear():
+    save_json(NOTIF_FILE, {"items": []})
+    return jsonify({"success": True})
+
+@app.route("/api/notify", methods=["POST"])
+def notif_push():
+    data = request.get_json(silent=True) or {}
+    _push_notif(data.get("project", ""), data.get("title", "Notice"),
+                data.get("body", ""), data.get("kind", "info"))
+    return jsonify({"success": True})
 
 # ---------------- GIT ----------------
 def git_run(project, args, timeout=60):
     try:
         r = subprocess.run(["git"] + args, cwd=str(project),
                            capture_output=True, text=True, timeout=timeout)
-        return {"ok": r.returncode == 0, "out": r.stdout, "err": r.stderr,
-                "code": r.returncode}
+        return {"ok": r.returncode == 0, "out": r.stdout,
+                "err": r.stderr, "code": r.returncode}
     except FileNotFoundError:
         return {"ok": False, "out": "", "err": "git not installed. Run: pkg install git", "code": -1}
     except Exception as e:
@@ -1354,7 +1734,7 @@ def icon_generate(name):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------------- STRINGS EDITOR ----------------
+# ---------------- STRINGS / THEME / MANIFEST ----------------
 @app.route("/api/strings/<path:name>", methods=["GET", "POST"])
 def strings_editor(name):
     project = safe_project(name)
@@ -1367,10 +1747,8 @@ def strings_editor(name):
         try:
             import xml.etree.ElementTree as ET
             tree = ET.parse(str(strings_file))
-            root = tree.getroot()
-            items = []
-            for s in root.findall("string"):
-                items.append({"name": s.get("name", ""), "value": s.text or ""})
+            items = [{"name": s.get("name", ""), "value": s.text or ""}
+                     for s in tree.getroot().findall("string")]
             return jsonify({"items": items})
         except Exception as e:
             return jsonify({"error": str(e)}), 500
@@ -1389,7 +1767,6 @@ def strings_editor(name):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------------- THEME BUILDER ----------------
 @app.route("/api/theme/<path:name>", methods=["GET", "POST"])
 def theme_builder(name):
     project = safe_project(name)
@@ -1422,7 +1799,6 @@ def theme_builder(name):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------------- VERSION BUMP ----------------
 @app.route("/api/version-bump/<path:name>", methods=["POST"])
 def version_bump(name):
     project = safe_project(name)
@@ -1442,28 +1818,41 @@ def version_bump(name):
         txt = txt.replace(m_code.group(0), f"versionCode {new_code}")
     if bump_name and m_name:
         parts = m_name.group(1).split(".")
-        try:
-            parts[-1] = str(int(parts[-1]) + 1)
+        try: parts[-1] = str(int(parts[-1]) + 1)
         except: parts.append("1")
         new_name = ".".join(parts)
         txt = txt.replace(m_name.group(0), f'versionName "{new_name}"')
     gradle_file.write_text(txt, encoding="utf-8")
-    # update project.json
-    info_file = project / "project.json"
-    if info_file.exists():
-        try:
-            info = json.loads(info_file.read_text(encoding="utf-8"))
-            if bump_code: info["versionCode"] = info.get("versionCode", 1) + 1
-            if bump_name:
-                p = info.get("versionName", "1.0").split(".")
-                try: p[-1] = str(int(p[-1]) + 1)
-                except: p.append("1")
-                info["versionName"] = ".".join(p)
-            info_file.write_text(json.dumps(info, indent=4), encoding="utf-8")
-        except: pass
     return jsonify({"success": True})
 
-# ---------------- KEYSTORE / SIGN RELEASE ----------------
+@app.route("/api/manifest/<path:name>", methods=["GET", "POST"])
+def manifest_editor(name):
+    project = safe_project(name)
+    if project is None or not project.exists():
+        return jsonify({"error": "Invalid"}), 400
+    manifest_file = project / "app" / "src" / "main" / "AndroidManifest.xml"
+    if request.method == "GET":
+        if not manifest_file.exists():
+            return jsonify({"permissions": [], "activities": [], "raw": ""})
+        try:
+            raw = manifest_file.read_text(encoding="utf-8")
+            perms = re.findall(r'<uses-permission android:name="([^"]+)"', raw)
+            acts = re.findall(r'<activity android:name="([^"]+)"', raw)
+            return jsonify({"permissions": perms, "activities": acts, "raw": raw})
+        except Exception as e:
+            return jsonify({"error": str(e)}), 500
+    data = request.get_json(silent=True) or {}
+    raw = data.get("raw", "")
+    if not raw: return jsonify({"error": "Empty"}), 400
+    try:
+        import xml.etree.ElementTree as ET
+        ET.fromstring(raw)
+        manifest_file.write_text(raw, encoding="utf-8")
+        return jsonify({"success": True})
+    except Exception as e:
+        return jsonify({"error": "Invalid XML: " + str(e)}), 400
+
+# ---------------- KEYSTORE ----------------
 @app.route("/api/keystore", methods=["GET", "POST"])
 def keystore_mgr():
     if request.method == "GET":
@@ -1483,7 +1872,6 @@ def sign_release(name):
     ks = load_json(KEYSTORE_FILE, {})
     if not ks.get("storeFile") or not ks.get("storePassword"):
         return jsonify({"error": "Keystore not configured"}), 400
-    # Inject signing config into build.gradle
     gradle_file = project / "app" / "build.gradle"
     if not gradle_file.exists():
         return jsonify({"error": "app/build.gradle missing"}), 404
@@ -1500,12 +1888,7 @@ def sign_release(name):
     }}
 '''
         txt = txt.replace("    buildTypes {", sign_cfg + "    buildTypes {")
-        txt = txt.replace("release { minifyEnabled false }",
-                          'release { minifyEnabled false; signingConfig signingConfigs.release }')
-        txt = txt.replace('release {\n            minifyEnabled false\n        }',
-                          'release {\n            minifyEnabled false\n            signingConfig signingConfigs.release\n        }')
         gradle_file.write_text(txt, encoding="utf-8")
-    # Build release
     env = os.environ.copy()
     sdk = Path.home() / "android-sdk"
     if sdk.exists():
@@ -1534,34 +1917,6 @@ def download_signed(fname):
         return send_file(str(p), as_attachment=True, download_name=fname)
     return "Not found", 404
 
-# ---------------- MANIFEST EDITOR ----------------
-@app.route("/api/manifest/<path:name>", methods=["GET", "POST"])
-def manifest_editor(name):
-    project = safe_project(name)
-    if project is None or not project.exists():
-        return jsonify({"error": "Invalid"}), 400
-    manifest_file = project / "app" / "src" / "main" / "AndroidManifest.xml"
-    if request.method == "GET":
-        if not manifest_file.exists():
-            return jsonify({"permissions": [], "activities": [], "raw": ""})
-        try:
-            raw = manifest_file.read_text(encoding="utf-8")
-            perms = re.findall(r'<uses-permission android:name="([^"]+)"', raw)
-            acts = re.findall(r'<activity android:name="([^"]+)"', raw)
-            return jsonify({"permissions": perms, "activities": acts, "raw": raw})
-        except Exception as e:
-            return jsonify({"error": str(e)}), 500
-    data = request.get_json(silent=True) or {}
-    raw = data.get("raw", "")
-    if not raw: return jsonify({"error": "Empty"}), 400
-    try:
-        import xml.etree.ElementTree as ET
-        ET.fromstring(raw)
-        manifest_file.write_text(raw, encoding="utf-8")
-        return jsonify({"success": True})
-    except Exception as e:
-        return jsonify({"error": "Invalid XML: " + str(e)}), 400
-
 # ---------------- ENV MANAGER ----------------
 @app.route("/api/env/<path:name>", methods=["GET", "POST"])
 def env_mgr(name):
@@ -1574,7 +1929,6 @@ def env_mgr(name):
     data = request.get_json(silent=True) or {}
     vault[name] = data.get("items", [])
     save_json(ENV_FILE, vault)
-    # Also write .env
     env_txt = "\n".join(f'{it["key"]}={it["value"]}' for it in vault[name])
     write_file(project / ".env", env_txt + "\n")
     return jsonify({"success": True})
@@ -1640,6 +1994,305 @@ def saved_commands():
     save_saved_commands(items)
     return jsonify({"success": True, "items": items})
 
+# ---------------- PLUGINS ----------------
+@app.route("/api/plugins")
+def list_plugins():
+    plugins = []
+    for p in PLUGINS_DIR.glob("*.json"):
+        try:
+            data = json.loads(p.read_text(encoding="utf-8"))
+            data["_file"] = p.name
+            plugins.append(data)
+        except: continue
+    return jsonify({"plugins": plugins})
+
+@app.route("/api/plugins", methods=["POST"])
+def add_plugin():
+    data = request.get_json(silent=True) or {}
+    name = secure_filename(data.get("name", "plugin")) + ".json"
+    plugin = {
+        "name": data.get("name", "plugin"),
+        "version": data.get("version", "1.0"),
+        "author": data.get("author", "unknown"),
+        "description": data.get("description", ""),
+        "code": data.get("code", ""),
+        "css": data.get("css", ""),
+        "enabled": True, "created": time.time()
+    }
+    (PLUGINS_DIR / name).write_text(json.dumps(plugin, indent=2), encoding="utf-8")
+    return jsonify({"success": True})
+
+@app.route("/api/plugins/<path:name>", methods=["DELETE", "PATCH"])
+def plugin_mgr(name):
+    p = PLUGINS_DIR / secure_filename(name)
+    if not p.exists(): return jsonify({"error": "Not found"}), 404
+    if request.method == "DELETE":
+        p.unlink()
+        return jsonify({"success": True})
+    data = request.get_json(silent=True) or {}
+    try:
+        plugin = json.loads(p.read_text(encoding="utf-8"))
+        plugin.update(data)
+        p.write_text(json.dumps(plugin, indent=2), encoding="utf-8")
+        return jsonify({"success": True, "plugin": plugin})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# ---------------- CUSTOM THEMES ----------------
+@app.route("/api/themes", methods=["GET", "POST"])
+def custom_themes():
+    themes = load_json(THEMES_FILE, {"items": []}).get("items", [])
+    if request.method == "GET":
+        return jsonify({"themes": themes})
+    data = request.get_json(silent=True) or {}
+    theme = {
+        "id": str(uuid.uuid4())[:8],
+        "name": data.get("name", "My Theme"),
+        "colors": data.get("colors", {}),
+        "created": time.time()
+    }
+    themes.append(theme)
+    save_json(THEMES_FILE, {"items": themes})
+    return jsonify({"success": True, "theme": theme})
+
+@app.route("/api/themes/<tid>", methods=["DELETE"])
+def delete_theme(tid):
+    themes = load_json(THEMES_FILE, {"items": []}).get("items", [])
+    themes = [t for t in themes if t["id"] != tid]
+    save_json(THEMES_FILE, {"items": themes})
+    return jsonify({"success": True})
+
+# ---------------- ALIASES ----------------
+@app.route("/api/aliases", methods=["GET", "POST", "DELETE"])
+def aliases_mgr():
+    aliases = load_json(ALIAS_FILE, {"items": {}}).get("items", {})
+    if request.method == "GET":
+        return jsonify({"aliases": aliases})
+    data = request.get_json(silent=True) or {}
+    if request.method == "POST":
+        key = data.get("key", "").strip()
+        cmd = data.get("cmd", "").strip()
+        if not key or not cmd: return jsonify({"error": "Both required"}), 400
+        if not re.match(r"^[a-zA-Z][a-zA-Z0-9_-]{0,30}$", key):
+            return jsonify({"error": "Invalid alias name"}), 400
+        aliases[key] = cmd
+        save_json(ALIAS_FILE, {"items": aliases})
+        return jsonify({"success": True, "aliases": aliases})
+    key = data.get("key", "")
+    aliases.pop(key, None)
+    save_json(ALIAS_FILE, {"items": aliases})
+    return jsonify({"success": True, "aliases": aliases})
+
+# ---------------- MACROS ----------------
+@app.route("/api/macros", methods=["GET", "POST", "DELETE"])
+def macros_mgr():
+    macros = load_json(MACROS_FILE, {"items": []}).get("items", [])
+    if request.method == "GET":
+        return jsonify({"macros": macros})
+    data = request.get_json(silent=True) or {}
+    if request.method == "POST":
+        macro = {
+            "id": str(uuid.uuid4())[:8],
+            "name": data.get("name", "Macro"),
+            "steps": data.get("steps", []),
+            "created": time.time()
+        }
+        macros.append(macro)
+        save_json(MACROS_FILE, {"items": macros})
+        return jsonify({"success": True, "macro": macro})
+    mid = data.get("id", "")
+    macros = [m for m in macros if m["id"] != mid]
+    save_json(MACROS_FILE, {"items": macros})
+    return jsonify({"success": True})
+
+@app.route("/api/macros/run/<mid>", methods=["POST"])
+def run_macro(mid):
+    macros = load_json(MACROS_FILE, {"items": []}).get("items", [])
+    m = next((x for x in macros if x["id"] == mid), None)
+    if not m: return jsonify({"error": "Not found"}), 404
+    data = request.get_json(silent=True) or {}
+    project = safe_project(data.get("project", ""))
+    if not project: return jsonify({"error": "Invalid project"}), 400
+    results = []
+    for step in m["steps"]:
+        stype = step.get("type", "")
+        try:
+            if stype == "cmd":
+                cmd = expand_alias(step.get("value", ""))
+                r = subprocess.run(cmd, shell=True, cwd=str(project),
+                                   capture_output=True, text=True, timeout=120)
+                results.append({"step": step, "out": r.stdout, "err": r.stderr, "code": r.returncode})
+            elif stype == "build":
+                results.append({"step": step, "out": "build triggered"})
+                trigger_auto_build(project.name)
+            else:
+                results.append({"step": step, "out": "skipped"})
+        except Exception as e:
+            results.append({"step": step, "err": str(e)})
+    return jsonify({"success": True, "results": results})
+
+# ---------------- KANBAN ----------------
+@app.route("/api/kanban/<path:name>", methods=["GET", "POST"])
+def kanban_mgr(name):
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+    f = KANBAN_DIR / f"{safe}.json"
+    if request.method == "GET":
+        data = load_json(f, {"columns": {"todo": [], "doing": [], "done": []}})
+        return jsonify(data)
+    data = request.get_json(silent=True) or {}
+    save_json(f, data)
+    return jsonify({"success": True})
+
+@app.route("/api/kanban/<path:name>/add", methods=["POST"])
+def kanban_add(name):
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+    f = KANBAN_DIR / f"{safe}.json"
+    data = load_json(f, {"columns": {"todo": [], "doing": [], "done": []}})
+    body = request.get_json(silent=True) or {}
+    col = body.get("column", "todo")
+    if col not in data["columns"]:
+        data["columns"][col] = []
+    data["columns"][col].append({
+        "id": str(uuid.uuid4())[:8],
+        "text": body.get("text", ""),
+        "priority": body.get("priority", "normal"),
+        "ts": time.time()
+    })
+    save_json(f, data)
+    return jsonify({"success": True, "data": data})
+
+@app.route("/api/kanban/<path:name>/move", methods=["POST"])
+def kanban_move(name):
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+    f = KANBAN_DIR / f"{safe}.json"
+    data = load_json(f, {"columns": {"todo": [], "doing": [], "done": []}})
+    body = request.get_json(silent=True) or {}
+    card_id = body.get("id")
+    from_col = body.get("from")
+    to_col = body.get("to")
+    for i, c in enumerate(data["columns"].get(from_col, [])):
+        if c["id"] == card_id:
+            card = data["columns"][from_col].pop(i)
+            data["columns"].setdefault(to_col, []).append(card)
+            break
+    save_json(f, data)
+    return jsonify({"success": True, "data": data})
+
+@app.route("/api/kanban/<path:name>/del", methods=["POST"])
+def kanban_del(name):
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+    f = KANBAN_DIR / f"{safe}.json"
+    data = load_json(f, {"columns": {"todo": [], "doing": [], "done": []}})
+    body = request.get_json(silent=True) or {}
+    col = body.get("column")
+    cid = body.get("id")
+    if col in data["columns"]:
+        data["columns"][col] = [c for c in data["columns"][col] if c["id"] != cid]
+    save_json(f, data)
+    return jsonify({"success": True, "data": data})
+
+# ---------------- NOTES ----------------
+@app.route("/api/notes/<path:name>", methods=["GET", "POST"])
+def notes_mgr(name):
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
+    f = NOTES_DIR / f"{safe}.json"
+    if request.method == "GET":
+        return jsonify(load_json(f, {"content": "", "updated": 0}))
+    data = request.get_json(silent=True) or {}
+    save_json(f, {
+        "content": data.get("content", ""),
+        "updated": time.time()
+    })
+    return jsonify({"success": True})
+
+# ---------------- BOOKMARKS ----------------
+@app.route("/api/bookmarks/<path:name>", methods=["GET", "POST", "DELETE"])
+def bookmarks_mgr(name):
+    all_b = load_json(BOOKMARKS_FILE, {})
+    items = all_b.get(name, [])
+    if request.method == "GET":
+        return jsonify({"bookmarks": items})
+    data = request.get_json(silent=True) or {}
+    if request.method == "POST":
+        bm = {
+            "id": str(uuid.uuid4())[:8],
+            "path": data.get("path", ""),
+            "line": data.get("line", 1),
+            "label": data.get("label", ""),
+            "ts": time.time()
+        }
+        items.append(bm)
+        all_b[name] = items[:100]
+        save_json(BOOKMARKS_FILE, all_b)
+        return jsonify({"success": True, "bookmark": bm})
+    bid = data.get("id", "")
+    items = [b for b in items if b["id"] != bid]
+    all_b[name] = items
+    save_json(BOOKMARKS_FILE, all_b)
+    return jsonify({"success": True})
+
+# ---------------- SNIPPETS ----------------
+@app.route("/api/snippets", methods=["GET", "POST", "DELETE"])
+def snippets_mgr():
+    items = load_json(SNIPPETS_FILE, {"items": []}).get("items", [])
+    if request.method == "GET":
+        return jsonify({"items": items})
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        items.append({
+            "name": data.get("name", "snippet"),
+            "lang": data.get("lang", "text"),
+            "code": data.get("code", ""),
+            "ts": time.time()
+        })
+        save_json(SNIPPETS_FILE, {"items": items})
+        return jsonify({"success": True, "items": items})
+    data = request.get_json(silent=True) or {}
+    idx = data.get("index", -1)
+    if 0 <= idx < len(items):
+        items.pop(idx)
+        save_json(SNIPPETS_FILE, {"items": items})
+    return jsonify({"success": True, "items": items})
+
+# ---------------- DEV TOOLS ----------------
+@app.route("/api/devtool/hash", methods=["POST"])
+def devtool_hash():
+    data = request.get_json(silent=True) or {}
+    text = data.get("text", "")
+    algo = data.get("algo", "sha256")
+    try:
+        h = hashlib.new(algo, text.encode("utf-8")).hexdigest()
+        return jsonify({"result": h})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/api/devtool/base64", methods=["POST"])
+def devtool_base64():
+    data = request.get_json(silent=True) or {}
+    text = data.get("text", "")
+    mode = data.get("mode", "encode")
+    try:
+        if mode == "encode":
+            return jsonify({"result": base64.b64encode(text.encode()).decode()})
+        else:
+            return jsonify({"result": base64.b64decode(text).decode("utf-8", errors="replace")})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 400
+
+@app.route("/api/devtool/uuid")
+def devtool_uuid():
+    return jsonify({"uuid": str(uuid.uuid4())})
+
+@app.route("/api/devtool/lorem")
+def devtool_lorem():
+    n = int(request.args.get("n", 3))
+    import random
+    words = "lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua".split()
+    paras = []
+    for _ in range(min(n, 20)):
+        paras.append(" ".join(random.choice(words) for _ in range(50)).capitalize() + ".")
+    return jsonify({"text": "\n\n".join(paras)})
+
 # ---------------- BACKUP / RESTORE ----------------
 @app.route("/api/backup")
 def backup_all():
@@ -1671,7 +2324,7 @@ def restore_backup():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------------- EXPORT ZIP ----------------
+# ---------------- EXPORT ----------------
 @app.route("/api/export-zip/<path:name>")
 def export_zip(name):
     project = safe_project(name)
@@ -1687,16 +2340,6 @@ def export_zip(name):
     return send_file(mem, as_attachment=True, download_name=name + ".zip",
                      mimetype="application/zip")
 
-# ---------------- LIVE HTML PREVIEW ----------------
-@app.route("/api/live-preview/<path:name>")
-def live_preview(name):
-    project = safe_project(name)
-    if project is None or not project.exists(): return "Invalid", 404
-    target = safe_subpath(project, request.args.get("path", "index.html"))
-    if target is None or not target.is_file(): return "Not found", 404
-    content = target.read_text(encoding="utf-8", errors="replace")
-    return Response(content, mimetype="text/html")
-
 # ---------------- PWA ----------------
 @app.route("/manifest.json")
 def pwa_manifest():
@@ -1711,7 +2354,7 @@ def pwa_manifest():
 @app.route("/sw.js")
 def service_worker():
     sw = """
-const CACHE='zihad-ide-v10';
+const CACHE='zihad-ide-v12';
 self.addEventListener('install',e=>self.skipWaiting());
 self.addEventListener('activate',e=>e.waitUntil(clients.claim()));
 self.addEventListener('fetch',e=>{
@@ -1722,11 +2365,11 @@ self.addEventListener('fetch',e=>{
     return Response(sw, mimetype="application/javascript")
 
 # ============================================================
-# END OF PART 2 — Paste PART 3 below
+# END OF PART 2 — Paste PART 3 BELOW THIS LINE
 # ============================================================
 
 # ============================================================
-# PART 3/3 : IDE_HTML + Main Block
+# PART 3/3 : IDE_HTML (Full UI) + Main Block
 # ============================================================
 
 IDE_HTML = r'''<!DOCTYPE html>
@@ -1736,7 +2379,8 @@ IDE_HTML = r'''<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <meta name="theme-color" content="#3b82f6">
 <link rel="manifest" href="/manifest.json">
-<title>__NAME__ - Zihad IDE</title>
+<title>__NAME__ - Zihad IDE v12</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/dracula.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/material-darker.min.css">
@@ -1744,53 +2388,92 @@ IDE_HTML = r'''<!DOCTYPE html>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/dialog/dialog.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/fold/foldgutter.min.css">
 <style>
-:root{--bg:#070b14;--card:#111827;--border:#1f2937;--primary:#3b82f6;--text:#e2e8f0;--muted:#94a3b8;--success:#22c55e;--danger:#ef4444;--radius:14px;--bottom-h:62px}
-*{box-sizing:border-box;margin:0;padding:0}
+:root{--bg:#070b14;--card:#111827;--border:#1f2937;--primary:#3b82f6;--text:#e2e8f0;--muted:#94a3b8;--success:#22c55e;--danger:#ef4444;--radius:14px;--bottom-h:64px;--header-h:52px}
+*{box-sizing:border-box;margin:0;padding:0;-webkit-tap-highlight-color:transparent}
 html,body{height:100%;background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:14px;overflow:hidden}
-header{padding:8px 10px;background:rgba(15,23,42,.95);backdrop-filter:blur(16px);border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;gap:6px;position:relative;z-index:30;flex-wrap:wrap}
-header h2{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:80px}
-.btn{border:0;border-radius:9px;padding:6px 9px;font-weight:600;font-size:11px;color:#fff;cursor:pointer;background:#374151}
+body{background-image:radial-gradient(ellipse at top left,#0f172a 0%,#070b14 60%);-webkit-font-smoothing:antialiased}
+header{padding:6px 10px;min-height:var(--header-h);background:rgba(15,23,42,.95);backdrop-filter:blur(16px);border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;gap:5px;position:relative;z-index:30;flex-wrap:wrap}
+header h2{font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1;min-width:60px;display:flex;align-items:center;gap:5px}
+header h2 i{color:#60a5fa}
+.btn{border:0;border-radius:9px;padding:6px 9px;font-weight:600;font-size:11px;color:#fff;cursor:pointer;background:#374151;display:inline-flex;align-items:center;justify-content:center;gap:4px;transition:transform .15s}
+.btn:active{transform:scale(.94)}
+.btn i{pointer-events:none}
 .btn-primary{background:linear-gradient(135deg,#3b82f6,#2563eb)}
 .btn-success{background:linear-gradient(135deg,#22c55e,#16a34a)}
 .btn-danger{background:linear-gradient(135deg,#ef4444,#dc2626)}
 .btn-orange{background:linear-gradient(135deg,#f59e0b,#d97706)}
 .btn-purple{background:linear-gradient(135deg,#8b5cf6,#7c3aed)}
+.btn-pink{background:linear-gradient(135deg,#ec4899,#db2777)}
 .badge{display:inline-block;padding:2px 7px;border-radius:20px;font-size:10px;font-weight:700}
 .badge.ok{background:rgba(34,197,94,.2);color:#4ade80}
 .badge.err{background:rgba(239,68,68,.25);color:#fca5a5}
-.bottom-nav{position:fixed;bottom:0;left:0;right:0;height:var(--bottom-h);background:rgba(15,23,42,.96);border-top:1px solid var(--border);display:flex;z-index:40;padding-bottom:env(safe-area-inset-bottom)}
-.nav-item{flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;font-size:10px;color:var(--muted);cursor:pointer}
+.badge.info{background:rgba(59,130,246,.2);color:#93c5fd}
+.notif-dot{position:relative}
+.notif-dot::after{content:attr(data-count);position:absolute;top:-2px;right:-2px;background:#ef4444;color:#fff;font-size:9px;font-weight:700;border-radius:50%;min-width:15px;height:15px;display:flex;align-items:center;justify-content:center;padding:0 3px;border:1.5px solid #0f172a}
+.notif-dot[data-count="0"]::after{display:none}
+.bottom-nav{position:fixed;bottom:0;left:0;right:0;height:var(--bottom-h);background:rgba(15,23,42,.97);backdrop-filter:blur(16px);border-top:1px solid var(--border);display:flex;z-index:40;padding-bottom:env(safe-area-inset-bottom);overflow-x:auto}
+.nav-item{flex:1;min-width:56px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:2px;font-size:9px;color:var(--muted);cursor:pointer;padding:4px 2px;position:relative;transition:color .15s}
 .nav-item.active{color:#60a5fa}
-.nav-item span:first-child{font-size:19px}
-.main-area{height:calc(100vh - 48px - var(--bottom-h));overflow:hidden}
-.panel{display:none;height:100%;overflow-y:auto;padding:10px;padding-bottom:20px}
+.nav-item.active::before{content:"";position:absolute;top:0;left:22%;right:22%;height:3px;background:linear-gradient(90deg,transparent,#3b82f6,transparent);border-radius:3px}
+.nav-item i{font-size:18px}
+.main-area{height:calc(100vh - var(--header-h) - var(--bottom-h));overflow:hidden}
+.panel{display:none;height:100%;overflow-y:auto;padding:10px;padding-bottom:22px;-webkit-overflow-scrolling:touch}
 .panel.active{display:block}
 .breadcrumb{background:rgba(8,15,28,.7);padding:8px 11px;border-radius:10px;margin-bottom:8px;font-size:12px;word-break:break-all}
 .breadcrumb span{color:#60a5fa;cursor:pointer}
-.file-item{background:var(--card);padding:11px;margin:4px 0;border-radius:11px;border:1px solid var(--border);cursor:pointer;display:flex;align-items:center;gap:9px}
-.file-item .name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px}
+.file-item{background:var(--card);padding:10px;margin:4px 0;border-radius:11px;border:1px solid var(--border);cursor:pointer;display:flex;align-items:center;gap:8px;transition:transform .12s;position:relative;overflow:hidden}
+.file-item:active{transform:scale(.98);background:#1f2937}
+.file-item .icon-wrap{width:36px;height:36px;border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:16px;flex-shrink:0;color:#fff}
+.file-item.folder .icon-wrap{background:linear-gradient(135deg,#f59e0b,#d97706)}
+.file-item.file .icon-wrap{background:linear-gradient(135deg,#3b82f6,#2563eb)}
+.file-item.file.code .icon-wrap{background:linear-gradient(135deg,#8b5cf6,#7c3aed)}
+.file-item.file.image .icon-wrap{background:linear-gradient(135deg,#22c55e,#16a34a)}
+.file-item.file.video .icon-wrap{background:linear-gradient(135deg,#ec4899,#db2777)}
+.file-item.file.audio .icon-wrap{background:linear-gradient(135deg,#f97316,#ea580c)}
+.file-item.file.doc .icon-wrap{background:linear-gradient(135deg,#06b6d4,#0891b2)}
+.file-item.file.zip .icon-wrap{background:linear-gradient(135deg,#a3a3a3,#525252)}
+.file-item .name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:13px;color:#e2e8f0}
 .file-item.folder .name{color:#fbbf24;font-weight:600}
-.file-item.file .name{color:#93c5fd}
+.file-item .name mark{background:rgba(59,130,246,.4);color:#93c5fd;padding:0 2px;border-radius:3px;font-weight:700}
+.file-item .size-badge{background:rgba(139,92,246,.2);color:#c4b5fd;padding:2px 7px;border-radius:6px;font-size:10px;font-weight:700;flex-shrink:0}
 .file-item .meta{font-size:10px;color:var(--muted);white-space:nowrap}
 .toolbar{display:flex;gap:5px;margin-bottom:8px;flex-wrap:wrap}
 .sort-bar{display:flex;gap:5px;margin-bottom:8px}
 .sort-bar select{padding:7px 9px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:#fff;font-size:12px;flex:1}
+.search-box{display:flex;gap:6px;margin-bottom:8px}
+.search-box input{flex:1;padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:#0b1220;color:#fff;font-size:13px;outline:none}
 #editor-box{position:fixed;inset:0;background:var(--bg);z-index:100;display:none;flex-direction:column}
 #editor-header{padding:6px 9px;background:rgba(15,23,42,.95);border-bottom:1px solid var(--border);display:flex;align-items:center;gap:5px;flex-wrap:wrap}
 .tab-bar-editor{display:flex;overflow-x:auto;background:#0b1220;border-bottom:1px solid var(--border)}
-.editor-tab{padding:8px 12px;font-size:12px;white-space:nowrap;cursor:pointer;border-bottom:2px solid transparent;color:var(--muted)}
+.editor-tab{padding:8px 12px;font-size:12px;white-space:nowrap;cursor:pointer;border-bottom:2px solid transparent;color:var(--muted);display:flex;align-items:center;gap:6px}
 .editor-tab.active{color:#60a5fa;border-bottom-color:#3b82f6;background:rgba(59,130,246,.08)}
-.editor-tab .close-tab{opacity:.5;font-size:13px;padding:0 2px}
-#editor-toolbar{padding:4px 7px;background:#0b1220;border-bottom:1px solid var(--border);display:flex;gap:3px;flex-wrap:wrap}
-#editor-toolbar button{background:#1f2937;color:#e2e8f0;border:0;border-radius:6px;padding:5px 9px;font-size:11px;font-weight:600;cursor:pointer}
+.editor-tab .close-tab{opacity:.55;font-size:14px;padding:0 2px;line-height:1}
+#editor-toolbar{padding:4px 7px;background:#0b1220;border-bottom:1px solid var(--border);display:flex;gap:3px;flex-wrap:wrap;overflow-x:auto}
+#editor-toolbar button{background:#1f2937;color:#e2e8f0;border:0;border-radius:6px;padding:5px 9px;font-size:11px;font-weight:600;cursor:pointer;white-space:nowrap;display:flex;align-items:center;gap:3px}
+#editor-toolbar button:active{background:#374151}
 #editor-container{flex:1;overflow:hidden;position:relative}
 .CodeMirror{height:100%!important;font-size:13px;font-family:'JetBrains Mono',Consolas,monospace}
 .cm-error-line{background:rgba(239,68,68,.18)!important}
-#terminal-output{background:#000;color:#4ade80;padding:11px;border-radius:11px;min-height:200px;max-height:calc(100vh - 240px);overflow-y:auto;font-size:12px;white-space:pre-wrap;font-family:monospace;border:1px solid #1f2937;margin-bottom:8px}
-#cmd-input{display:flex;gap:5px}
-#cmd-input input{flex:1;padding:10px;background:#0b1220;color:#e2e8f0;border:1px solid #374151;border-radius:9px;font-family:monospace;font-size:13px}
-#cmd-input button{padding:10px 14px;background:var(--success);color:#fff;border:0;border-radius:9px;font-weight:700}
+.split-toggle{position:absolute;top:8px;right:8px;z-index:101;padding:5px 9px;font-size:10px;background:#1f2937;color:#94a3b8;border:0;border-radius:6px;cursor:pointer}
+.split-pane{position:absolute;right:0;top:0;bottom:0;width:45%;background:#0f172a;border-left:1px solid var(--border);overflow:auto;padding:10px;display:none}
+.split-pane.show{display:block}
 .output-box{background:#000;color:#4ade80;padding:11px;border-radius:11px;min-height:180px;white-space:pre-wrap;font-family:monospace;font-size:12px;border:1px solid #1f2937;max-height:calc(100vh - 260px);overflow-y:auto}
+#terminal-output{background:#000;color:#4ade80;padding:11px;border-radius:11px;min-height:180px;max-height:calc(100vh - 400px);overflow-y:auto;font-size:12px;white-space:pre-wrap;font-family:monospace;border:1px solid #1f2937;margin-bottom:8px}
+#cmd-input{display:flex;gap:5px}
+#cmd-input input{flex:1;padding:10px;background:#0b1220;color:#e2e8f0;border:1px solid #374151;border-radius:9px;font-family:monospace;font-size:13px;outline:none}
+#cmd-input button{padding:10px 14px;background:var(--success);color:#fff;border:0;border-radius:9px;font-weight:700}
+.terminal-presets{display:grid;grid-template-columns:repeat(auto-fill,minmax(130px,1fr));gap:5px;margin-bottom:10px;max-height:180px;overflow-y:auto;padding:2px}
+.terminal-presets button{background:linear-gradient(135deg,#1e293b,#0f172a);border:1px solid #334155;color:#cbd5e1;padding:7px 9px;font-size:11px;border-radius:10px;text-align:left;display:flex;align-items:center;gap:5px;cursor:pointer;font-weight:600}
+.terminal-presets button:hover{background:#334155;color:#60a5fa}
+.terminal-presets button i{color:#60a5fa;font-size:12px;width:14px}
+.pty-term{background:#000;color:#d1fae5;padding:10px;font-family:'JetBrains Mono',monospace;font-size:12px;border-radius:11px;border:1px solid #1f2937;height:calc(100vh - 340px);overflow-y:auto;white-space:pre-wrap;word-break:break-all}
+.pty-input{display:flex;gap:5px;margin-top:8px}
+.pty-input input{flex:1;background:#0b1220;border:1px solid #374151;border-radius:9px;padding:10px;color:#fff;font-family:monospace;font-size:13px;outline:none}
+.system-card{background:linear-gradient(135deg,#1e1b4b,#0f172a);border:1px solid #312e81;border-radius:14px;padding:12px;margin-bottom:12px}
+.system-card h4{color:#a5b4fc;font-size:11px;margin-bottom:6px;text-transform:uppercase;letter-spacing:.5px;display:flex;align-items:center;gap:5px}
+.stat-row{display:flex;justify-content:space-between;font-size:11px;padding:3px 0;border-bottom:1px solid rgba(99,102,241,.15)}
+.stat-row:last-child{border-bottom:0}
+.stat-row b{color:#c7d2fe;font-weight:600}
 .err-item{background:rgba(127,29,29,.5);color:#fecaca;padding:11px;border-radius:9px;margin:5px 0;cursor:pointer;border-left:4px solid #ef4444;font-family:monospace;font-size:12px}
 .info-bar{background:rgba(8,15,28,.7);padding:9px;border-radius:9px;margin-bottom:9px;font-size:12px;border:1px solid var(--border)}
 .build-panel{background:#0b1220;border:1px solid #1f2937;border-radius:13px;padding:14px;margin-bottom:12px}
@@ -1798,57 +2481,97 @@ header h2{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text
 .progress-bar{height:100%;background:linear-gradient(90deg,#3b82f6,#8b5cf6);transition:width .4s;width:0%}
 .progress-text{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;font-size:12px;font-weight:700;color:#fff}
 .toast-container{position:fixed;bottom:calc(var(--bottom-h)+16px);left:50%;transform:translateX(-50%);z-index:999;display:flex;flex-direction:column;gap:7px;pointer-events:none}
-.toast{background:rgba(15,23,42,.96);border:1px solid var(--border);color:#fff;padding:10px 16px;border-radius:11px;font-size:13px}
-.toast.success{border-color:rgba(34,197,94,.45)}.toast.error{border-color:rgba(239,68,68,.45)}
-.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200;display:none;align-items:flex-end;justify-content:center}
+.toast{background:rgba(15,23,42,.96);border:1px solid var(--border);color:#fff;padding:10px 16px;border-radius:11px;font-size:13px;display:flex;align-items:center;gap:8px;animation:slideUp .3s}
+@keyframes slideUp{from{transform:translateY(20px);opacity:0}}
+.toast.success{border-color:rgba(34,197,94,.45)}
+.toast.error{border-color:rgba(239,68,68,.45)}
+.toast.info{border-color:rgba(59,130,246,.45)}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200;display:none;align-items:flex-end;justify-content:center;backdrop-filter:blur(4px)}
 .modal-overlay.show{display:flex}
-.modal{background:#111827;border-radius:20px 20px 0 0;padding:20px;width:100%;max-width:520px;max-height:85vh;overflow-y:auto}
-.modal h3{font-size:15px;margin-bottom:10px;color:#60a5fa}
-.modal input,.modal textarea,.modal select{width:100%;padding:10px 12px;margin:6px 0;border-radius:10px;border:1px solid #374151;background:#0b1220;color:#fff;font-size:13px}
-.modal textarea{font-family:monospace;min-height:120px;resize:vertical}
+.modal{background:#111827;border-radius:20px 20px 0 0;padding:20px;width:100%;max-width:560px;max-height:88vh;overflow-y:auto;animation:slideUp .25s;border:1px solid var(--border);border-bottom:0}
+.modal h3{font-size:15px;margin-bottom:10px;color:#60a5fa;display:flex;align-items:center;gap:7px}
+.modal input,.modal textarea,.modal select{width:100%;padding:10px 12px;margin:5px 0;border-radius:10px;border:1px solid #374151;background:#0b1220;color:#fff;font-size:13px;outline:none}
+.modal textarea{font-family:monospace;min-height:110px;resize:vertical}
 .empty{color:var(--muted);text-align:center;padding:25px;font-style:italic}
-.search-box{display:flex;gap:6px;margin-bottom:8px}
-.search-box input{flex:1;padding:10px 12px;border-radius:10px;border:1px solid var(--border);background:#0b1220;color:#fff;font-size:13px}
-.upload-btn{position:relative;overflow:hidden}
-.upload-btn input{position:absolute;inset:0;opacity:0;cursor:pointer;width:100%}
-.preview-frame{background:#0f172a;border-radius:24px;border:6px solid #1e293b;width:min(320px,90vw);margin:0 auto;overflow:hidden;min-height:480px;position:relative}
+.preview-frame{background:#0f172a;border-radius:24px;border:6px solid #1e293b;width:min(320px,90vw);margin:0 auto;overflow:hidden;min-height:480px;position:relative;transition:width .2s}
 .preview-frame.tablet{width:min(520px,95vw);min-height:380px}
 .preview-frame.desktop{width:min(90vw,900px);min-height:400px}
 .preview-content{padding:14px;min-height:440px;color:#fff}
-.device-frames{display:flex;gap:6px;margin-bottom:10px;justify-content:center;flex-wrap:wrap}
-.device-frames button{background:#1f2937;color:#94a3b8;padding:6px 12px;font-size:11px}
+.device-frames{display:flex;gap:5px;margin-bottom:10px;justify-content:center;flex-wrap:wrap}
+.device-frames button{background:#1f2937;color:#94a3b8;padding:6px 11px;font-size:11px}
 .device-frames button.active{background:#3b82f6;color:#fff}
-.cmd-palette{position:fixed;top:20%;left:50%;transform:translateX(-50%);width:min(500px,92vw);background:#0b1220;border:1px solid #1f2937;border-radius:14px;z-index:500;display:none;box-shadow:0 20px 60px rgba(0,0,0,.6);overflow:hidden}
+.cmd-palette{position:fixed;top:18%;left:50%;transform:translateX(-50%);width:min(500px,92vw);background:#0b1220;border:1px solid #1f2937;border-radius:14px;z-index:500;display:none;box-shadow:0 20px 60px rgba(0,0,0,.7);overflow:hidden}
 .cmd-palette.show{display:block}
 .cmd-palette input{width:100%;padding:14px 16px;background:transparent;border:0;color:#fff;font-size:15px;outline:none;border-bottom:1px solid #1f2937}
 .cmd-palette ul{list-style:none;max-height:340px;overflow-y:auto}
-.cmd-palette li{padding:11px 16px;cursor:pointer;font-size:13px;color:#cbd5e1;border-bottom:1px solid #111827}
+.cmd-palette li{padding:11px 16px;cursor:pointer;font-size:13px;color:#cbd5e1;border-bottom:1px solid #111827;display:flex;align-items:center;gap:8px}
 .cmd-palette li:hover,.cmd-palette li.active{background:#1f2937;color:#60a5fa}
+.cmd-palette li i{width:18px;color:#8b5cf6}
+.more-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:8px;margin:8px 0}
+.more-item{background:linear-gradient(135deg,#1e293b,#0f172a);border:1px solid #334155;border-radius:11px;padding:12px 8px;text-align:center;cursor:pointer;font-size:11px;color:#cbd5e1;transition:.15s;font-weight:600}
+.more-item:active{transform:scale(.95)}
+.more-item:hover{background:linear-gradient(135deg,#334155,#1e293b);color:#60a5fa}
+.more-item i{font-size:22px;display:block;margin-bottom:5px;color:#8b5cf6}
+.devtool-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:8px;margin:8px 0}
+.devtool-item{background:linear-gradient(135deg,#1e293b,#0f172a);border:1px solid #334155;border-radius:12px;padding:12px 10px;text-align:center;cursor:pointer;font-size:11px;color:#cbd5e1;transition:.15s;font-weight:600}
+.devtool-item:hover{background:linear-gradient(135deg,#334155,#1e293b);color:#60a5fa;transform:translateY(-2px)}
+.devtool-item i{font-size:22px;display:block;margin-bottom:5px;color:#8b5cf6}
+.logcat-line{font-family:monospace;font-size:11px;padding:2px 4px;border-bottom:1px solid #0f172a;word-break:break-all}
+.logcat-line.err{color:#f87171}
+.logcat-line.warn{color:#fbbf24}
+.logcat-line.info{color:#60a5fa}
 .git-item{background:#0b1220;border:1px solid #1f2937;border-radius:8px;padding:8px 10px;margin:3px 0;font-family:monospace;font-size:11px}
-.logcat-line{font-family:monospace;font-size:11px;padding:2px 4px;border-bottom:1px solid #0f172a}
-.logcat-line.err{color:#f87171}.logcat-line.warn{color:#fbbf24}.logcat-line.info{color:#60a5fa}
-.more-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(120px,1fr));gap:8px;margin:8px 0}
-.more-item{background:#0b1220;border:1px solid #1f2937;border-radius:11px;padding:14px 8px;text-align:center;cursor:pointer;font-size:12px;color:#cbd5e1}
-.more-item:hover{background:#1f2937;color:#60a5fa}
-.more-item span{font-size:22px;display:block;margin-bottom:5px}
-.hint-line{color:#fbbf24;font-weight:600}
-.split-toggle{position:absolute;top:5px;right:5px;z-index:101;padding:5px 10px;font-size:10px;background:#1f2937;color:#94a3b8;border:0;border-radius:6px;cursor:pointer}
-.split-pane{position:absolute;right:0;top:0;bottom:0;width:45%;background:#0f172a;border-left:1px solid #1f2937;overflow:auto;padding:10px;display:none}
-.split-pane.show{display:block}
+.kanban-board{display:grid;grid-template-columns:1fr;gap:10px}
+@media(min-width:600px){.kanban-board{grid-template-columns:repeat(3,1fr)}}
+.kanban-col{background:#0b1220;border:1px solid #1f2937;border-radius:12px;padding:10px;min-height:150px}
+.kanban-col h4{font-size:12px;color:#60a5fa;margin-bottom:8px;display:flex;justify-content:space-between;align-items:center}
+.kanban-card{background:#1e293b;padding:8px 10px;border-radius:8px;margin-bottom:6px;font-size:12px;cursor:pointer;border-left:3px solid #3b82f6;position:relative}
+.kanban-card.p-high{border-left-color:#ef4444}
+.kanban-card.p-low{border-left-color:#22c55e}
+.kanban-card .del{position:absolute;top:5px;right:5px;color:#ef4444;opacity:.6;font-size:11px}
+.notif-item{background:#0b1220;border:1px solid #1f2937;border-radius:10px;padding:10px;margin-bottom:6px;border-left:3px solid #3b82f6;font-size:12px}
+.notif-item.success{border-left-color:#22c55e}
+.notif-item.error{border-left-color:#ef4444}
+.notif-item .time{font-size:10px;color:#64748b;margin-top:3px}
+.notif-item .ttl{color:#e2e8f0;font-weight:600;margin-bottom:2px}
+.notif-item .bdy{color:#94a3b8;font-size:11px}
+.chart-bar{background:#1f2937;border-radius:3px;overflow:hidden}
+.chart-wrap{display:flex;gap:3px;align-items:flex-end;height:100px;padding:6px;background:#0b1220;border-radius:10px;border:1px solid #1f2937}
+.chart-col{flex:1;background:linear-gradient(180deg,#3b82f6,#8b5cf6);border-radius:3px 3px 0 0;min-height:4px;transition:height .3s;position:relative}
+.chart-col.ok{background:linear-gradient(180deg,#22c55e,#16a34a)}
+.chart-col.fail{background:linear-gradient(180deg,#ef4444,#dc2626)}
+.plugin-item{background:#0b1220;border:1px solid #1f2937;border-radius:10px;padding:10px;margin-bottom:6px}
+.plugin-item h5{font-size:12px;color:#60a5fa;margin-bottom:3px}
+.plugin-item p{font-size:11px;color:#94a3b8;margin-bottom:6px}
+.fab-2026{position:fixed;bottom:calc(var(--bottom-h) + 16px);right:16px;width:52px;height:52px;border-radius:50%;background:linear-gradient(135deg,#6366f1,#8b5cf6);box-shadow:0 8px 30px rgba(139,92,246,.6);display:flex;align-items:center;justify-content:center;color:#fff;font-size:20px;z-index:45;border:0;cursor:pointer;transition:transform .2s}
+.fab-2026:active{transform:scale(.9) rotate(90deg)}
+@media(min-width:720px){
+  .main-area{max-width:1100px;margin:0 auto}
+  .file-item{padding:13px}
+  .terminal-presets{grid-template-columns:repeat(auto-fill,minmax(170px,1fr));max-height:280px}
+  .pty-term{height:calc(100vh - 300px)}
+  header h2{font-size:14px}
+}
+@media(max-width:380px){
+  .btn{padding:5px 7px;font-size:10px}
+  header h2{font-size:11px}
+  .bottom-nav .nav-item{font-size:8px}
+}
 </style>
 </head>
 <body>
 <header>
-  <h2>📱 __NAME__</h2>
+  <h2><i class="fa-solid fa-bolt"></i> __NAME__</h2>
   <div style="display:flex;gap:3px;flex-wrap:wrap">
-    <button class="btn btn-orange" onclick="scanAllErrors()" id="scanBtn" title="Scan errors">🔍</button>
-    <button class="btn btn-purple" onclick="runCurrent()" id="runBtn" style="display:none">▶</button>
-    <button class="btn btn-primary" onclick="buildApk()" title="Build APK">🔨</button>
-    <button class="btn" onclick="exportZip()" title="Export ZIP">📦</button>
-    <button class="btn" onclick="showMoreMenu()" title="More">⋯</button>
-    <button class="btn" onclick="openCommandPalette()" title="Command Palette">⌘</button>
-    <button class="btn" onclick="openSettings()" title="Settings">⚙️</button>
-    <button class="btn" onclick="location.href='/'" title="Home">🏠</button>
+    <button class="btn btn-orange" onclick="scanAllErrors()" id="scanBtn" title="Scan"><i class="fa-solid fa-magnifying-glass"></i></button>
+    <button class="btn btn-purple" onclick="runCurrent()" id="runBtn" style="display:none" title="Run"><i class="fa-solid fa-play"></i></button>
+    <button class="btn btn-primary" onclick="buildApk()" title="Build"><i class="fa-solid fa-hammer"></i></button>
+    <button class="btn notif-dot" id="notifBtn" data-count="0" onclick="showNotifications()" title="Notifications"><i class="fa-solid fa-bell"></i></button>
+    <button class="btn" onclick="exportZip()" title="Export"><i class="fa-solid fa-file-zipper"></i></button>
+    <button class="btn" onclick="showMoreMenu()" title="More"><i class="fa-solid fa-ellipsis"></i></button>
+    <button class="btn" onclick="openCommandPalette()" title="Cmd"><i class="fa-solid fa-bolt"></i></button>
+    <button class="btn" onclick="openSettings()" title="Settings"><i class="fa-solid fa-gear"></i></button>
+    <button class="btn" onclick="location.href='/'" title="Home"><i class="fa-solid fa-house"></i></button>
   </div>
 </header>
 
@@ -1856,112 +2579,132 @@ header h2{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text
   <!-- FILES -->
   <div class="panel active" id="panel-explorer">
     <div class="toolbar">
-      <button class="btn btn-success" onclick="newFile()">📄 +File</button>
-      <button class="btn btn-orange" onclick="newFolder()">📁 +Folder</button>
-      <button class="btn upload-btn">⬆ Upload<input type="file" onchange="doUpload(this)"></button>
-      <button class="btn upload-btn">🗜 Extract<input type="file" accept=".zip" onchange="doExtract(this)"></button>
-      <button class="btn" onclick="loadFiles(currentPath)">🔄</button>
-      <button class="btn" onclick="showRecent()">🕒 Recent</button>
+      <button class="btn btn-success" onclick="newFile()"><i class="fa-solid fa-file-circle-plus"></i> File</button>
+      <button class="btn btn-orange" onclick="newFolder()"><i class="fa-solid fa-folder-plus"></i> Folder</button>
+      <button class="btn upload-btn" style="position:relative;overflow:hidden"><i class="fa-solid fa-upload"></i> Upload<input type="file" style="position:absolute;inset:0;opacity:0;cursor:pointer;width:100%" onchange="doUpload(this)"></button>
+      <button class="btn upload-btn" style="position:relative;overflow:hidden"><i class="fa-solid fa-file-zipper"></i> Zip<input type="file" accept=".zip" style="position:absolute;inset:0;opacity:0;cursor:pointer;width:100%" onchange="doExtract(this)"></button>
+      <button class="btn" onclick="loadFiles(currentPath)"><i class="fa-solid fa-rotate"></i></button>
+      <button class="btn" onclick="showRecent()"><i class="fa-solid fa-clock-rotate-left"></i></button>
     </div>
     <div class="sort-bar">
       <select id="sortBy" onchange="loadFiles(currentPath)">
-        <option value="name">Sort: Name</option>
-        <option value="size">Sort: Size</option>
-        <option value="date">Sort: Date</option>
+        <option value="name">Name</option>
+        <option value="size">Size</option>
+        <option value="date">Date</option>
       </select>
     </div>
     <div class="search-box">
       <input id="searchInput" placeholder="Search files..." oninput="filterFiles(this.value)">
-      <button class="btn" onclick="clearSearch()">✕</button>
+      <button class="btn" onclick="clearSearch()"><i class="fa-solid fa-xmark"></i></button>
     </div>
     <div class="breadcrumb" id="breadcrumb">Loading...</div>
-    <div id="file-list"><div class="empty">Loading...</div></div>
+    <div id="file-list"><div class="empty"><i class="fa-solid fa-spinner fa-spin"></i> Loading...</div></div>
   </div>
 
   <!-- PREVIEW -->
   <div class="panel" id="panel-preview">
-    <div class="info-bar">Live Layout / HTML Preview</div>
+    <div class="info-bar"><i class="fa-solid fa-eye"></i> Live Layout / HTML Preview</div>
     <div class="device-frames">
-      <button class="active" onclick="setDevice('phone',this)">📱 Phone</button>
-      <button onclick="setDevice('tablet',this)">📱 Tablet</button>
-      <button onclick="setDevice('desktop',this)">💻 Desktop</button>
-      <button onclick="refreshPreview()">🔄</button>
+      <button class="active" onclick="setDevice('phone',this)"><i class="fa-solid fa-mobile"></i></button>
+      <button onclick="setDevice('tablet',this)"><i class="fa-solid fa-tablet"></i></button>
+      <button onclick="setDevice('desktop',this)"><i class="fa-solid fa-desktop"></i></button>
+      <button onclick="refreshPreview()"><i class="fa-solid fa-rotate"></i></button>
       <button onclick="togglePreviewMode()" id="prevModeBtn">HTML</button>
     </div>
     <div class="preview-frame" id="previewFrame">
       <div class="preview-content" id="previewContent">
-        <p style="text-align:center;color:#64748b;padding:40px 20px">Tap 🔄 to load layout or HTML</p>
+        <p style="text-align:center;color:#64748b;padding:40px 20px"><i class="fa-solid fa-mobile-screen"></i><br>Tap <i class="fa-solid fa-rotate"></i> to load</p>
       </div>
     </div>
   </div>
 
   <!-- ERRORS -->
   <div class="panel" id="panel-errors">
-    <div class="info-bar" id="errInfo">Press 🔍 to scan</div>
+    <div class="info-bar" id="errInfo"><i class="fa-solid fa-bug"></i> Press scan to check</div>
     <div id="err-list"></div>
   </div>
 
   <!-- TERMINAL -->
   <div class="panel" id="panel-terminal">
+    <div class="system-card" id="sysCard">
+      <h4><i class="fa-solid fa-microchip"></i> System Monitor</h4>
+      <div id="sysInfo">Loading...</div>
+    </div>
     <div style="display:flex;justify-content:space-between;margin-bottom:7px;gap:5px;flex-wrap:wrap">
-      <span style="font-size:12px;color:var(--muted)">Terminal</span>
-      <div>
-        <button class="btn" style="padding:4px 9px;font-size:11px" onclick="showSavedCommands()">⭐ Saved</button>
-        <button class="btn" style="padding:4px 9px;font-size:11px" onclick="saveCurrentCmd()">+ Save</button>
-        <button class="btn" style="padding:4px 9px;font-size:11px" onclick="clearTerminal()">Clear</button>
+      <span style="font-size:12px;color:var(--muted)"><i class="fa-solid fa-terminal"></i> Terminal</span>
+      <div style="display:flex;gap:3px">
+        <button class="btn" style="padding:4px 9px;font-size:11px" onclick="startPTY()"><i class="fa-solid fa-terminal"></i> PTY</button>
+        <button class="btn" style="padding:4px 9px;font-size:11px" onclick="showSavedCommands()"><i class="fa-solid fa-star"></i></button>
+        <button class="btn" style="padding:4px 9px;font-size:11px" onclick="showAliases()"><i class="fa-solid fa-tag"></i></button>
+        <button class="btn" style="padding:4px 9px;font-size:11px" onclick="clearTerminal()"><i class="fa-solid fa-broom"></i></button>
       </div>
     </div>
+    <div class="terminal-presets" id="presetBox"></div>
     <div id="terminal-output">$ Zihad IDE Terminal — Ready
 </div>
     <div id="cmd-input">
-      <input id="cmd" placeholder="ls, gradle -v, git status..." onkeydown="termKey(event)">
-      <button onclick="runCmd()">Run</button>
+      <input id="cmd" placeholder="ls, pkg install git, python..." onkeydown="termKey(event)">
+      <button onclick="runCmd()"><i class="fa-solid fa-paper-plane"></i></button>
+    </div>
+    <div id="ptyBox" style="display:none;margin-top:10px">
+      <div class="pty-term" id="ptyOutput"></div>
+      <div class="pty-input">
+        <input id="ptyInput" placeholder="Interactive input..." onkeydown="ptyKey(event)">
+        <button class="btn btn-success" onclick="ptySend()"><i class="fa-solid fa-arrow-right"></i></button>
+        <button class="btn btn-danger" onclick="stopPTY()"><i class="fa-solid fa-stop"></i></button>
+      </div>
     </div>
   </div>
 
   <!-- OUTPUT -->
   <div class="panel" id="panel-output">
-    <div class="info-bar" id="run-info">No code executed yet</div>
+    <div class="info-bar" id="run-info"><i class="fa-solid fa-play"></i> No code executed yet</div>
     <div class="output-box" id="output-box">Output will appear here...</div>
   </div>
 
   <!-- BUILD -->
   <div class="panel" id="panel-build">
     <div class="build-panel">
-      <h3 style="margin:0 0 8px;font-size:14px;color:#60a5fa">🔨 APK Build</h3>
+      <h3 style="margin:0 0 8px;font-size:14px;color:#60a5fa;display:flex;align-items:center;gap:6px"><i class="fa-solid fa-hammer"></i> APK Build</h3>
       <div class="progress-wrap">
         <div class="progress-bar" id="buildProgressBar"></div>
         <div class="progress-text" id="buildProgressText">0%</div>
       </div>
-      <div id="currentTask" style="font-family:monospace;font-size:11px;color:#fbbf24;margin:8px 0">Press 🔨 to build</div>
+      <div id="currentTask" style="font-family:monospace;font-size:11px;color:#fbbf24;margin:8px 0"><i class="fa-solid fa-hourglass"></i> Press build to start</div>
       <div id="buildStatusMsg" style="text-align:center;font-size:12px;color:var(--muted)">Ready</div>
+      <div style="display:flex;align-items:center;gap:6px;margin-top:8px;font-size:12px">
+        <label style="display:flex;align-items:center;gap:5px;cursor:pointer">
+          <input type="checkbox" id="autoBuildChk" onchange="toggleAutoBuild(this.checked)" style="width:auto;margin:0">
+          <i class="fa-solid fa-robot"></i> Auto-build on save
+        </label>
+      </div>
       <div id="apk-box" style="display:none;margin-top:10px">
-        <button class="btn btn-success" id="apkDownloadBtn" style="width:100%;padding:12px;margin-bottom:6px">⬇ Download APK</button>
+        <button class="btn btn-success" id="apkDownloadBtn" style="width:100%;padding:12px;margin-bottom:6px"><i class="fa-solid fa-download"></i> Download APK</button>
         <div style="display:flex;gap:5px">
-          <button class="btn btn-primary" style="flex:1;padding:12px" onclick="adbInstall()">📲 ADB Install</button>
-          <button class="btn btn-danger" style="flex:1;padding:12px" onclick="cleanBuild()">🧹 Clean</button>
+          <button class="btn btn-primary" style="flex:1;padding:11px" onclick="adbInstall()"><i class="fa-solid fa-mobile-button"></i> ADB Install</button>
+          <button class="btn btn-danger" style="flex:1;padding:11px" onclick="cleanBuild()"><i class="fa-solid fa-broom"></i> Clean</button>
         </div>
       </div>
     </div>
-    <div class="info-bar">Live Build Log</div>
+    <div class="info-bar"><i class="fa-solid fa-list-check"></i> Live Build Log</div>
     <div class="output-box" id="buildLog">$ Waiting...</div>
   </div>
 
   <!-- GIT -->
   <div class="panel" id="panel-git">
-    <div class="info-bar" id="gitInfo">Git</div>
+    <div class="info-bar" id="gitInfo"><i class="fa-brands fa-git-alt"></i> Git</div>
     <div class="toolbar">
-      <button class="btn btn-success" onclick="gitAction('init')">🔧 Init</button>
-      <button class="btn btn-primary" onclick="gitAction('add')">➕ Add All</button>
-      <button class="btn btn-purple" onclick="gitCommitPrompt()">💾 Commit</button>
-      <button class="btn" onclick="gitAction('log')">📜 Log</button>
-      <button class="btn" onclick="gitAction('diff')">🔍 Diff</button>
-      <button class="btn" onclick="gitAction('branches')">🌿 Branch</button>
+      <button class="btn btn-success" onclick="gitAction('init')"><i class="fa-solid fa-wrench"></i> Init</button>
+      <button class="btn btn-primary" onclick="gitAction('add')"><i class="fa-solid fa-plus"></i> Add</button>
+      <button class="btn btn-purple" onclick="gitCommitPrompt()"><i class="fa-solid fa-floppy-disk"></i> Commit</button>
+      <button class="btn" onclick="gitAction('log')"><i class="fa-solid fa-list-ul"></i></button>
+      <button class="btn" onclick="gitAction('diff')"><i class="fa-solid fa-code-compare"></i></button>
+      <button class="btn" onclick="gitAction('branches')"><i class="fa-solid fa-code-branch"></i></button>
     </div>
     <div class="toolbar">
-      <button class="btn btn-success" onclick="gitRemote('push')">⬆ Push</button>
-      <button class="btn btn-orange" onclick="gitRemote('pull')">⬇ Pull</button>
-      <button class="btn" onclick="gitSetRemote()">🔗 Set Remote</button>
+      <button class="btn btn-success" onclick="gitRemote('push')"><i class="fa-solid fa-cloud-arrow-up"></i> Push</button>
+      <button class="btn btn-orange" onclick="gitRemote('pull')"><i class="fa-solid fa-cloud-arrow-down"></i> Pull</button>
+      <button class="btn" onclick="gitSetRemote()"><i class="fa-solid fa-link"></i></button>
     </div>
     <div id="gitOutput" class="output-box" style="min-height:150px;max-height:calc(100vh - 340px)"></div>
   </div>
@@ -1969,65 +2712,110 @@ header h2{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text
   <!-- LOGCAT -->
   <div class="panel" id="panel-logcat">
     <div class="toolbar">
-      <button class="btn btn-success" onclick="logcatStart()" id="lcStartBtn">▶ Start</button>
-      <button class="btn btn-danger" onclick="logcatStop()">⏹ Stop</button>
-      <button class="btn" onclick="logcatClear()">🗑 Clear</button>
-      <select id="lcFilter" onchange="renderLogcat()" style="padding:7px 9px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:#fff;font-size:12px">
+      <button class="btn btn-success" onclick="logcatStart()" id="lcStartBtn"><i class="fa-solid fa-play"></i> Start</button>
+      <button class="btn btn-danger" onclick="logcatStop()"><i class="fa-solid fa-stop"></i></button>
+      <button class="btn" onclick="logcatClear()"><i class="fa-solid fa-trash"></i></button>
+      <select id="lcFilter" onchange="renderLogcat()" style="padding:7px 9px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:#fff;font-size:12px;flex:1">
         <option value="all">All</option>
-        <option value="error">Errors only</option>
+        <option value="error">Errors</option>
         <option value="warn">Warn+</option>
         <option value="info">Info+</option>
       </select>
     </div>
     <div id="logcatBox" style="background:#000;border:1px solid #1f2937;border-radius:11px;max-height:calc(100vh - 260px);overflow-y:auto;padding:6px">Not started</div>
   </div>
+
+  <!-- KANBAN -->
+  <div class="panel" id="panel-kanban">
+    <div class="info-bar"><i class="fa-solid fa-list-check"></i> Project Kanban Board</div>
+    <div style="display:flex;gap:6px;margin-bottom:10px">
+      <input id="kanbanInput" placeholder="New task..." style="flex:1;padding:10px;border-radius:10px;border:1px solid var(--border);background:#0b1220;color:#fff;font-size:13px;outline:none">
+      <select id="kanbanPriority" style="padding:10px;border-radius:10px;border:1px solid var(--border);background:#0b1220;color:#fff;font-size:12px">
+        <option value="normal">Normal</option>
+        <option value="high">High</option>
+        <option value="low">Low</option>
+      </select>
+      <button class="btn btn-success" onclick="kanbanAdd()"><i class="fa-solid fa-plus"></i></button>
+    </div>
+    <div class="kanban-board" id="kanbanBoard">Loading...</div>
+  </div>
+
+  <!-- NOTES -->
+  <div class="panel" id="panel-notes">
+    <div class="info-bar"><i class="fa-solid fa-note-sticky"></i> Project Notes</div>
+    <textarea id="notesArea" placeholder="Your notes here..." style="width:100%;height:calc(100vh - 260px);background:#0b1220;color:#e2e8f0;border:1px solid var(--border);border-radius:12px;padding:12px;font-family:monospace;font-size:13px;resize:none;outline:none"></textarea>
+    <button class="btn btn-primary" style="width:100%;margin-top:8px;padding:11px" onclick="saveNotes()"><i class="fa-solid fa-floppy-disk"></i> Save Notes</button>
+  </div>
+
+  <!-- ANALYTICS -->
+  <div class="panel" id="panel-analytics">
+    <div class="info-bar"><i class="fa-solid fa-chart-line"></i> Build Analytics</div>
+    <div style="margin-bottom:14px">
+      <h4 style="font-size:12px;color:#60a5fa;margin-bottom:6px"><i class="fa-solid fa-clock"></i> Build Time (last 20)</h4>
+      <div class="chart-wrap" id="buildTimeChart"></div>
+    </div>
+    <div style="margin-bottom:14px">
+      <h4 style="font-size:12px;color:#60a5fa;margin-bottom:6px"><i class="fa-solid fa-box-archive"></i> APK Size (KB)</h4>
+      <div class="chart-wrap" id="apkSizeChart"></div>
+    </div>
+    <div style="margin-bottom:14px">
+      <h4 style="font-size:12px;color:#60a5fa;margin-bottom:6px"><i class="fa-solid fa-triangle-exclamation"></i> Top Errors</h4>
+      <div id="errFreqList" style="background:#0b1220;border:1px solid #1f2937;border-radius:10px;padding:10px;max-height:300px;overflow-y:auto"></div>
+    </div>
+  </div>
 </div>
 
 <nav class="bottom-nav">
-  <div class="nav-item active" data-panel="explorer" onclick="switchPanel('explorer',this)"><span>📂</span>Files</div>
-  <div class="nav-item" data-panel="preview" onclick="switchPanel('preview',this)"><span>📱</span>Preview</div>
-  <div class="nav-item" data-panel="errors" onclick="switchPanel('errors',this)"><span>⚠️</span>Errors <span id="errBadgeNav" class="badge ok" style="font-size:9px">0</span></div>
-  <div class="nav-item" data-panel="terminal" onclick="switchPanel('terminal',this)"><span>💻</span>Term</div>
-  <div class="nav-item" data-panel="build" onclick="switchPanel('build',this)"><span>🔨</span>Build</div>
-  <div class="nav-item" data-panel="git" onclick="switchPanel('git',this)"><span>🔀</span>Git</div>
-  <div class="nav-item" data-panel="logcat" onclick="switchPanel('logcat',this)"><span>📜</span>Log</div>
+  <div class="nav-item active" data-panel="explorer" onclick="switchPanel('explorer',this)"><i class="fa-solid fa-folder-tree"></i><span>Files</span></div>
+  <div class="nav-item" data-panel="preview" onclick="switchPanel('preview',this)"><i class="fa-solid fa-mobile-screen"></i><span>Preview</span></div>
+  <div class="nav-item" data-panel="errors" onclick="switchPanel('errors',this)"><i class="fa-solid fa-bug"></i><span>Errors</span></div>
+  <div class="nav-item" data-panel="terminal" onclick="switchPanel('terminal',this)"><i class="fa-solid fa-terminal"></i><span>Term</span></div>
+  <div class="nav-item" data-panel="build" onclick="switchPanel('build',this)"><i class="fa-solid fa-hammer"></i><span>Build</span></div>
+  <div class="nav-item" data-panel="git" onclick="switchPanel('git',this)"><i class="fa-brands fa-git-alt"></i><span>Git</span></div>
+  <div class="nav-item" data-panel="logcat" onclick="switchPanel('logcat',this)"><i class="fa-solid fa-list-ul"></i><span>Log</span></div>
+  <div class="nav-item" data-panel="kanban" onclick="switchPanel('kanban',this)"><i class="fa-solid fa-list-check"></i><span>Todo</span></div>
+  <div class="nav-item" data-panel="notes" onclick="switchPanel('notes',this)"><i class="fa-solid fa-note-sticky"></i><span>Notes</span></div>
+  <div class="nav-item" data-panel="analytics" onclick="switchPanel('analytics',this)"><i class="fa-solid fa-chart-line"></i><span>Stats</span></div>
 </nav>
+
+<button class="fab-2026" onclick="openCommandPalette()"><i class="fa-solid fa-bolt"></i></button>
 
 <!-- EDITOR -->
 <div id="editor-box">
   <div id="editor-header">
     <span style="font-size:12px;color:#93c5fd;font-family:monospace;flex:1;overflow:hidden;text-overflow:ellipsis" id="editor-filename">file</span>
     <span id="editor-err-badge" class="badge ok">0</span>
-    <button class="btn btn-success" onclick="saveFile(false)">💾</button>
-    <button class="btn btn-orange" onclick="checkCurrentFile()">🔍</button>
-    <button class="btn btn-purple" onclick="runCurrent()">▶</button>
-    <button class="btn" onclick="toggleSplitPreview()" title="Split Preview">◧</button>
-    <button class="btn" onclick="showHistory()" title="History">🕒</button>
-    <button class="btn" onclick="closeEditor()">✖</button>
+    <button class="btn btn-success" onclick="saveFile(false)"><i class="fa-solid fa-floppy-disk"></i></button>
+    <button class="btn btn-orange" onclick="checkCurrentFile()"><i class="fa-solid fa-magnifying-glass"></i></button>
+    <button class="btn btn-purple" onclick="runCurrent()"><i class="fa-solid fa-play"></i></button>
+    <button class="btn" onclick="toggleSplitPreview()"><i class="fa-solid fa-columns"></i></button>
+    <button class="btn" onclick="showHistory()"><i class="fa-solid fa-clock-rotate-left"></i></button>
+    <button class="btn" onclick="addBookmark()"><i class="fa-regular fa-bookmark"></i></button>
+    <button class="btn" onclick="closeEditor()"><i class="fa-solid fa-xmark"></i></button>
   </div>
   <div class="tab-bar-editor" id="editorTabs"></div>
   <div id="editor-toolbar">
-    <button onclick="doSelectAll()">Select</button>
-    <button onclick="doCut()">Cut</button>
-    <button onclick="doCopy()">Copy</button>
-    <button onclick="doPaste()">Paste</button>
-    <button onclick="doUndo()">Undo</button>
-    <button onclick="doRedo()">Redo</button>
-    <button onclick="doFind()">Find</button>
-    <button onclick="doIndent()">Indent</button>
-    <button onclick="formatCode()">Format</button>
+    <button onclick="doSelectAll()"><i class="fa-solid fa-object-group"></i>Select</button>
+    <button onclick="doCut()"><i class="fa-solid fa-scissors"></i>Cut</button>
+    <button onclick="doCopy()"><i class="fa-solid fa-copy"></i>Copy</button>
+    <button onclick="doPaste()"><i class="fa-solid fa-paste"></i>Paste</button>
+    <button onclick="doUndo()"><i class="fa-solid fa-rotate-left"></i></button>
+    <button onclick="doRedo()"><i class="fa-solid fa-rotate-right"></i></button>
+    <button onclick="doFind()"><i class="fa-solid fa-magnifying-glass"></i></button>
+    <button onclick="doIndent()"><i class="fa-solid fa-indent"></i></button>
+    <button onclick="formatCode()"><i class="fa-solid fa-wand-magic-sparkles"></i></button>
   </div>
   <div id="editor-container">
     <textarea id="editor"></textarea>
-    <button class="split-toggle" onclick="toggleSplitPreview()">Split Preview</button>
+    <button class="split-toggle" onclick="toggleSplitPreview()">Split</button>
     <div class="split-pane" id="splitPane"></div>
   </div>
 </div>
 
-<!-- MODALS -->
+<!-- SETTINGS MODAL -->
 <div class="modal-overlay" id="settingsModal" onclick="if(event.target===this)this.classList.remove('show')">
   <div class="modal">
-    <h3>⚙️ Settings</h3>
+    <h3><i class="fa-solid fa-gear"></i> Settings</h3>
     <label style="font-size:12px">Font Size</label>
     <input type="range" id="fontSize" min="11" max="20" value="13" oninput="applyFontSize(this.value);localStorage.setItem('fontSize',this.value)">
     <label style="font-size:12px">Auto Save</label>
@@ -2042,32 +2830,42 @@ header h2{font-size:13px;font-weight:600;white-space:nowrap;overflow:hidden;text
     </select>
     <label style="font-size:12px">UI Language</label>
     <select id="uiLang" onchange="setLang(this.value)">
-      <option value="en">English</option><option value="bn">বাংলা</option>
+      <option value="en">English</option>
+      <option value="bn">বাংলা</option>
     </select>
-    <button class="btn btn-primary" style="width:100%;margin-top:12px;padding:12px" onclick="document.getElementById('settingsModal').classList.remove('show')">Done</button>
+    <div style="display:flex;gap:6px;margin-top:10px">
+      <button class="btn btn-pink" style="flex:1;padding:11px" onclick="openCustomThemes()"><i class="fa-solid fa-palette"></i> Custom Themes</button>
+      <button class="btn btn-purple" style="flex:1;padding:11px" onclick="openPlugins()"><i class="fa-solid fa-puzzle-piece"></i> Plugins</button>
+    </div>
+    <button class="btn btn-primary" style="width:100%;margin-top:10px;padding:12px" onclick="document.getElementById('settingsModal').classList.remove('show')">Done</button>
   </div>
 </div>
 
+<!-- MORE MODAL -->
 <div class="modal-overlay" id="moreModal" onclick="if(event.target===this)this.classList.remove('show')">
   <div class="modal">
-    <h3>⋯ More Tools</h3>
+    <h3><i class="fa-solid fa-ellipsis"></i> More Tools</h3>
     <div class="more-grid">
-      <div class="more-item" onclick="openPkgRename()"><span>📦</span>Rename Pkg</div>
-      <div class="more-item" onclick="openStrings()"><span>🔤</span>Strings</div>
-      <div class="more-item" onclick="openThemeBuilder()"><span>🎨</span>Theme</div>
-      <div class="more-item" onclick="openManifest()"><span>📋</span>Manifest</div>
-      <div class="more-item" onclick="openIconGen()"><span>🖼</span>Icon</div>
-      <div class="more-item" onclick="openEnvMgr()"><span>🔑</span>ENV</div>
-      <div class="more-item" onclick="openBulkRename()"><span>✏️</span>Bulk Rename</div>
-      <div class="more-item" onclick="openFirebase()"><span>🔥</span>Firebase</div>
-      <div class="more-item" onclick="bumpVersion()"><span>🔢</span>Bump Ver</div>
-      <div class="more-item" onclick="openKeystore()"><span>🔐</span>Keystore</div>
-      <div class="more-item" onclick="signRelease()"><span>✅</span>Sign Rel</div>
-      <div class="more-item" onclick="cleanBuild(true)"><span>🧹</span>Clean All</div>
-      <div class="more-item" onclick="showRecent()"><span>🕒</span>Recent</div>
-      <div class="more-item" onclick="showShortcuts()"><span>⌨️</span>Shortcuts</div>
-      <div class="more-item" onclick="location.href='/api/backup'"><span>💾</span>Backup</div>
-      <div class="more-item" onclick="openRestore()"><span>📥</span>Restore</div>
+      <div class="more-item" onclick="closeModal();openPkgRename()"><i class="fa-solid fa-box"></i>Rename Pkg</div>
+      <div class="more-item" onclick="closeModal();openStrings()"><i class="fa-solid fa-language"></i>Strings</div>
+      <div class="more-item" onclick="closeModal();openThemeBuilder()"><i class="fa-solid fa-brush"></i>Theme</div>
+      <div class="more-item" onclick="closeModal();openManifest()"><i class="fa-solid fa-file-code"></i>Manifest</div>
+      <div class="more-item" onclick="closeModal();openIconGen()"><i class="fa-solid fa-image"></i>Icon</div>
+      <div class="more-item" onclick="closeModal();openEnvMgr()"><i class="fa-solid fa-key"></i>ENV</div>
+      <div class="more-item" onclick="closeModal();openBulkRename()"><i class="fa-solid fa-i-cursor"></i>Bulk</div>
+      <div class="more-item" onclick="closeModal();openFirebase()"><i class="fa-solid fa-fire"></i>Firebase</div>
+      <div class="more-item" onclick="closeModal();bumpVersion()"><i class="fa-solid fa-hashtag"></i>Bump Ver</div>
+      <div class="more-item" onclick="closeModal();openKeystore()"><i class="fa-solid fa-lock"></i>Keystore</div>
+      <div class="more-item" onclick="closeModal();signRelease()"><i class="fa-solid fa-certificate"></i>Sign Rel</div>
+      <div class="more-item" onclick="closeModal();openDevTools()"><i class="fa-solid fa-toolbox"></i>DevTools</div>
+      <div class="more-item" onclick="closeModal();openSnippets()"><i class="fa-solid fa-scissors"></i>Snippets</div>
+      <div class="more-item" onclick="closeModal();openMacros()"><i class="fa-solid fa-record-vinyl"></i>Macros</div>
+      <div class="more-item" onclick="closeModal();showBookmarks()"><i class="fa-regular fa-bookmark"></i>Marks</div>
+      <div class="more-item" onclick="closeModal();cleanBuild(true)"><i class="fa-solid fa-broom"></i>Clean</div>
+      <div class="more-item" onclick="closeModal();showRecent()"><i class="fa-solid fa-clock-rotate-left"></i>Recent</div>
+      <div class="more-item" onclick="closeModal();showShortcuts()"><i class="fa-solid fa-keyboard"></i>Keys</div>
+      <div class="more-item" onclick="closeModal();location.href='/api/backup'"><i class="fa-solid fa-floppy-disk"></i>Backup</div>
+      <div class="more-item" onclick="closeModal();openRestore()"><i class="fa-solid fa-download"></i>Restore</div>
     </div>
     <button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="document.getElementById('moreModal').classList.remove('show')">Close</button>
   </div>
@@ -2110,38 +2908,32 @@ var errorLines=[];
 var buildPollTimer=null;
 var buildStartTime=0;
 var elapsedTimer=null;
-var tasksSeen=0;
-var EST_TOTAL=32;
-var buildId=null;
-var lastLineIdx=0;
-var cmdHistory=[];
-var histIdx=-1;
+var tasksSeen=0,EST_TOTAL=32,buildId=null,lastLineIdx=0;
+var cmdHistory=[],histIdx=-1;
 var autoSaveTimer=null;
-var allFilesCache=[];
-var previewMode="android";
-var currentDevice="phone";
-var logcatSid=null;
-var logcatTimer=null;
-var logcatLines=[];
-var logcatLastIdx=0;
-
-var I18N={
-  en:{files:"Files",preview:"Preview",errors:"Errors",term:"Term",build:"Build",git:"Git",log:"Log"},
-  bn:{files:"ফাইল",preview:"প্রিভিউ",errors:"ভুল",term:"টার্ম",build:"বিল্ড",git:"গিট",log:"লগ"}
-};
-function T(k){var l=localStorage.getItem("uiLang")||"en";return (I18N[l]&&I18N[l][k])||k;}
+var allFilesCache=[],folderSizes={};
+var previewMode="android",currentDevice="phone";
+var logcatSid=null,logcatTimer=null,logcatLines=[],logcatLastIdx=0;
+var ptySid=null,ptyLastIdx=0,ptyTimer=null;
+var PRESETS=[];
+var notifLastSeen=0,notifPollTimer=null;
+var autoBuildPollTimer=null;
 
 // ============ UTILS ============
-function toast(msg,type){type=type||"success";var c=document.getElementById("toasts");var t=document.createElement("div");t.className="toast "+type;t.innerText=msg;c.appendChild(t);setTimeout(function(){t.remove()},3000);}
+function toast(msg,type){type=type||"success";var c=document.getElementById("toasts");var t=document.createElement("div");t.className="toast "+type;var icon=type==="error"?'<i class="fa-solid fa-circle-xmark"></i>':type==="info"?'<i class="fa-solid fa-circle-info"></i>':'<i class="fa-solid fa-circle-check"></i>';t.innerHTML=icon+"<span>"+msg+"</span>";c.appendChild(t);setTimeout(function(){t.remove()},3000);}
 function esc(t){var d=document.createElement("div");d.innerText=t;return d.innerHTML;}
 function switchPanel(id,el){
   document.querySelectorAll(".nav-item").forEach(function(n){n.classList.remove("active");});
   document.querySelectorAll(".panel").forEach(function(p){p.classList.remove("active");});
   if(el) el.classList.add("active");
+  else{var n=document.querySelector('[data-panel="'+id+'"]');if(n)n.classList.add("active");}
   var panel=document.getElementById("panel-"+id);
   if(panel) panel.classList.add("active");
-  if(id==="preview") refreshPreview();
-  if(id==="git") gitAction("status");
+  if(id==="preview")refreshPreview();
+  if(id==="git")gitAction("status");
+  if(id==="kanban")loadKanban();
+  if(id==="notes")loadNotes();
+  if(id==="analytics")loadAnalytics();
 }
 function getMode(filename){
   var ext=filename.split(".").pop().toLowerCase();
@@ -2150,80 +2942,125 @@ function getMode(filename){
     css:"css",json:"application/json",md:"markdown",sh:"text/x-sh",gradle:"text/x-java"};
   return map[ext]||"null";
 }
-function showModal(html){
-  document.getElementById("genericModalContent").innerHTML=html;
-  document.getElementById("genericModal").classList.add("show");
-}
+function showModal(html){document.getElementById("genericModalContent").innerHTML=html;document.getElementById("genericModal").classList.add("show");}
 function closeModal(){document.getElementById("genericModal").classList.remove("show");}
+function fileCategory(name){
+  var ext=name.split(".").pop().toLowerCase();
+  if(["java","kt","py","js","ts","c","cpp","cc","h","go","rs","rb","php","pl","sh","gradle"].indexOf(ext)>=0)return "code";
+  if(["png","jpg","jpeg","gif","webp","svg","bmp"].indexOf(ext)>=0)return "image";
+  if(["mp4","mov","avi","mkv","webm"].indexOf(ext)>=0)return "video";
+  if(["mp3","wav","ogg","flac","m4a"].indexOf(ext)>=0)return "audio";
+  if(["xml","json","html","css","md","txt","properties","yaml","yml"].indexOf(ext)>=0)return "doc";
+  if(["zip","tar","gz","rar","7z","apk","jar"].indexOf(ext)>=0)return "zip";
+  return "";
+}
+function fileIcon(name,isFolder){
+  if(isFolder) return "fa-folder";
+  var ext=name.split(".").pop().toLowerCase();
+  var map={java:"fa-java",kt:"fa-k",py:"fa-python",js:"fa-node-js",ts:"fa-code",
+    c:"fa-code",cpp:"fa-code",h:"fa-code",go:"fa-code",rs:"fa-cog",rb:"fa-gem",
+    php:"fa-php",sh:"fa-terminal",gradle:"fa-cubes",
+    xml:"fa-file-code",json:"fa-file-code",html:"fa-html5",css:"fa-css3-alt",
+    md:"fa-markdown",txt:"fa-file-lines",properties:"fa-sliders",
+    png:"fa-image",jpg:"fa-image",jpeg:"fa-image",gif:"fa-image",svg:"fa-bezier-curve",
+    mp4:"fa-video",mov:"fa-video",mp3:"fa-music",wav:"fa-music",
+    zip:"fa-file-zipper",tar:"fa-file-zipper",apk:"fa-android",jar:"fa-mug-hot",
+    sql:"fa-database",db:"fa-database"};
+  return map[ext]||"fa-file";
+}
+function highlight(name,q){
+  if(!q)return esc(name);
+  var idx=name.toLowerCase().indexOf(q.toLowerCase());
+  if(idx<0)return esc(name);
+  return esc(name.slice(0,idx))+"<mark>"+esc(name.slice(idx,idx+q.length))+"</mark>"+esc(name.slice(idx+q.length));
+}
 
 // ============ FILES ============
 async function loadFiles(path){
   currentPath=path||"";
   var box=document.getElementById("file-list");
   var bc=document.getElementById("breadcrumb");
-  box.innerHTML='<div class="empty">Loading...</div>';
+  box.innerHTML='<div class="empty"><i class="fa-solid fa-spinner fa-spin"></i> Loading...</div>';
   try{
     var sort=(document.getElementById("sortBy")&&document.getElementById("sortBy").value)||"name";
     var r=await fetch("/api/project-files/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(currentPath)+"&sort="+sort);
     var d=await r.json();
     if(!r.ok){box.innerHTML='<div class="empty" style="color:#f87171">'+(d.error||r.status)+'</div>';return;}
     var parts=currentPath?currentPath.split("/"):[];
-    var bcHtml='<span onclick="loadFiles(\'\')">📁 '+esc(PROJECT)+'</span>';
+    var bcHtml='<span onclick="loadFiles(\'\')"><i class="fa-solid fa-folder"></i> '+esc(PROJECT)+'</span>';
     var acc="";
-    parts.forEach(function(p){acc+=(acc?"/":"")+p;
-      bcHtml+=' / <span onclick="loadFiles(\''+acc+'\')">'+esc(p)+'</span>';});
+    parts.forEach(function(p){acc+=(acc?"/":"")+p;bcHtml+=' / <span onclick="loadFiles(\''+acc+'\')">'+esc(p)+'</span>';});
     bc.innerHTML=bcHtml;
     allFilesCache=d.files||[];
-    if(!allFilesCache.length){box.innerHTML='<div class="empty">Empty folder</div>';return;}
-    renderFileList(allFilesCache);
+    if(!allFilesCache.length){box.innerHTML='<div class="empty"><i class="fa-solid fa-folder-open"></i> Empty folder</div>';return;}
+    await renderFileList(allFilesCache);
   }catch(e){box.innerHTML='<div class="empty" style="color:#f87171">'+e.message+'</div>';}
 }
-function renderFileList(files){
-  var box=document.getElementById("file-list");box.innerHTML="";
+async function renderFileList(files){
+  var box=document.getElementById("file-list");
+  box.innerHTML="";
+  try{
+    var r=await fetch("/api/all-folder-sizes/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(currentPath));
+    if(r.ok){var d=await r.json();folderSizes=d.sizes||{};}
+  }catch(e){}
   if(currentPath){
     var parts=currentPath.split("/");var up=parts.slice(0,-1).join("/");
     var d=document.createElement("div");d.className="file-item folder";
-    d.innerHTML="<span>⬆️</span><span class='name'>.. (up)</span>";
+    d.innerHTML='<div class="icon-wrap"><i class="fa-solid fa-arrow-up"></i></div><span class="name">.. up</span>';
     d.onclick=function(){loadFiles(up);};box.appendChild(d);
   }
+  var q=(document.getElementById("searchInput")&&document.getElementById("searchInput").value)||"";
   files.forEach(function(f){
     var div=document.createElement("div");
-    div.className="file-item "+(f.type==="directory"?"folder":"file");
-    var icon=f.type==="directory"?"📁":"📄";
-    var meta=f.type==="file"?((f.size_h||"")+" • "+(f.mtime||"")):(f.mtime||"");
-    div.innerHTML="<span>"+icon+"</span><span class='name'>"+esc(f.name)+"</span><span class='meta'>"+esc(meta)+"</span>";
+    var cat=f.type==="file"?fileCategory(f.name):"";
+    div.className="file-item "+(f.type==="directory"?"folder":"file "+cat);
+    var icon=fileIcon(f.name,f.type==="directory");
+    var sizeText="";
+    if(f.type==="directory")sizeText=folderSizes[f.name]||"...";
+    else sizeText=f.size_h||"";
+    div.innerHTML='<div class="icon-wrap"><i class="fa-solid '+icon+'"></i></div>'+
+      '<span class="name">'+highlight(f.name,q)+'</span>'+
+      '<span class="size-badge">'+esc(sizeText)+'</span>'+
+      '<span class="meta">'+esc(f.mtime?f.mtime.slice(5,16):"")+'</span>';
     div.onclick=function(){if(f.type==="directory")loadFiles(f.path);else openFile(f.path);};
     div.oncontextmenu=function(e){e.preventDefault();showItemMenu(f);};
+    var pressTimer;
+    div.addEventListener("touchstart",function(){pressTimer=setTimeout(function(){showItemMenu(f);},600);});
+    div.addEventListener("touchend",function(){clearTimeout(pressTimer);});
+    div.addEventListener("touchmove",function(){clearTimeout(pressTimer);});
     box.appendChild(div);
   });
 }
 function filterFiles(q){
-  q=(q||"").toLowerCase().trim();
+  q=(q||"").trim();
   if(!q){renderFileList(allFilesCache);return;}
   if(q.length>=2){
     fetch("/api/search/"+encodeURIComponent(PROJECT)+"?q="+encodeURIComponent(q))
       .then(function(r){return r.json();}).then(function(d){
         var box=document.getElementById("file-list");box.innerHTML="";
-        if(!d.results||!d.results.length){box.innerHTML='<div class="empty">No results</div>';return;}
+        if(!d.results||!d.results.length){box.innerHTML='<div class="empty"><i class="fa-solid fa-magnifying-glass"></i><br>No results</div>';return;}
         d.results.forEach(function(f){
-          var div=document.createElement("div");div.className="file-item file";
-          div.innerHTML="<span>📄</span><span class='name'>"+esc(f.path)+"</span>";
+          var div=document.createElement("div");
+          var cat=fileCategory(f.name);
+          div.className="file-item file "+cat;
+          div.innerHTML='<div class="icon-wrap"><i class="fa-solid '+fileIcon(f.name,false)+'"></i></div><span class="name">'+highlight(f.path,q)+'</span>';
           div.onclick=function(){openFile(f.path);};box.appendChild(div);
         });
       });
   }else{
-    var filtered=allFilesCache.filter(function(f){return f.name.toLowerCase().indexOf(q)!==-1;});
+    var filtered=allFilesCache.filter(function(f){return f.name.toLowerCase().indexOf(q.toLowerCase())!==-1;});
     renderFileList(filtered);
   }
 }
 function clearSearch(){document.getElementById("searchInput").value="";renderFileList(allFilesCache);}
 function showItemMenu(f){
-  var c=prompt("Action for: "+f.name+"\n1=Open  2=Rename  3=Delete  4=Copy  5=Check");
+  var c=prompt("Action for: "+f.name+"\n1=Open  2=Rename  3=Delete  4=Copy  5=Check  6=Bookmark");
   if(c==="1"){if(f.type==="directory")loadFiles(f.path);else openFile(f.path);}
   else if(c==="2"){var nn=prompt("New name:",f.name);if(nn&&nn!==f.name)fileOp("rename",f.path,nn);}
   else if(c==="3"){if(confirm("Delete "+f.name+"?"))fileOp("delete",f.path);}
   else if(c==="4"){var nn=prompt("Copy as:",f.name+"_copy");if(nn)fileOp("copy",f.path,nn);}
   else if(c==="5"&&f.type==="file")checkFileErrors(f.path,true);
+  else if(c==="6"){fetch("/api/bookmarks/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:f.path,line:1,label:f.name})}).then(function(){toast("Bookmarked");});}
 }
 async function newFile(){
   var n=prompt("New file name:");if(!n)return;
@@ -2239,8 +3076,8 @@ async function newFolder(){
 async function fileOp(action,path,newName,content){
   try{
     var body={project:PROJECT,action:action,path:path};
-    if(newName) body.newName=newName;
-    if(content!==undefined) body.content=content;
+    if(newName)body.newName=newName;
+    if(content!==undefined)body.content=content;
     var r=await fetch("/api/file-operation",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
     var d=await r.json();
     if(!r.ok){toast(d.error||"Error","error");return;}
@@ -2270,12 +3107,12 @@ async function doExtract(input){
 async function showRecent(){
   try{
     var r=await fetch("/api/recent");var d=await r.json();
-    var html='<h3>🕒 Recent Files</h3>';
-    if(!d.items||!d.items.length){html+='<div class="empty">No recent files</div>';}
+    var html='<h3><i class="fa-solid fa-clock-rotate-left"></i> Recent Files</h3>';
+    if(!d.items||!d.items.length)html+='<div class="empty">No recent files</div>';
     else{
       html+='<div style="max-height:400px;overflow-y:auto">';
       d.items.forEach(function(it){
-        html+='<div class="file-item file" onclick="closeModal();location.href=\'/project/'+encodeURIComponent(it.project)+'\'"><span>📄</span><span class="name">'+esc(it.project)+' / '+esc(it.path)+'<br><small style="color:#94a3b8">'+esc(it.mtime)+'</small></span></div>';
+        html+='<div class="file-item file" onclick="closeModal();location.href=\'/project/'+encodeURIComponent(it.project)+'\'"><div class="icon-wrap"><i class="fa-solid fa-file"></i></div><span class="name">'+esc(it.project)+' / '+esc(it.path)+'<br><small style="color:#94a3b8">'+esc(it.mtime)+'</small></span></div>';
       });
       html+='</div>';
     }
@@ -2299,7 +3136,7 @@ async function openFile(path){
     renderTabs();loadTabContent();
     var ext=path.split(".").pop().toLowerCase();
     var runnable=["py","c","cpp","cc","php","js","go","rs","rb","sh","java"];
-    document.getElementById("runBtn").style.display=runnable.indexOf(ext)!==-1?"inline-block":"none";
+    document.getElementById("runBtn").style.display=runnable.indexOf(ext)>=0?"inline-flex":"none";
     setTimeout(checkCurrentFile,500);
   }catch(e){toast("Error: "+e,"error");}
 }
@@ -2343,8 +3180,7 @@ function loadTabContent(){
   cm.on("change",function(){
     openTabs[activeTabIdx].dirty=true;renderTabs();
     if(localStorage.getItem("autoSave")==="on"){
-      clearTimeout(autoSaveTimer);
-      autoSaveTimer=setTimeout(function(){saveFile(true);},2500);
+      clearTimeout(autoSaveTimer);autoSaveTimer=setTimeout(function(){saveFile(true);},2500);
     }
     updateSplitPreview();
   });
@@ -2367,17 +3203,16 @@ function closeEditor(){
   if(cm){cm.toTextArea();cm=null;}
 }
 function doSelectAll(){if(cm){cm.execCommand("selectAll");cm.focus();}}
-async function doCut(){if(!cm)return;var sel=cm.getSelection();if(!sel){toast("Select first");return;}try{await navigator.clipboard.writeText(sel);cm.replaceSelection("");toast("Cut");}catch(e){toast("Cut failed","error");}}
-async function doCopy(){if(!cm)return;var sel=cm.getSelection();if(!sel){toast("Select first");return;}try{await navigator.clipboard.writeText(sel);toast("Copied");}catch(e){var ta=document.createElement("textarea");ta.value=sel;document.body.appendChild(ta);ta.select();document.execCommand("copy");document.body.removeChild(ta);toast("Copied");}}
-async function doPaste(){if(!cm)return;try{var txt=await navigator.clipboard.readText();cm.replaceSelection(txt);}catch(e){toast("Paste blocked","error");}}
+async function doCut(){if(!cm)return;var s=cm.getSelection();if(!s){toast("Select first");return;}try{await navigator.clipboard.writeText(s);cm.replaceSelection("");toast("Cut");}catch(e){toast("Failed","error");}}
+async function doCopy(){if(!cm)return;var s=cm.getSelection();if(!s){toast("Select first");return;}try{await navigator.clipboard.writeText(s);toast("Copied");}catch(e){var ta=document.createElement("textarea");ta.value=s;document.body.appendChild(ta);ta.select();document.execCommand("copy");document.body.removeChild(ta);toast("Copied");}}
+async function doPaste(){if(!cm)return;try{var t=await navigator.clipboard.readText();cm.replaceSelection(t);}catch(e){toast("Paste blocked","error");}}
 function doUndo(){if(cm)cm.undo();}
 function doRedo(){if(cm)cm.redo();}
 function doFind(){if(cm)cm.execCommand("find");}
-function doIndent(){if(!cm)return;var sel=cm.getSelection();if(!sel){cm.execCommand("indentMore");return;}cm.replaceSelection(sel.split("\n").map(function(l){return "    "+l;}).join("\n"));}
+function doIndent(){if(!cm)return;var s=cm.getSelection();if(!s){cm.execCommand("indentMore");return;}cm.replaceSelection(s.split("\n").map(function(l){return "    "+l;}).join("\n"));}
 function formatCode(){
   if(!cm)return;
-  var lines=cm.getValue().split("\n");
-  var indent=0;
+  var lines=cm.getValue().split("\n");var indent=0;
   var formatted=lines.map(function(l){
     var t=l.trim();
     if(t.startsWith("}")||t.startsWith(")")||t.startsWith("]"))indent=Math.max(0,indent-1);
@@ -2431,8 +3266,8 @@ async function checkFileErrors(path,showAlert){
   }catch(e){return{errors:[]};}
 }
 async function scanAllErrors(){
-  document.getElementById("scanBtn").innerText="⏳";
-  document.getElementById("errInfo").innerText="Scanning...";
+  document.getElementById("scanBtn").innerHTML='<i class="fa-solid fa-spinner fa-spin"></i>';
+  document.getElementById("errInfo").innerHTML='<i class="fa-solid fa-spinner fa-spin"></i> Scanning...';
   document.getElementById("err-list").innerHTML="";
   try{
     var r=await fetch("/api/scan-errors/"+encodeURIComponent(PROJECT));
@@ -2445,7 +3280,7 @@ async function scanAllErrors(){
         total+=f.errors.length;bad++;
         var fh=document.createElement("div");
         fh.style.cssText="color:#fbbf24;font-weight:700;margin-top:12px;font-size:13px";
-        fh.innerText="📄 "+f.path+" — "+f.errors.length+" error(s)";
+        fh.innerHTML='<i class="fa-solid fa-file-code"></i> '+esc(f.path)+' — '+f.errors.length+' error(s)';
         box.appendChild(fh);
         f.errors.forEach(function(e){
           var item=document.createElement("div");
@@ -2456,11 +3291,10 @@ async function scanAllErrors(){
         });
       }
     });
-    var badge=document.getElementById("errBadgeNav");
-    if(total===0){badge.innerText="0";badge.className="badge ok";document.getElementById("errInfo").innerText="✓ No errors in "+d.scanned+" files";}
-    else{badge.innerText=total;badge.className="badge err";document.getElementById("errInfo").innerText=bad+" file(s) • "+total+" error(s)";}
+    if(total===0){document.getElementById("errInfo").innerHTML='<i class="fa-solid fa-circle-check" style="color:#4ade80"></i> No errors in '+d.scanned+' files';}
+    else{document.getElementById("errInfo").innerHTML='<i class="fa-solid fa-triangle-exclamation" style="color:#f87171"></i> '+bad+' file(s) • '+total+' error(s)';}
   }catch(e){document.getElementById("errInfo").innerText="Error: "+e;}
-  document.getElementById("scanBtn").innerText="🔍";
+  document.getElementById("scanBtn").innerHTML='<i class="fa-solid fa-magnifying-glass"></i>';
 }
 async function jumpToError(path,line){
   await openFile(path);
@@ -2476,13 +3310,11 @@ async function showHistory(){
   try{
     var r=await fetch("/api/history/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(path));
     var d=await r.json();
-    var html='<h3>🕒 History: '+esc(path.split("/").pop())+'</h3>';
-    if(!d.versions||!d.versions.length) html+='<div class="empty">No versions yet</div>';
-    else{
-      d.versions.forEach(function(v){
-        html+='<div class="file-item file" onclick="restoreHistory(\''+esc(path)+'\',\''+esc(v.file)+'\')"><span>📄</span><span class="name">'+esc(v.mtime)+'<br><small style="color:#94a3b8">'+esc(v.size)+'</small></span></div>';
-      });
-    }
+    var html='<h3><i class="fa-solid fa-clock-rotate-left"></i> History: '+esc(path.split("/").pop())+'</h3>';
+    if(!d.versions||!d.versions.length)html+='<div class="empty">No versions yet</div>';
+    else d.versions.forEach(function(v){
+      html+='<div class="file-item file" onclick="restoreHistory(\''+esc(path)+'\',\''+esc(v.file)+'\')"><div class="icon-wrap"><i class="fa-solid fa-clock"></i></div><span class="name">'+esc(v.mtime)+'<br><small style="color:#94a3b8">'+esc(v.size)+'</small></span></div>';
+    });
     html+='<button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>';
     showModal(html);
   }catch(e){toast("Error","error");}
@@ -2490,12 +3322,41 @@ async function showHistory(){
 async function restoreHistory(path,version){
   if(!confirm("Restore this version?"))return;
   try{
-    var r=await fetch("/api/history-restore",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({project:PROJECT,path:path,version:version})});
+    var r=await fetch("/api/history-restore",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT,path:path,version:version})});
     var d=await r.json();
-    if(r.ok){toast("Restored");closeModal();if(cm)cm.setValue((await (await fetch("/api/file-content/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(path))).json()).content);}
+    if(r.ok){toast("Restored");closeModal();if(cm){var rr=await fetch("/api/file-content/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(path));var dd=await rr.json();cm.setValue(dd.content);}}
     else toast(d.error||"Fail","error");
   }catch(e){toast("Error","error");}
+}
+async function addBookmark(){
+  if(activeTabIdx<0)return;
+  var path=openTabs[activeTabIdx].path;
+  var line=cm?cm.getCursor().line+1:1;
+  var label=prompt("Bookmark label:",path.split("/").pop());
+  if(!label)return;
+  try{
+    await fetch("/api/bookmarks/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:path,line:line,label:label})});
+    toast("Bookmarked");
+  }catch(e){toast("Error","error");}
+}
+async function showBookmarks(){
+  try{
+    var r=await fetch("/api/bookmarks/"+encodeURIComponent(PROJECT));
+    var d=await r.json();
+    var html='<h3><i class="fa-regular fa-bookmark"></i> Bookmarks</h3>';
+    if(!d.bookmarks||!d.bookmarks.length)html+='<div class="empty">No bookmarks</div>';
+    else d.bookmarks.forEach(function(b){
+      html+='<div class="file-item file"><div class="icon-wrap"><i class="fa-solid fa-bookmark"></i></div><span class="name" onclick="closeModal();openFile(\''+esc(b.path)+'\')">'+esc(b.label)+'<br><small style="color:#94a3b8">'+esc(b.path)+':'+b.line+'</small></span><button class="btn btn-danger" style="padding:4px 8px" onclick="delBookmark(\''+b.id+'\')"><i class="fa-solid fa-trash"></i></button></div>';
+    });
+    html+='<button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>';
+    showModal(html);
+  }catch(e){toast("Error","error");}
+}
+async function delBookmark(id){
+  try{
+    await fetch("/api/bookmarks/"+encodeURIComponent(PROJECT),{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:id})});
+    showBookmarks();
+  }catch(e){}
 }
 
 // ============ TERMINAL ============
@@ -2514,8 +3375,7 @@ async function runCmd(){
   document.getElementById("cmd").value="";
   out.scrollTop=out.scrollHeight;
   try{
-    var r=await fetch("/api/run-command",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({project:PROJECT,cmd:cmd})});
+    var r=await fetch("/api/run-command",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT,cmd:cmd})});
     var d=await r.json();
     if(d.stdout)out.innerText+=d.stdout;
     if(d.stderr)out.innerText+="\n[stderr]\n"+d.stderr;
@@ -2524,30 +3384,126 @@ async function runCmd(){
     out.scrollTop=out.scrollHeight;
   }catch(e){out.innerText+="\n[error] "+e+"\n";}
 }
-async function saveCurrentCmd(){
-  var cmd=prompt("Command to save:");if(!cmd)return;
+async function loadPresets(){
   try{
-    await fetch("/api/saved-commands",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cmd:cmd})});
-    toast("Saved");
-  }catch(e){toast("Error","error");}
+    var r=await fetch("/api/preset-commands");var d=await r.json();
+    PRESETS=d.commands||[];
+    var box=document.getElementById("presetBox");
+    box.innerHTML="";
+    PRESETS.forEach(function(c){
+      var b=document.createElement("button");
+      b.innerHTML='<i class="fa-solid '+c.icon+'"></i><span>'+esc(c.name)+'</span>';
+      b.onclick=function(){document.getElementById("cmd").value=c.cmd;runCmd();};
+      box.appendChild(b);
+    });
+  }catch(e){}
 }
 async function showSavedCommands(){
   try{
     var r=await fetch("/api/saved-commands");var d=await r.json();
-    var html='<h3>⭐ Saved Commands</h3>';
-    if(!d.items||!d.items.length) html+='<div class="empty">No saved commands</div>';
-    else{
-      d.items.forEach(function(c){
-        html+='<div class="file-item file"><span>⚡</span><span class="name" style="font-family:monospace">'+esc(c)+'</span><span class="meta" onclick="runSavedCmd(\''+esc(c).replace(/'/g,"\\'")+'\')">▶</span></div>';
-      });
-    }
-    html+='<button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>';
+    var html='<h3><i class="fa-solid fa-star"></i> Saved Commands</h3>';
+    if(!d.items||!d.items.length)html+='<div class="empty">No saved commands</div>';
+    else d.items.forEach(function(c){
+      html+='<div class="file-item file"><div class="icon-wrap"><i class="fa-solid fa-bolt"></i></div><span class="name" style="font-family:monospace">'+esc(c)+'</span><button class="btn btn-success" style="padding:5px 9px" onclick="closeModal();switchPanel(\'terminal\');document.getElementById(\'cmd\').value=\''+esc(c).replace(/'/g,"\\'")+'\';runCmd()"><i class="fa-solid fa-play"></i></button><button class="btn btn-danger" style="padding:5px 9px" onclick="delSavedCmd(\''+esc(c).replace(/'/g,"\\'")+'\')"><i class="fa-solid fa-trash"></i></button></div>';
+    });
+    html+='<button class="btn btn-success" style="width:100%;margin-top:8px;padding:11px" onclick="saveCurrentCmd()">+ Save Current</button><button class="btn" style="width:100%;margin-top:6px;padding:11px" onclick="closeModal()">Close</button>';
     showModal(html);
   }catch(e){toast("Error","error");}
 }
-function runSavedCmd(cmd){
-  closeModal();switchPanel("terminal",document.querySelector('[data-panel="terminal"]'));
-  document.getElementById("cmd").value=cmd;runCmd();
+async function saveCurrentCmd(){
+  var cmd=prompt("Command to save:");if(!cmd)return;
+  try{await fetch("/api/saved-commands",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cmd:cmd})});toast("Saved");}catch(e){toast("Error","error");}
+}
+async function delSavedCmd(cmd){
+  try{await fetch("/api/saved-commands",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({cmd:cmd})});showSavedCommands();}catch(e){}
+}
+async function showAliases(){
+  try{
+    var r=await fetch("/api/aliases");var d=await r.json();
+    var html='<h3><i class="fa-solid fa-tag"></i> Command Aliases</h3>';
+    Object.keys(d.aliases||{}).forEach(function(k){
+      html+='<div class="file-item file"><div class="icon-wrap"><i class="fa-solid fa-tag"></i></div><span class="name"><b>'+esc(k)+'</b> → <code style="color:#4ade80">'+esc(d.aliases[k])+'</code></span><button class="btn btn-danger" style="padding:5px 9px" onclick="delAlias(\''+esc(k)+'\')"><i class="fa-solid fa-trash"></i></button></div>';
+    });
+    html+='<input id="aliasKey" placeholder="alias name (e.g. upd)" style="margin-top:10px"><input id="aliasCmd" placeholder="command (e.g. pkg update -y)"><button class="btn btn-success" style="width:100%;padding:11px" onclick="addAlias()">+ Add Alias</button><button class="btn" style="width:100%;margin-top:6px;padding:11px" onclick="closeModal()">Close</button>';
+    showModal(html);
+  }catch(e){toast("Error","error");}
+}
+async function addAlias(){
+  var k=document.getElementById("aliasKey").value.trim();
+  var c=document.getElementById("aliasCmd").value.trim();
+  if(!k||!c){toast("Fill both","error");return;}
+  try{
+    var r=await fetch("/api/aliases",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({key:k,cmd:c})});
+    var d=await r.json();
+    if(r.ok){toast("Added");showAliases();}else toast(d.error||"Fail","error");
+  }catch(e){toast("Error","error");}
+}
+async function delAlias(k){
+  try{await fetch("/api/aliases",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({key:k})});showAliases();}catch(e){}
+}
+
+// ============ PTY ============
+async function startPTY(){
+  if(ptySid){toast("PTY already running");return;}
+  try{
+    var r=await fetch("/api/pty/start",{method:"POST"});
+    var d=await r.json();
+    if(!r.ok){toast(d.error||"PTY failed","error");return;}
+    ptySid=d.session;ptyLastIdx=0;
+    document.getElementById("ptyBox").style.display="block";
+    document.getElementById("terminal-output").style.display="none";
+    document.getElementById("cmd-input").style.display="none";
+    if(ptyTimer)clearInterval(ptyTimer);
+    ptyTimer=setInterval(ptyPoll,300);
+    toast("PTY started");
+  }catch(e){toast("Error: "+e,"error");}
+}
+async function ptyPoll(){
+  if(!ptySid)return;
+  try{
+    var r=await fetch("/api/pty/output/"+ptySid+"?since="+ptyLastIdx);
+    var d=await r.json();
+    if(d.output){
+      var out=document.getElementById("ptyOutput");
+      out.textContent+=d.output;
+      out.scrollTop=out.scrollHeight;
+      ptyLastIdx=d.total;
+    }
+  }catch(e){}
+}
+async function ptySend(){
+  if(!ptySid)return;
+  var inp=document.getElementById("ptyInput");
+  var text=inp.value+"\n";
+  inp.value="";
+  try{await fetch("/api/pty/input/"+ptySid,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:text})});}catch(e){}
+}
+function ptyKey(e){if(e.key==="Enter"){e.preventDefault();ptySend();}}
+async function stopPTY(){
+  if(!ptySid)return;
+  if(ptyTimer)clearInterval(ptyTimer);ptyTimer=null;
+  try{await fetch("/api/pty/stop/"+ptySid,{method:"POST"});}catch(e){}
+  ptySid=null;
+  document.getElementById("ptyBox").style.display="none";
+  document.getElementById("terminal-output").style.display="block";
+  document.getElementById("cmd-input").style.display="flex";
+  toast("PTY stopped");
+}
+
+// ============ SYSTEM INFO ============
+async function loadSystemInfo(){
+  try{
+    var r=await fetch("/api/system-info");var d=await r.json();
+    var mem=d.MemTotal?(parseInt(d.MemTotal)/1024/1024).toFixed(1)+" GB":"?";
+    var avail=d.MemAvailable?(parseInt(d.MemAvailable)/1024/1024).toFixed(1)+" GB":"?";
+    var pct=d.MemTotal?Math.round((1-parseInt(d.MemAvailable)/parseInt(d.MemTotal))*100):0;
+    document.getElementById("sysInfo").innerHTML=
+      '<div class="stat-row"><span><i class="fa-solid fa-memory"></i> RAM</span><b>'+avail+' / '+mem+' ('+pct+'%)</b></div>'+
+      '<div class="stat-row"><span><i class="fa-solid fa-hdd"></i> Disk</span><b>'+(d.disk_free||"?")+' / '+(d.disk_total||"?")+'</b></div>'+
+      '<div class="stat-row"><span><i class="fa-solid fa-clock"></i> Uptime</span><b>'+(d.uptime||"?")+'</b></div>'+
+      '<div class="stat-row"><span><i class="fa-brands fa-python"></i> Python</span><b>'+(d.python||"?")+'</b></div>'+
+      '<div class="stat-row"><span><i class="fa-solid fa-microchip"></i> Arch</span><b>'+(d.machine||"?")+'</b></div>';
+  }catch(e){document.getElementById("sysInfo").innerText="Unavailable";}
 }
 
 // ============ RUN CODE ============
@@ -2560,10 +3516,9 @@ async function runCurrent(){
   var outBox=document.getElementById("output-box");
   outBox.innerText="Running "+path+"...\n\n";
   try{
-    var r=await fetch("/api/run-code",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({project:PROJECT,path:path})});
+    var r=await fetch("/api/run-code",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT,path:path})});
     var d=await r.json();
-    document.getElementById("run-info").innerHTML="<b>File:</b> "+esc(path)+" | <b>Lang:</b> "+esc(d.language||"?")+" | <b>Exit:</b> "+(d.returncode!=null?d.returncode:"?");
+    document.getElementById("run-info").innerHTML='<i class="fa-solid fa-play"></i> <b>'+esc(path)+'</b> | '+esc(d.language||"?")+' | exit '+(d.returncode!=null?d.returncode:"?");
     var text="";
     if(d.command)text+="$ "+d.command+"\n\n";
     if(d.stdout)text+=d.stdout;
@@ -2588,17 +3543,13 @@ function togglePreviewMode(){
 }
 async function refreshPreview(){
   var box=document.getElementById("previewContent");
-  box.innerHTML='<p style="text-align:center;color:#64748b;padding:30px">Loading...</p>';
+  box.innerHTML='<p style="text-align:center;color:#64748b;padding:30px"><i class="fa-solid fa-spinner fa-spin"></i></p>';
   try{
     if(previewMode==="html"){
       var candidates=["index.html","app/src/main/assets/index.html","public/index.html"];
       for(var i=0;i<candidates.length;i++){
         var r=await fetch("/api/file-content/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(candidates[i]));
-        if(r.ok){
-          var d=await r.json();
-          box.innerHTML='<iframe style="width:100%;height:440px;border:0;background:#fff" srcdoc="'+d.content.replace(/"/g,"&quot;")+'"></iframe>';
-          return;
-        }
+        if(r.ok){var d=await r.json();box.innerHTML='<iframe style="width:100%;height:440px;border:0;background:#fff;border-radius:8px" srcdoc="'+d.content.replace(/"/g,"&quot;")+'"></iframe>';return;}
       }
       box.innerHTML='<p style="text-align:center;color:#64748b;padding:40px">No index.html found</p>';
       return;
@@ -2639,7 +3590,7 @@ function renderNode(node){
   if(tag==="TextView")return '<div style="margin:6px 0;color:#fff">'+esc(attrs.text||attrs.hint||"Text")+'</div>';
   if(tag==="Button")return '<button style="width:100%;padding:12px;margin:8px 0;border:0;border-radius:10px;background:#3b82f6;color:#fff">'+esc(attrs.text||"Button")+'</button>';
   if(tag==="EditText")return '<input style="width:100%;padding:12px;margin:8px 0;border-radius:10px;border:1px solid #334155;background:#1e293b;color:#fff" placeholder="'+esc(attrs.hint||"")+'">';
-  if(tag==="ListView")return '<div style="background:#1e293b;border-radius:8px;padding:8px;color:#cbd5e1">List: item 1, item 2, item 3...</div>';
+  if(tag==="ListView")return '<div style="background:#1e293b;border-radius:8px;padding:8px;color:#cbd5e1">List: item 1, item 2...</div>';
   if(tag==="ImageView")return '<div style="background:#1e293b;padding:30px;text-align:center;border-radius:8px;color:#94a3b8">🖼 Image</div>';
   return '<div>'+children+'</div>';
 }
@@ -2663,7 +3614,7 @@ async function updateSplitPreview(){
 }
 
 // ============ BUILD ============
-function formatTime(sec){sec=Math.floor(sec);if(sec<60)return sec+"s";returnMath.floor(sec/60)+"m "+(sec%60)+"s";}
+function formatTime(sec){sec=Math.floor(sec);if(sec<60)return sec+"s";return Math.floor(sec/60)+"m "+(sec%60)+"s";}
 function startElapsedTimer(){
   if(elapsedTimer)clearInterval(elapsedTimer);
   elapsedTimer=setInterval(function(){
@@ -2675,10 +3626,10 @@ function startElapsedTimer(){
 function processBuildLine(line){
   var log=document.getElementById("buildLog");
   var cls="";
-  if(line.indexOf("BUILD SUCCESSFUL")!==-1)cls="color:#4ade80";
-  else if(line.indexOf("BUILD FAILED")!==-1||line.indexOf("error:")!==-1)cls="color:#f87171";
-  else if(line.indexOf("> Task")!==-1)cls="color:#fbbf24";
-  else if(line.indexOf("💡 Hint:")!==-1)cls="color:#fbbf24;font-weight:600";
+  if(line.indexOf("BUILD SUCCESSFUL")>=0)cls="color:#4ade80";
+  else if(line.indexOf("BUILD FAILED")>=0||line.indexOf("error:")>=0)cls="color:#f87171";
+  else if(line.indexOf("> Task")>=0)cls="color:#fbbf24";
+  else if(line.indexOf("💡 Hint:")>=0)cls="color:#fbbf24;font-weight:600";
   log.innerHTML+="\n<span style='"+cls+"'>"+esc(line)+"</span>";
   log.scrollTop=log.scrollHeight;
   var m=line.match(/^>\s+Task\s+(:[\w:]+)/);
@@ -2689,13 +3640,13 @@ function processBuildLine(line){
     document.getElementById("buildProgressBar").style.width=pct+"%";
     document.getElementById("buildProgressText").innerText=pct+"%";
   }
-  if(line.indexOf("BUILD SUCCESSFUL")!==-1){
+  if(line.indexOf("BUILD SUCCESSFUL")>=0){
     document.getElementById("buildProgressBar").style.width="100%";
     document.getElementById("buildProgressText").innerText="100%";
-    document.getElementById("currentTask").innerText="✅ Build complete";
+    document.getElementById("currentTask").innerHTML='<i class="fa-solid fa-circle-check" style="color:#4ade80"></i> Build complete';
   }
-  if(line.indexOf("BUILD FAILED")!==-1)
-    document.getElementById("currentTask").innerText="❌ Build failed";
+  if(line.indexOf("BUILD FAILED")>=0)
+    document.getElementById("currentTask").innerHTML='<i class="fa-solid fa-circle-xmark" style="color:#f87171"></i> Build failed';
 }
 async function pollBuild(){
   if(!buildId)return;
@@ -2709,15 +3660,15 @@ async function pollBuild(){
       if(d.success&&d.apk_path){
         document.getElementById("buildProgressBar").style.width="100%";
         document.getElementById("buildProgressText").innerText="100%";
-        document.getElementById("currentTask").innerText="✅ Build successful";
-        document.getElementById("buildStatusMsg").innerText="✓ APK ready!";
+        document.getElementById("currentTask").innerHTML='<i class="fa-solid fa-circle-check" style="color:#4ade80"></i> Build successful';
+        document.getElementById("buildStatusMsg").innerHTML='✓ APK ready!';
         document.getElementById("buildStatusMsg").style.color="#4ade80";
         document.getElementById("apk-box").style.display="block";
         document.getElementById("apkDownloadBtn").onclick=function(){location.href="/api/download-apk/"+encodeURIComponent(PROJECT);};
         toast("APK Ready!");
         try{if(Notification.permission==="granted")new Notification("Zihad IDE","✅ Build successful!");}catch(e){}
       }else{
-        document.getElementById("currentTask").innerText="❌ Build failed";
+        document.getElementById("currentTask").innerHTML='<i class="fa-solid fa-circle-xmark" style="color:#f87171"></i> Build failed';
         document.getElementById("buildStatusMsg").innerText="✗ Failed";
         document.getElementById("buildStatusMsg").style.color="#f87171";
         toast("Build failed","error");
@@ -2727,16 +3678,17 @@ async function pollBuild(){
 }
 async function buildApk(){
   if(!confirm("Build APK?"))return;
-  switchPanel("build",document.querySelector('[data-panel="build"]'));
+  switchPanel("build");
   document.getElementById("buildLog").innerHTML="$ Starting build...";
   document.getElementById("buildProgressBar").style.width="0%";
   document.getElementById("buildProgressText").innerText="0%";
-  document.getElementById("currentTask").innerHTML="Starting...";
+  document.getElementById("currentTask").innerHTML='<i class="fa-solid fa-spinner fa-spin"></i> Starting...';
   document.getElementById("buildStatusMsg").innerText="Starting...";
   document.getElementById("buildStatusMsg").style.color="#94a3b8";
   document.getElementById("apk-box").style.display="none";
   tasksSeen=0;lastLineIdx=0;EST_TOTAL=32;
-  try{try{if(Notification.permission==="default")await Notification.requestPermission();}catch(e){}
+  try{
+    try{if(Notification.permission==="default")await Notification.requestPermission();}catch(e){}
     var r=await fetch("/api/build-start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT})});
     var d=await r.json();
     if(!r.ok){toast(d.error||"Error","error");return;}
@@ -2746,6 +3698,12 @@ async function buildApk(){
     buildPollTimer=setInterval(pollBuild,700);
     pollBuild();
   }catch(e){toast("Error: "+e,"error");}
+}
+async function toggleAutoBuild(on){
+  try{
+    await fetch("/api/settings/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({autoBuild:on})});
+    toast(on?"Auto-build ON":"Auto-build OFF");
+  }catch(e){}
 }
 async function adbInstall(){
   toast("Trying ADB install...");
@@ -2757,12 +3715,11 @@ async function adbInstall(){
   }catch(e){toast("ADB error","error");}
 }
 async function cleanBuild(deep){
-  if(!confirm(deep?"Deep clean (also ~/.gradle transforms)?" : "Clean build dirs?"))return;
+  if(!confirm(deep?"Deep clean (also ~/.gradle)?" : "Clean build dirs?"))return;
   try{
-    var r=await fetch("/api/cache-clean",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({project:PROJECT,deep:deep})});
+    var r=await fetch("/api/cache-clean",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT,deep:deep})});
     var d=await r.json();
-    if(r.ok)toast("Cleaned: "+(d.cleared||[]).join(", ")||"nothing");
+    if(r.ok)toast("Cleaned: "+((d.cleared||[]).join(", ")||"nothing"));
     else toast(d.error||"Fail","error");
   }catch(e){toast("Error","error");}
 }
@@ -2780,17 +3737,16 @@ async function gitAction(a){
       var r=await fetch("/api/git/init/"+encodeURIComponent(PROJECT),{method:"POST"});
       var d=await r.json();
       gitLog(d.out||d.err||"Init done",d.success?"#4ade80":"#f87171");
-      if(!d.success)toast("Init failed","error");
-      else toast("Git initialized");
+      if(!d.success)toast("Init failed","error");else toast("Git initialized");
       return;
     }
     if(a==="status"){
       var r=await fetch("/api/git/status/"+encodeURIComponent(PROJECT));
       var d=await r.json();
-      document.getElementById("gitInfo").innerText="Branch: "+(d.branch||"?")+" | "+(d.init?"initialized":"not initialized");
+      document.getElementById("gitInfo").innerHTML='<i class="fa-brands fa-git-alt"></i> Branch: '+(d.branch||"?")+' | '+(d.init?"initialized":"not initialized");
       if(!d.init){gitLog("Repository not initialized. Tap Init.");return;}
       if(!d.files||!d.files.length){gitLog("✓ Working tree clean","#4ade80");return;}
-      gitLog("Modified files:\n"+d.files.join("\n"));
+      gitLog("Modified:\n"+d.files.join("\n"));
       return;
     }
     if(a==="add"){
@@ -2802,7 +3758,7 @@ async function gitAction(a){
     if(a==="log"){
       var r=await fetch("/api/git/log/"+encodeURIComponent(PROJECT));
       var d=await r.json();
-      gitLog(d.log.length?(d.log.join("\n")):"No commits");
+      gitLog(d.log.length?d.log.join("\n"):"No commits");
       return;
     }
     if(a==="diff"){
@@ -2890,10 +3846,155 @@ async function logcatStop(){
 }
 function logcatClear(){logcatLines=[];logcatLastIdx=0;renderLogcat();}
 
+// ============ NOTIFICATIONS ============
+async function pollNotifications(){
+  try{
+    var r=await fetch("/api/notifications?since="+notifLastSeen);
+    var d=await r.json();
+    if(d.new&&d.new.length){
+      d.new.forEach(function(n){
+        if(n.ts>notifLastSeen){
+          notifLastSeen=n.ts;
+          if(n.kind==="error")toast(n.title+" — "+n.body,"error");
+          else if(n.kind==="success")toast(n.title+" — "+n.body,"success");
+        }
+      });
+    }
+    var btn=document.getElementById("notifBtn");
+    btn.dataset.count=d.unread||0;
+  }catch(e){}
+}
+async function showNotifications(){
+  try{
+    var r=await fetch("/api/notifications");var d=await r.json();
+    var html='<h3><i class="fa-solid fa-bell"></i> Notifications</h3>';
+    if(!d.items||!d.items.length)html+='<div class="empty">No notifications</div>';
+    else{
+      html+='<div style="max-height:400px;overflow-y:auto">';
+      d.items.forEach(function(n){
+        var when=new Date(n.ts*1000).toLocaleString();
+        html+='<div class="notif-item '+(n.kind||"info")+'"><div class="ttl">'+esc(n.title)+'</div><div class="bdy">'+esc(n.body)+'</div><div class="time">'+when+'</div></div>';
+      });
+      html+='</div>';
+    }
+    html+='<div style="display:flex;gap:6px;margin-top:8px"><button class="btn btn-primary" style="flex:1;padding:11px" onclick="markNotifsRead()">Mark Read</button><button class="btn btn-danger" style="flex:1;padding:11px" onclick="clearNotifs()">Clear</button><button class="btn" style="padding:11px" onclick="closeModal()">Close</button></div>';
+    showModal(html);
+    fetch("/api/notifications/read",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})}).then(function(){pollNotifications();});
+  }catch(e){toast("Error","error");}
+}
+async function markNotifsRead(){try{await fetch("/api/notifications/read",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})});closeModal();pollNotifications();}catch(e){}}
+async function clearNotifs(){try{await fetch("/api/notifications/clear",{method:"POST"});closeModal();pollNotifications();}catch(e){}}
+
+// ============ KANBAN ============
+async function loadKanban(){
+  try{
+    var r=await fetch("/api/kanban/"+encodeURIComponent(PROJECT));
+    var d=await r.json();
+    var board=document.getElementById("kanbanBoard");
+    var cols=[{id:"todo",name:"📋 Todo"},{id:"doing",name:"⚙️ Doing"},{id:"done",name:"✅ Done"}];
+    board.innerHTML="";
+    cols.forEach(function(col){
+      var cards=d.columns&&d.columns[col.id]?d.columns[col.id]:[];
+      var html='<div class="kanban-col"><h4>'+col.name+' <span class="badge info">'+cards.length+'</span></h4>';
+      cards.forEach(function(c){
+        var priClass=c.priority==="high"?"p-high":c.priority==="low"?"p-low":"";
+        var nextCol=col.id==="todo"?"doing":col.id==="doing"?"done":"todo";
+        html+='<div class="kanban-card '+priClass+'">'+esc(c.text)+
+          '<span class="del" onclick="kanbanDel(\''+col.id+'\',\''+c.id+'\')"><i class="fa-solid fa-xmark"></i></span>'+
+          '<div style="margin-top:5px;font-size:10px"><a onclick="kanbanMove(\''+col.id+'\',\''+nextCol+'\',\''+c.id+'\')" style="color:#60a5fa;cursor:pointer"><i class="fa-solid fa-arrow-right"></i> '+nextCol+'</a></div>'+
+          '</div>';
+      });
+      html+='</div>';
+      board.insertAdjacentHTML("beforeend",html);
+    });
+  }catch(e){document.getElementById("kanbanBoard").innerText="Error";}
+}
+async function kanbanAdd(){
+  var text=document.getElementById("kanbanInput").value.trim();
+  var priority=document.getElementById("kanbanPriority").value;
+  if(!text)return;
+  try{
+    var r=await fetch("/api/kanban/"+encodeURIComponent(PROJECT)+"/add",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:text,column:"todo",priority:priority})});
+    document.getElementById("kanbanInput").value="";
+    loadKanban();
+  }catch(e){}
+}
+async function kanbanMove(from,to,id){
+  try{
+    var r=await fetch("/api/kanban/"+encodeURIComponent(PROJECT)+"/move",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({from:from,to:to,id:id})});
+    loadKanban();
+  }catch(e){}
+}
+async function kanbanDel(col,id){
+  if(!confirm("Delete?"))return;
+  try{
+    var r=await fetch("/api/kanban/"+encodeURIComponent(PROJECT)+"/del",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({column:col,id:id})});
+    loadKanban();
+  }catch(e){}
+}
+
+// ============ NOTES ============
+async function loadNotes(){
+  try{
+    var r=await fetch("/api/notes/"+encodeURIComponent(PROJECT));
+    var d=await r.json();
+    document.getElementById("notesArea").value=d.content||"";
+  }catch(e){}
+}
+async function saveNotes(){
+  var content=document.getElementById("notesArea").value;
+  try{
+    await fetch("/api/notes/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({content:content})});
+    toast("Notes saved");
+  }catch(e){toast("Error","error");}
+}
+
+// ============ ANALYTICS ============
+async function loadAnalytics(){
+  try{
+    var r=await fetch("/api/build-chart/"+encodeURIComponent(PROJECT));
+    var d=await r.json();
+    var chart=d.chart||[];
+    var maxDur=Math.max.apply(null,chart.map(function(x){return x.duration||0;}))||1;
+    var html="";
+    chart.slice(0,20).reverse().forEach(function(x){
+      var h=Math.max(4,Math.round((x.duration/maxDur)*90));
+      var cls=x.success?"ok":"fail";
+      html+='<div class="chart-col '+cls+'" style="height:'+h+'px" title="'+x.duration.toFixed(1)+'s"></div>';
+    });
+    document.getElementById("buildTimeChart").innerHTML=html||'<div class="empty" style="width:100%">No builds yet</div>';
+  }catch(e){}
+  try{
+    var r2=await fetch("/api/apk-size-graph/"+encodeURIComponent(PROJECT));
+    var d2=await r2.json();
+    var pts=d2.points||[];
+    var maxSize=Math.max.apply(null,pts.map(function(x){return x.size||0;}))||1;
+    var html2="";
+    pts.slice(0,20).reverse().forEach(function(x){
+      var h=Math.max(4,Math.round((x.size/maxSize)*90));
+      html2+='<div class="chart-col" style="height:'+h+'px" title="'+Math.round(x.size/1024)+' KB"></div>';
+    });
+    document.getElementById("apkSizeChart").innerHTML=html2||'<div class="empty" style="width:100%">No data</div>';
+  }catch(e){}
+  try{
+    var r3=await fetch("/api/error-frequency/"+encodeURIComponent(PROJECT));
+    var d3=await r3.json();
+    var freq=d3.freq||{};
+    var keys=Object.keys(freq).sort(function(a,b){return freq[b]-freq[a];}).slice(0,20);
+    var html3="";
+    if(!keys.length)html3='<div class="empty">No errors recorded</div>';
+    keys.forEach(function(k){
+      var pct=Math.min(100,Math.round((freq[k]/Math.max.apply(null,Object.values(freq)))*100));
+      html3+='<div style="margin-bottom:8px"><div style="font-size:11px;font-family:monospace;color:#fca5a5;margin-bottom:3px">'+esc(k.slice(0,80))+' <span style="color:#94a3b8">× '+freq[k]+'</span></div><div class="chart-bar" style="height:6px"><div style="width:'+pct+'%;height:100%;background:linear-gradient(90deg,#ef4444,#dc2626);border-radius:3px"></div></div></div>';
+    });
+    document.getElementById("errFreqList").innerHTML=html3;
+  }catch(e){}
+}
+
 // ============ MORE MENU TOOLS ============
-function showMoreMenu(){document.getElementById("moreModal").classList.add("show");document.querySelectorAll(".modal-overlay").forEach(function(m){if(m.id!=="moreModal")m.classList.remove("show");});}
+function showMoreMenu(){document.getElementById("moreModal").classList.add("show");}
 function openPkgRename(){
-  showModal('<h3>📦 Rename Package</h3><input id="oldPkg" placeholder="Old package"><input id="newPkg" placeholder="New package"><button class="btn btn-primary" style="width:100%;padding:12px;margin-top:8px" onclick="doPkgRename()">Update All</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>');
+  showModal('<h3><i class="fa-solid fa-box"></i> Rename Package</h3><input id="oldPkg" placeholder="Old package"><input id="newPkg" placeholder="New package"><button class="btn btn-primary" style="width:100%;padding:12px;margin-top:8px" onclick="doPkgRename()">Update All</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>');
 }
 async function doPkgRename(){
   var oldP=document.getElementById("oldPkg").value.trim();
@@ -2909,28 +4010,22 @@ async function doPkgRename(){
 async function openStrings(){
   try{
     var r=await fetch("/api/strings/"+encodeURIComponent(PROJECT));var d=await r.json();
-    var items=d.items||[];
-    var html='<h3>🔤 Strings Editor</h3><div id="strList" style="max-height:300px;overflow-y:auto">';
-    items.forEach(function(it,i){
-      html+='<div style="display:flex;gap:6px;margin:4px 0"><input value="'+esc(it.name)+'" placeholder="key" style="flex:1" onchange="strUpdate('+i+',this.value,\'name\')"><input value="'+esc(it.value)+'" placeholder="value" style="flex:2" onchange="strUpdate('+i+',this.value,\'value\')"><button class="btn btn-danger" style="padding:6px" onclick="strDel('+i+')">×</button></div>';
-    });
-    html+='</div><button class="btn btn-success" style="width:100%;margin-top:8px;padding:10px" onclick="strAdd()">+ Add</button><button class="btn btn-primary" style="width:100%;margin-top:6px;padding:12px" onclick="strSave()">💾 Save</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>';
-    window._strItems=items;
-    showModal(html);
+    window._strItems=d.items||[];
+    renderStringsModal();
   }catch(e){toast("Error","error");}
 }
-function strUpdate(i,v,k){window._strItems[i][k]=v;}
-function strDel(i){window._strItems.splice(i,1);openStringsAgain();}
-function strAdd(){window._strItems.push({name:"new_string",value:""});openStringsAgain();}
-function openStringsAgain(){
+function renderStringsModal(){
   var items=window._strItems;
-  var html='<h3>🔤 Strings Editor</h3><div id="strList" style="max-height:300px;overflow-y:auto">';
+  var html='<h3><i class="fa-solid fa-language"></i> Strings Editor</h3><div style="max-height:300px;overflow-y:auto">';
   items.forEach(function(it,i){
-    html+='<div style="display:flex;gap:6px;margin:4px 0"><input value="'+esc(it.name)+'" placeholder="key" style="flex:1" onchange="strUpdate('+i+',this.value,\'name\')"><input value="'+esc(it.value)+'" placeholder="value" style="flex:2" onchange="strUpdate('+i+',this.value,\'value\')"><button class="btn btn-danger" style="padding:6px" onclick="strDel('+i+')">×</button></div>';
+    html+='<div style="display:flex;gap:6px;margin:4px 0"><input value="'+esc(it.name)+'" placeholder="key" style="flex:1" onchange="strUpdate('+i+',this.value,\'name\')"><input value="'+esc(it.value)+'" placeholder="value" style="flex:2" onchange="strUpdate('+i+',this.value,\'value\')"><button class="btn btn-danger" style="padding:6px" onclick="strDel('+i+')"><i class="fa-solid fa-trash"></i></button></div>';
   });
   html+='</div><button class="btn btn-success" style="width:100%;margin-top:8px;padding:10px" onclick="strAdd()">+ Add</button><button class="btn btn-primary" style="width:100%;margin-top:6px;padding:12px" onclick="strSave()">💾 Save</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>';
   showModal(html);
 }
+function strUpdate(i,v,k){window._strItems[i][k]=v;}
+function strDel(i){window._strItems.splice(i,1);renderStringsModal();}
+function strAdd(){window._strItems.push({name:"new_string",value:""});renderStringsModal();}
 async function strSave(){
   try{
     var r=await fetch("/api/strings/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items:window._strItems})});
@@ -2941,15 +4036,14 @@ async function strSave(){
 async function openThemeBuilder(){
   try{
     var r=await fetch("/api/theme/"+encodeURIComponent(PROJECT));var d=await r.json();
-    var colors=d.colors||[];
-    window._themeColors=colors;
+    window._themeColors=d.colors||[];
     renderThemeModal();
   }catch(e){toast("Error","error");}
 }
 function renderThemeModal(){
-  var html='<h3>🎨 Theme Builder</h3><div style="max-height:300px;overflow-y:auto">';
+  var html='<h3><i class="fa-solid fa-brush"></i> Theme Builder</h3><div style="max-height:300px;overflow-y:auto">';
   window._themeColors.forEach(function(c,i){
-    html+='<div style="display:flex;gap:6px;margin:4px 0;align-items:center"><input value="'+esc(c.name)+'" placeholder="name" style="flex:1" onchange="thmUpdate('+i+',this.value,\'name\')"><input type="color" value="'+esc(c.value)+'" style="width:50px;height:40px;padding:2px" onchange="thmUpdate('+i+',this.value,\'value\')"><input value="'+esc(c.value)+'" style="flex:1" onchange="thmUpdate('+i+',this.value,\'value\')"><button class="btn btn-danger" style="padding:6px" onclick="thmDel('+i+')">×</button></div>';
+    html+='<div style="display:flex;gap:6px;margin:4px 0;align-items:center"><input value="'+esc(c.name)+'" placeholder="name" style="flex:1" onchange="thmUpdate('+i+',this.value,\'name\')"><input type="color" value="'+esc(c.value)+'" style="width:50px;height:40px;padding:2px" onchange="thmUpdate('+i+',this.value,\'value\')"><input value="'+esc(c.value)+'" style="flex:1" onchange="thmUpdate('+i+',this.value,\'value\')"><button class="btn btn-danger" style="padding:6px" onclick="thmDel('+i+')"><i class="fa-solid fa-trash"></i></button></div>';
   });
   html+='</div><button class="btn btn-success" style="width:100%;margin-top:8px;padding:10px" onclick="thmAdd()">+ Color</button><button class="btn btn-primary" style="width:100%;margin-top:6px;padding:12px" onclick="thmSave()">💾 Save</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>';
   showModal(html);
@@ -2967,7 +4061,7 @@ async function thmSave(){
 async function openManifest(){
   try{
     var r=await fetch("/api/manifest/"+encodeURIComponent(PROJECT));var d=await r.json();
-    var html='<h3>📋 Manifest Editor</h3>';
+    var html='<h3><i class="fa-solid fa-file-code"></i> Manifest Editor</h3>';
     html+='<div style="font-size:12px;color:#94a3b8;margin-bottom:6px">Permissions:</div>';
     html+='<div style="margin-bottom:10px">'+(d.permissions||[]).map(function(p){return '<div style="font-family:monospace;font-size:11px;color:#93c5fd">• '+esc(p)+'</div>';}).join("")+'</div>';
     html+='<div style="font-size:12px;color:#94a3b8;margin-bottom:6px">Activities:</div>';
@@ -2986,7 +4080,7 @@ async function saveManifest(){
   }catch(e){toast("Error","error");}
 }
 function openIconGen(){
-  showModal('<h3>🖼 Icon Generator</h3><p style="font-size:12px;color:#94a3b8">Upload a square PNG. Auto-generates all mipmap sizes.</p><input type="file" id="iconFile" accept="image/*" style="padding:8px;background:transparent;color:#fff"><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="doIconGen()">🚀 Generate</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>');
+  showModal('<h3><i class="fa-solid fa-image"></i> Icon Generator</h3><p style="font-size:12px;color:#94a3b8">Upload square PNG. Auto-generates all mipmaps.</p><input type="file" id="iconFile" accept="image/*" style="padding:8px;background:transparent;color:#fff"><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="doIconGen()">🚀 Generate</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>');
 }
 async function doIconGen(){
   var f=document.getElementById("iconFile").files[0];
@@ -3008,9 +4102,9 @@ async function openEnvMgr(){
   }catch(e){toast("Error","error");}
 }
 function renderEnvModal(){
-  var html='<h3>🔑 ENV Manager</h3><p style="font-size:11px;color:#94a3b8">Stored securely. Also written to .env</p>';
+  var html='<h3><i class="fa-solid fa-key"></i> ENV Manager</h3><p style="font-size:11px;color:#94a3b8">Written to .env file</p>';
   window._envItems.forEach(function(it,i){
-    html+='<div style="display:flex;gap:6px;margin:4px 0"><input value="'+esc(it.key)+'" placeholder="KEY" style="flex:1" onchange="envUpdate('+i+',this.value,\'key\')"><input value="'+esc(it.value)+'" placeholder="value" style="flex:2" onchange="envUpdate('+i+',this.value,\'value\')"><button class="btn btn-danger" style="padding:6px" onclick="envDel('+i+')">×</button></div>';
+    html+='<div style="display:flex;gap:6px;margin:4px 0"><input value="'+esc(it.key)+'" placeholder="KEY" style="flex:1" onchange="envUpdate('+i+',this.value,\'key\')"><input value="'+esc(it.value)+'" placeholder="value" style="flex:2" onchange="envUpdate('+i+',this.value,\'value\')"><button class="btn btn-danger" style="padding:6px" onclick="envDel('+i+')"><i class="fa-solid fa-trash"></i></button></div>';
   });
   html+='<button class="btn btn-success" style="width:100%;margin-top:8px;padding:10px" onclick="envAdd()">+ Add</button><button class="btn btn-primary" style="width:100%;margin-top:6px;padding:12px" onclick="envSave()">💾 Save</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Close</button>';
   showModal(html);
@@ -3026,23 +4120,23 @@ async function envSave(){
   }catch(e){toast("Error","error");}
 }
 function openBulkRename(){
-  showModal('<h3>✏️ Bulk Rename</h3><input id="bulkPattern" placeholder="Regex pattern e.g. old_(.*)"><input id="bulkReplace" placeholder="Replace e.g. new_\\1"><input id="bulkExt" placeholder="Extension filter (optional) e.g. .java"><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="doBulkRename()">🚀 Rename</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>');
+  showModal('<h3><i class="fa-solid fa-i-cursor"></i> Bulk Rename</h3><input id="bulkPattern" placeholder="Regex e.g. old_(.*)"><input id="bulkReplace" placeholder="Replace e.g. new_\\1"><input id="bulkExt" placeholder="Extension filter (optional)"><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="doBulkRename()">🚀 Rename</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>');
 }
 async function doBulkRename(){
   var p=document.getElementById("bulkPattern").value;
   var r=document.getElementById("bulkReplace").value;
   var e=document.getElementById("bulkExt").value;
   if(!p){toast("Pattern required","error");return;}
-  if(!confirm("This will rename matching files. Continue?"))return;
+  if(!confirm("Rename matching files?"))return;
   try{
     var res=await fetch("/api/bulk-rename",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT,pattern:p,replace:r,ext:e})});
     var d=await res.json();
-    if(res.ok){toast("Renamed "+d.renamed+" files");closeModal();loadFiles(currentPath);}
+    if(res.ok){toast("Renamed "+d.renamed);closeModal();loadFiles(currentPath);}
     else toast(d.error||"Fail","error");
   }catch(err){toast("Error","error");}
 }
 function openFirebase(){
-  showModal('<h3>🔥 Firebase Inject</h3><p style="font-size:12px;color:#94a3b8">Paste google-services.json content:</p><textarea id="fbJson" style="height:220px;font-family:monospace;font-size:11px" placeholder=\'{"project_info":{...}}\'></textarea><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="doFirebase()">🚀 Inject</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>');
+  showModal('<h3><i class="fa-solid fa-fire"></i> Firebase Inject</h3><p style="font-size:12px;color:#94a3b8">Paste google-services.json:</p><textarea id="fbJson" style="height:220px;font-family:monospace;font-size:11px" placeholder=\'{"project_info":{...}}\'></textarea><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="doFirebase()">🚀 Inject</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>');
 }
 async function doFirebase(){
   var j=document.getElementById("fbJson").value;
@@ -3062,26 +4156,21 @@ async function bumpVersion(){
   }catch(e){toast("Error","error");}
 }
 function openKeystore(){
-  showModal('<h3>🔐 Keystore Config</h3><input id="ksFile" placeholder="Keystore file path (e.g. /sdcard/release.jks)"><input id="ksPass" placeholder="Store password" type="password"><input id="ksAlias" placeholder="Key alias"><input id="ksKeyPass" placeholder="Key password" type="password"><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="saveKs()">💾 Save</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>');
+  showModal('<h3><i class="fa-solid fa-lock"></i> Keystore Config</h3><input id="ksFile" placeholder="Keystore file path"><input id="ksPass" placeholder="Store password" type="password"><input id="ksAlias" placeholder="Key alias"><input id="ksKeyPass" placeholder="Key password" type="password"><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="saveKs()">💾 Save</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>');
   fetch("/api/keystore").then(function(r){return r.json();}).then(function(d){
     if(d.storeFile)document.getElementById("ksFile").value=d.storeFile;
     if(d.keyAlias)document.getElementById("ksAlias").value=d.keyAlias;
   });
 }
 async function saveKs(){
-  var data={
-    storeFile:document.getElementById("ksFile").value,
-    storePassword:document.getElementById("ksPass").value,
-    keyAlias:document.getElementById("ksAlias").value||"release",
-    keyPassword:document.getElementById("ksKeyPass").value
-  };
+  var data={storeFile:document.getElementById("ksFile").value,storePassword:document.getElementById("ksPass").value,keyAlias:document.getElementById("ksAlias").value||"release",keyPassword:document.getElementById("ksKeyPass").value};
   try{
     var r=await fetch("/api/keystore",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});
     if(r.ok){toast("Saved");closeModal();}
   }catch(e){toast("Error","error");}
 }
 async function signRelease(){
-  if(!confirm("Build + sign release APK? (may take a while)"))return;
+  if(!confirm("Build + sign release APK?"))return;
   toast("Building release...");
   try{
     var r=await fetch("/api/sign-release/"+encodeURIComponent(PROJECT),{method:"POST"});
@@ -3091,7 +4180,7 @@ async function signRelease(){
   }catch(e){toast("Error","error");}
 }
 function openRestore(){
-  showModal('<h3>📥 Restore Backup</h3><p style="font-size:12px;color:#94a3b8">Select a ZIP backup file.</p><input type="file" id="restoreFile" accept=".zip" style="padding:8px;background:transparent;color:#fff"><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="doRestore()">🚀 Restore</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>');
+  showModal('<h3><i class="fa-solid fa-download"></i> Restore Backup</h3><p style="font-size:12px;color:#94a3b8">Select a ZIP backup file.</p><input type="file" id="restoreFile" accept=".zip" style="padding:8px;background:transparent;color:#fff"><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="doRestore()">🚀 Restore</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>');
 }
 async function doRestore(){
   var f=document.getElementById("restoreFile").files[0];
@@ -3105,56 +4194,213 @@ async function doRestore(){
   }catch(e){toast("Error","error");}
 }
 function showShortcuts(){
-  showModal('<h3>⌨️ Keyboard Shortcuts</h3><div style="font-size:13px;line-height:1.9;color:#cbd5e1"><b>Ctrl+S</b> — Save<br><b>Ctrl+B</b> — Build APK<br><b>Ctrl+Shift+P</b> — Command Palette<br><b>Ctrl+F</b> — Find<br><b>Ctrl+/</b> — Toggle comment<br><b>Ctrl+Z</b> — Undo<br><b>Ctrl+Y</b> — Redo</div><button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>');
+  showModal('<h3><i class="fa-solid fa-keyboard"></i> Shortcuts</h3><div style="font-size:13px;line-height:2;color:#cbd5e1"><b>Ctrl+S</b> Save<br><b>Ctrl+B</b> Build<br><b>Ctrl+Shift+P</b> Command Palette<br><b>Ctrl+F</b> Find<br><b>Ctrl+Z</b> Undo<br><b>Ctrl+Y</b> Redo<br></div><button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>');
 }
+
+// ============ DEV TOOLS ============
+function openDevTools(){
+  var html='<h3><i class="fa-solid fa-toolbox"></i> Dev Tools</h3><div class="devtool-grid">';
+  html+='<div class="devtool-item" onclick="toolHash()"><i class="fa-solid fa-fingerprint"></i>Hash</div>';
+  html+='<div class="devtool-item" onclick="toolBase64()"><i class="fa-solid fa-code"></i>Base64</div>';
+  html+='<div class="devtool-item" onclick="toolUUID()"><i class="fa-solid fa-id-card"></i>UUID</div>';
+  html+='<div class="devtool-item" onclick="toolLorem()"><i class="fa-solid fa-paragraph"></i>Lorem</div>';
+  html+='<div class="devtool-item" onclick="toolJSON()"><i class="fa-solid fa-brackets-curly"></i>JSON</div>';
+  html+='<div class="devtool-item" onclick="toolColorPicker()"><i class="fa-solid fa-palette"></i>Color</div>';
+  html+='<div class="devtool-item" onclick="showProcs()"><i class="fa-solid fa-list-check"></i>Processes</div>';
+  html+='</div><div id="toolOutput" style="margin-top:10px"></div><button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>';
+  showModal(html);
+}
+async function toolHash(){
+  var t=prompt("Text to hash:");if(!t)return;
+  var r=await fetch("/api/devtool/hash",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:t,algo:"sha256"})});
+  var d=await r.json();
+  document.getElementById("toolOutput").innerHTML='<div style="font-family:monospace;font-size:11px;word-break:break-all;padding:10px;background:#000;border-radius:10px;color:#4ade80">SHA256:<br>'+esc(d.result||d.error)+'</div>';
+}
+async function toolBase64(){
+  var t=prompt("Text:");if(!t)return;
+  var r=await fetch("/api/devtool/base64",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:t,mode:"encode"})});
+  var d=await r.json();
+  document.getElementById("toolOutput").innerHTML='<div style="font-family:monospace;font-size:11px;word-break:break-all;padding:10px;background:#000;border-radius:10px;color:#4ade80">'+esc(d.result||d.error)+'</div>';
+}
+async function toolUUID(){
+  var r=await fetch("/api/devtool/uuid");var d=await r.json();
+  document.getElementById("toolOutput").innerHTML='<div style="font-family:monospace;font-size:11px;padding:10px;background:#000;border-radius:10px;color:#4ade80">'+esc(d.uuid)+'</div>';
+}
+async function toolLorem(){
+  var r=await fetch("/api/devtool/lorem?n=3");var d=await r.json();
+  document.getElementById("toolOutput").innerHTML='<textarea style="height:150px">'+esc(d.text)+'</textarea>';
+}
+function toolJSON(){
+  document.getElementById("toolOutput").innerHTML='<textarea id="jsonIO" placeholder="Paste JSON..." style="height:120px"></textarea><button class="btn btn-primary" style="width:100%;margin-top:6px;padding:10px" onclick="formatJSON()">Format</button>';
+}
+function formatJSON(){
+  try{var v=document.getElementById("jsonIO").value;var p=JSON.parse(v);document.getElementById("jsonIO").value=JSON.stringify(p,null,2);}
+  catch(e){alert("Invalid: "+e.message);}
+}
+function toolColorPicker(){
+  document.getElementById("toolOutput").innerHTML='<input type="color" id="clrPkr" style="width:100%;height:60px" oninput="document.getElementById(\'clrTxt\').innerText=this.value"><div id="clrTxt" style="text-align:center;font-family:monospace;padding:8px;color:#4ade80">#000000</div>';
+}
+async function showProcs(){
+  var r=await fetch("/api/proc-list");var d=await r.json();
+  var html='<div style="max-height:340px;overflow-y:auto;font-family:monospace;font-size:11px;background:#000;padding:10px;border-radius:10px;color:#4ade80">';
+  (d.procs||[]).forEach(function(l){html+=esc(l)+"<br>";});
+  html+='</div>';
+  document.getElementById("toolOutput").innerHTML=html;
+}
+
+// ============ SNIPPETS ============
+async function openSnippets(){
+  try{
+    var r=await fetch("/api/snippets");var d=await r.json();
+    var html='<h3><i class="fa-solid fa-scissors"></i> Code Snippets</h3><div style="max-height:300px;overflow-y:auto">';
+    if(!d.items||!d.items.length)html+='<div class="empty">No snippets</div>';
+    else d.items.forEach(function(s,i){
+      html+='<div style="background:#0b1220;padding:8px;border-radius:8px;margin:4px 0;display:flex;gap:6px;align-items:center"><b style="color:#60a5fa;flex:1;font-size:12px">'+esc(s.name)+' <small style="color:#94a3b8">['+esc(s.lang)+']</small></b><button class="btn btn-success" style="padding:4px 8px" onclick="insertSnippet(\''+esc(s.code).replace(/'/g,"\\'").replace(/\n/g,"\\n")+'\')"><i class="fa-solid fa-plus"></i></button><button class="btn btn-danger" style="padding:4px 8px" onclick="delSnippet('+i+')"><i class="fa-solid fa-trash"></i></button></div>';
+    });
+    html+='</div><button class="btn btn-success" style="width:100%;margin-top:8px;padding:11px" onclick="addSnippet()">+ New Snippet</button><button class="btn" style="width:100%;margin-top:6px;padding:11px" onclick="closeModal()">Close</button>';
+    showModal(html);
+  }catch(e){}
+}
+function insertSnippet(code){if(!cm)return toast("Open a file first","error");cm.replaceSelection(code);closeModal();}
+async function addSnippet(){
+  var name=prompt("Name:");if(!name)return;
+  var lang=prompt("Language:","java")||"text";
+  var code=prompt("Code:");if(!code)return;
+  await fetch("/api/snippets",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name,lang:lang,code:code})});
+  openSnippets();
+}
+async function delSnippet(i){await fetch("/api/snippets",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({index:i})});openSnippets();}
+
+// ============ MACROS ============
+async function openMacros(){
+  try{
+    var r=await fetch("/api/macros");var d=await r.json();
+    var html='<h3><i class="fa-solid fa-record-vinyl"></i> Macros</h3>';
+    (d.macros||[]).forEach(function(m){
+      html+='<div class="file-item file"><div class="icon-wrap"><i class="fa-solid fa-play"></i></div><span class="name">'+esc(m.name)+' <small style="color:#94a3b8">'+m.steps.length+' steps</small></span><button class="btn btn-success" style="padding:5px 9px" onclick="runMacro(\''+m.id+'\')"><i class="fa-solid fa-play"></i></button><button class="btn btn-danger" style="padding:5px 9px" onclick="delMacro(\''+m.id+'\')"><i class="fa-solid fa-trash"></i></button></div>';
+    });
+    html+='<button class="btn btn-success" style="width:100%;margin-top:8px;padding:11px" onclick="createMacro()">+ Record Macro</button><button class="btn" style="width:100%;margin-top:6px;padding:11px" onclick="closeModal()">Close</button>';
+    showModal(html);
+  }catch(e){}
+}
+async function createMacro(){
+  var name=prompt("Macro name:");if(!name)return;
+  var cmd=prompt("Step 1: shell command:");if(!cmd)return;
+  var steps=[{type:"cmd",value:cmd}];
+  if(confirm("Add build step?"))steps.push({type:"build"});
+  await fetch("/api/macros",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name,steps:steps})});
+  openMacros();
+}
+async function runMacro(id){
+  try{
+    var r=await fetch("/api/macros/run/"+id,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT})});
+    var d=await r.json();
+    if(r.ok)toast("Macro executed");else toast(d.error||"Fail","error");
+    closeModal();
+  }catch(e){toast("Error","error");}
+}
+async function delMacro(id){await fetch("/api/macros",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:id})});openMacros();}
+
+// ============ CUSTOM THEMES ============
+async function openCustomThemes(){
+  try{
+    var r=await fetch("/api/themes");var d=await r.json();
+    var html='<h3><i class="fa-solid fa-palette"></i> Custom Themes</h3>';
+    (d.themes||[]).forEach(function(t){
+      html+='<div class="file-item file"><div class="icon-wrap" style="background:'+(t.colors.primary||"#3b82f6")+'"></div><span class="name">'+esc(t.name)+'</span><button class="btn btn-success" style="padding:5px 9px" onclick="applyTheme(\''+t.id+'\')"><i class="fa-solid fa-check"></i></button><button class="btn btn-danger" style="padding:5px 9px" onclick="delTheme(\''+t.id+'\')"><i class="fa-solid fa-trash"></i></button></div>';
+    });
+    html+='<input id="themeName" placeholder="Theme name"><input type="color" id="themePrimary" value="#3b82f6" style="width:100%;height:44px;padding:4px"><button class="btn btn-success" style="width:100%;padding:11px" onclick="createTheme()">+ Create Theme</button><button class="btn" style="width:100%;margin-top:6px;padding:11px" onclick="closeModal()">Close</button>';
+    window._customThemes=d.themes||[];
+    showModal(html);
+  }catch(e){}
+}
+async function createTheme(){
+  var name=document.getElementById("themeName").value.trim();
+  var primary=document.getElementById("themePrimary").value;
+  if(!name)return;
+  await fetch("/api/themes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name,colors:{primary:primary}})});
+  openCustomThemes();
+}
+function applyTheme(id){
+  var t=(window._customThemes||[]).find(function(x){return x.id===id;});
+  if(!t)return;
+  if(t.colors.primary){document.documentElement.style.setProperty("--primary",t.colors.primary);}
+  toast("Theme applied: "+t.name);
+}
+async function delTheme(id){await fetch("/api/themes/"+id,{method:"DELETE"});openCustomThemes();}
+
+// ============ PLUGINS ============
+async function openPlugins(){
+  try{
+    var r=await fetch("/api/plugins");var d=await r.json();
+    var html='<h3><i class="fa-solid fa-puzzle-piece"></i> Plugins</h3>';
+    (d.plugins||[]).forEach(function(p){
+      html+='<div class="plugin-item"><h5>'+esc(p.name)+' v'+esc(p.version)+'</h5><p>'+esc(p.description||"No description")+'</p><button class="btn btn-danger" style="padding:5px 9px" onclick="delPlugin(\''+esc(p._file)+'\')"><i class="fa-solid fa-trash"></i> Delete</button></div>';
+    });
+    html+='<input id="pluginName" placeholder="Plugin name"><input id="pluginDesc" placeholder="Description"><textarea id="pluginCode" placeholder="JavaScript code..." style="height:100px"></textarea><button class="btn btn-success" style="width:100%;padding:11px" onclick="createPlugin()">+ Add Plugin</button><button class="btn" style="width:100%;margin-top:6px;padding:11px" onclick="closeModal()">Close</button>';
+    showModal(html);
+  }catch(e){}
+}
+async function createPlugin(){
+  var name=document.getElementById("pluginName").value.trim();
+  var desc=document.getElementById("pluginDesc").value;
+  var code=document.getElementById("pluginCode").value;
+  if(!name)return;
+  await fetch("/api/plugins",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name,description:desc,code:code})});
+  openPlugins();
+}
+async function delPlugin(f){await fetch("/api/plugins/"+encodeURIComponent(f),{method:"DELETE"});openPlugins();}
 
 // ============ COMMAND PALETTE ============
 var PALETTE_CMDS=[
-  {name:"🔨 Build APK",run:buildApk},
-  {name:"▶ Run Current File",run:runCurrent},
-  {name:"🔍 Scan All Errors",run:scanAllErrors},
-  {name:"📦 Export ZIP",run:exportZip},
-  {name:"📲 ADB Install",run:adbInstall},
-  {name:"🧹 Clean Build",run:function(){cleanBuild(false);}},
-  {name:"🧹 Deep Clean (all)",run:function(){cleanBuild(true);}},
-  {name:"🔀 Git Status",run:function(){gitAction("status");switchPanel("git",document.querySelector('[data-panel="git"]'));}},
-  {name:"💾 Git Commit",run:function(){switchPanel("git",document.querySelector('[data-panel="git"]'));gitCommitPrompt();}},
-  {name:"📜 Logcat Start",run:function(){switchPanel("logcat",document.querySelector('[data-panel="logcat"]'));logcatStart();}},
-  {name:"📦 Rename Package",run:openPkgRename},
-  {name:"🔤 Strings Editor",run:openStrings},
-  {name:"🎨 Theme Builder",run:openThemeBuilder},
-  {name:"📋 Manifest Editor",run:openManifest},
-  {name:"🖼 Icon Generator",run:openIconGen},
-  {name:"🔑 ENV Manager",run:openEnvMgr},
-  {name:"✏️ Bulk Rename",run:openBulkRename},
-  {name:"🔥 Firebase Inject",run:openFirebase},
-  {name:"🔢 Bump Version",run:bumpVersion},
-  {name:"🔐 Keystore Config",run:openKeystore},
-  {name:"✅ Sign Release",run:signRelease},
-  {name:"🕒 Recent Files",run:showRecent},
-  {name:"⌨️ Show Shortcuts",run:showShortcuts},
-  {name:"📱 Preview: Phone",run:function(){switchPanel("preview",document.querySelector('[data-panel="preview"]'));}},
-  {name:"📱 Preview: Toggle HTML/Android",run:togglePreviewMode},
-  {name:"🖥 Toggle Split Preview",run:toggleSplitPreview},
-  {name:"⚙️ Settings",run:openSettings},
-  {name:"🌓 Toggle UI Language",run:function(){setLang((localStorage.getItem("uiLang")==="bn")?"en":"bn");}},
+  {name:"Build APK",icon:"fa-hammer",run:buildApk},
+  {name:"Run Current File",icon:"fa-play",run:runCurrent},
+  {name:"Scan Errors",icon:"fa-magnifying-glass",run:scanAllErrors},
+  {name:"Export ZIP",icon:"fa-file-zipper",run:exportZip},
+  {name:"ADB Install",icon:"fa-mobile-button",run:adbInstall},
+  {name:"Clean Build",icon:"fa-broom",run:function(){cleanBuild(false);}},
+  {name:"Deep Clean",icon:"fa-broom",run:function(){cleanBuild(true);}},
+  {name:"Git Status",icon:"fa-code-branch",run:function(){switchPanel("git");}},
+  {name:"Logcat Start",icon:"fa-list-ul",run:function(){switchPanel("logcat");logcatStart();}},
+  {name:"Real PTY Terminal",icon:"fa-terminal",run:function(){switchPanel("terminal");startPTY();}},
+  {name:"Kanban Board",icon:"fa-list-check",run:function(){switchPanel("kanban");}},
+  {name:"Project Notes",icon:"fa-note-sticky",run:function(){switchPanel("notes");}},
+  {name:"Analytics",icon:"fa-chart-line",run:function(){switchPanel("analytics");}},
+  {name:"Rename Package",icon:"fa-box",run:openPkgRename},
+  {name:"Strings Editor",icon:"fa-language",run:openStrings},
+  {name:"Theme Builder",icon:"fa-brush",run:openThemeBuilder},
+  {name:"Manifest Editor",icon:"fa-file-code",run:openManifest},
+  {name:"Icon Generator",icon:"fa-image",run:openIconGen},
+  {name:"ENV Manager",icon:"fa-key",run:openEnvMgr},
+  {name:"Bulk Rename",icon:"fa-i-cursor",run:openBulkRename},
+  {name:"Firebase Inject",icon:"fa-fire",run:openFirebase},
+  {name:"Version Bump",icon:"fa-hashtag",run:bumpVersion},
+  {name:"Keystore Config",icon:"fa-lock",run:openKeystore},
+  {name:"Sign Release",icon:"fa-certificate",run:signRelease},
+  {name:"Dev Tools",icon:"fa-toolbox",run:openDevTools},
+  {name:"Snippets",icon:"fa-scissors",run:openSnippets},
+  {name:"Macros",icon:"fa-record-vinyl",run:openMacros},
+  {name:"Bookmarks",icon:"fa-bookmark",run:showBookmarks},
+  {name:"Recent Files",icon:"fa-clock-rotate-left",run:showRecent},
+  {name:"Aliases",icon:"fa-tag",run:showAliases},
+  {name:"Plugins",icon:"fa-puzzle-piece",run:openPlugins},
+  {name:"Custom Themes",icon:"fa-palette",run:openCustomThemes},
+  {name:"Settings",icon:"fa-gear",run:openSettings},
+  {name:"Toggle HTML/Android Preview",icon:"fa-eye",run:togglePreviewMode},
+  {name:"Notifications",icon:"fa-bell",run:showNotifications},
 ];
-var paletteFiltered=PALETTE_CMDS.slice();
-var paletteIdx=0;
+var paletteFiltered=PALETTE_CMDS.slice(),paletteIdx=0;
 function openCommandPalette(){
   document.getElementById("cmdPalette").classList.add("show");
   document.getElementById("cmdPaletteInput").value="";
-  paletteFiltered=PALETTE_CMDS.slice();
-  paletteIdx=0;
-  renderPalette();
+  paletteFiltered=PALETTE_CMDS.slice();paletteIdx=0;renderPalette();
   setTimeout(function(){document.getElementById("cmdPaletteInput").focus();},50);
 }
 function renderPalette(){
-  var ul=document.getElementById("cmdPaletteList");
-  ul.innerHTML="";
+  var ul=document.getElementById("cmdPaletteList");ul.innerHTML="";
   paletteFiltered.slice(0,12).forEach(function(c,i){
     var li=document.createElement("li");
-    li.textContent=c.name;
+    li.innerHTML='<i class="fa-solid '+c.icon+'"></i>'+esc(c.name);
     if(i===paletteIdx)li.classList.add("active");
     li.onclick=function(){closePalette();c.run();};
     ul.appendChild(li);
@@ -3162,11 +4408,11 @@ function renderPalette(){
 }
 function filterPalette(){
   var q=document.getElementById("cmdPaletteInput").value.toLowerCase();
-  paletteFiltered=PALETTE_CMDS.filter(function(c){return c.name.toLowerCase().indexOf(q)!==-1;});
+  paletteFiltered=PALETTE_CMDS.filter(function(c){return c.name.toLowerCase().indexOf(q)>=0;});
   paletteIdx=0;renderPalette();
 }
 function paletteKey(e){
-  if(e.key==="Escape"){closePalette();}
+  if(e.key==="Escape")closePalette();
   else if(e.key==="ArrowDown"){e.preventDefault();if(paletteIdx<paletteFiltered.length-1){paletteIdx++;renderPalette();}}
   else if(e.key==="ArrowUp"){e.preventDefault();if(paletteIdx>0){paletteIdx--;renderPalette();}}
   else if(e.key==="Enter"){e.preventDefault();var c=paletteFiltered[paletteIdx];if(c){closePalette();c.run();}}
@@ -3174,45 +4420,54 @@ function paletteKey(e){
 function closePalette(){document.getElementById("cmdPalette").classList.remove("show");}
 
 // ============ SETTINGS ============
-function openSettings(){
+async function openSettings(){
   document.getElementById("fontSize").value=localStorage.getItem("fontSize")||13;
   document.getElementById("autoSave").value=localStorage.getItem("autoSave")||"off";
   document.getElementById("cmTheme").value=localStorage.getItem("cmTheme")||"dracula";
   document.getElementById("uiLang").value=localStorage.getItem("uiLang")||"en";
   document.getElementById("settingsModal").classList.add("show");
+  try{
+    var r=await fetch("/api/settings/"+encodeURIComponent(PROJECT));
+    var d=await r.json();
+    if(document.getElementById("autoBuildChk"))document.getElementById("autoBuildChk").checked=!!d.autoBuild;
+  }catch(e){}
 }
-function applyFontSize(v){
-  localStorage.setItem("fontSize",v);
-  if(cm)cm.getWrapperElement().style.fontSize=v+"px";
-}
+function applyFontSize(v){localStorage.setItem("fontSize",v);if(cm)cm.getWrapperElement().style.fontSize=v+"px";}
 function changeTheme(t){localStorage.setItem("cmTheme",t);if(cm)cm.setOption("theme",t);}
 function setLang(l){
   localStorage.setItem("uiLang",l);
-  var items=document.querySelectorAll(".nav-item");
-  items.forEach(function(it){
+  var map={en:{explorer:"Files",preview:"Preview",errors:"Errors",terminal:"Term",build:"Build",git:"Git",logcat:"Log",kanban:"Todo",notes:"Notes",analytics:"Stats"},
+           bn:{explorer:"ফাইল",preview:"প্রিভিউ",errors:"ভুল",terminal:"টার্ম",build:"বিল্ড",git:"গিট",logcat:"লগ",kanban:"টুডু",notes:"নোট",analytics:"স্ট্যাট"}};
+  var m=map[l]||map.en;
+  document.querySelectorAll(".nav-item").forEach(function(it){
     var p=it.dataset.panel;
-    var label=it.querySelector("span:last-child");
-    if(p&&label){
-      var key={explorer:"files",preview:"preview",errors:"errors",terminal:"term",build:"build",git:"git",logcat:"log"}[p];
-      if(key) label.textContent=(key==="errors"?"":"")+T(key);
-    }
+    if(p&&m[p]){var sp=it.querySelector("span");if(sp)sp.textContent=m[p];}
   });
   toast("Language: "+l);
 }
 
-// ============ KEYBOARD SHORTCUTS ============
+// ============ SHORTCUTS ============
 document.addEventListener("keydown",function(e){
   if((e.ctrlKey||e.metaKey)&&e.shiftKey&&e.key.toLowerCase()==="p"){e.preventDefault();openCommandPalette();}
   else if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="s"){e.preventDefault();if(cm)saveFile(false);}
   else if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="b"){e.preventDefault();buildApk();}
-  else if(e.key==="Escape"){closePalette();}
+  else if(e.key==="Escape")closePalette();
 });
-document.getElementById("cmdPaletteInput").addEventListener("blur",function(){setTimeout(closePalette,200);});
 
 // ============ INIT ============
-if(localStorage.getItem("uiLang")) setLang(localStorage.getItem("uiLang"));
+if(localStorage.getItem("uiLang"))setLang(localStorage.getItem("uiLang"));
 loadFiles("");
+loadPresets();
+loadSystemInfo();
+setInterval(loadSystemInfo,15000);
+pollNotifications();
+notifPollTimer=setInterval(pollNotifications,3000);
 setTimeout(function(){try{scanAllErrors();}catch(e){}},1500);
+setTimeout(function(){try{
+  fetch("/api/settings/"+encodeURIComponent(PROJECT)).then(function(r){return r.json();}).then(function(d){
+    if(document.getElementById("autoBuildChk"))document.getElementById("autoBuildChk").checked=!!d.autoBuild;
+  });
+}catch(e){}},1000);
 </script>
 </body>
 </html>
@@ -3223,20 +4478,21 @@ setTimeout(function(){try{scanAllErrors();}catch(e){}},1500);
 # ============================================================
 if __name__ == "__main__":
     print("")
-    print("============================================")
-    print("⚡ ZIHAD MOBILE IDE v10.0 — FULL EDITION")
-    print("============================================")
-    print("Projects  :", PROJECTS_DIR)
-    print("APKs      :", APKS_DIR)
-    print("History   :", HISTORY_DIR)
-    print("Backups   :", BACKUP_DIR)
-    print("Signed    :", SIGNED_DIR)
-    print("Server    : http://127.0.0.1:%d" % PORT)
-    print("============================================")
-    print("Features: Templates(6), Git, Logcat, Icon,")
-    print("Strings, Theme, Manifest, ENV, History,")
-    print("BulkRename, Extract, Firebase, Signing,")
-    print("Command Palette, i18n(bn/en), PWA, Split")
-    print("============================================")
+    print("=================================================")
+    print("⚡ ZIHAD MOBILE IDE v12.0 — ULTIMATE EDITION")
+    print("=================================================")
+    print("Projects :", PROJECTS_DIR)
+    print("APKs     :", APKS_DIR)
+    print("Plugins  :", PLUGINS_DIR)
+    print("Kanban   :", KANBAN_DIR)
+    print("Notes    :", NOTES_DIR)
+    print("Server   : http://127.0.0.1:%d" % PORT)
+    print("=================================================")
+    print("Features: 12 templates, Git, Logcat, PTY, Kanban,")
+    print("Notes, Bookmarks, Plugins, Themes, Aliases,")
+    print("Macros, Analytics, Auto-Build, Notifications,")
+    print("Dev Tools, Snippets, Command Palette, i18n,")
+    print("PWA, Live Preview, Real Termux PTY")
+    print("=================================================")
     print("")
     app.run(host="127.0.0.1", port=PORT, debug=False, threaded=True)
