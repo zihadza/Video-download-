@@ -12,7 +12,7 @@ APKS_DIR = BASE_DIR / "apks"
 PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
 APKS_DIR.mkdir(parents=True, exist_ok=True)
 
-PORT = 3060
+PORT = 3080
 TERMUX_PREFIX = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
 BUILDS = {}
 
