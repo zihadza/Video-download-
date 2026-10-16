@@ -2417,7 +2417,7 @@ header h2 i{color:#60a5fa}
 .nav-item.active::before{content:"";position:absolute;top:0;left:22%;right:22%;height:3px;background:linear-gradient(90deg,transparent,#3b82f6,transparent);border-radius:3px}
 .nav-item i{font-size:18px}
 .main-area{height:calc(100vh - var(--header-h) - var(--bottom-h));overflow:hidden}
-.panel{display:none;height:100%;overflow-y:auto;padding:10px;padding-bottom:22px;-webkit-overflow-scrolling:touch}
+.panel{display:none;height:100%;overflow-y:auto;padding:10px;padding-bottom:140px;-webkit-overflow-scrolling:touch}
 .panel.active{display:block}
 .breadcrumb{background:rgba(8,15,28,.7);padding:8px 11px;border-radius:10px;margin-bottom:8px;font-size:12px;word-break:break-all}
 .breadcrumb span{color:#60a5fa;cursor:pointer}
