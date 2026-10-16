@@ -1,1049 +1,2163 @@
-import os
-import re
-import json
-import time
-import shutil
-import sqlite3
-import mimetypes
-import subprocess
-import threading
-import urllib.request
-import urllib.error
+from flask import Flask, jsonify, request, send_file
 from pathlib import Path
+import json, re, subprocess, shutil, os, threading, time, uuid
 from datetime import datetime
-from flask import (
-    Flask, request, jsonify, Response, send_file,
-    abort, render_template_string
-)
 
 app = Flask(__name__)
-app.config["MAX_CONTENT_LENGTH"] = 100 * 1024 * 1024
 
-HOME = Path.home()
-BASE = (HOME / "Projects" / "ZihadIDE").resolve()
-PROJECTS = (BASE / "projects").resolve()
-BACKUPS = (BASE / "backups").resolve()
-SETTINGS_FILE = BASE / "ide_settings.json"
+BASE_DIR = Path.home() / "Projects" / "ZihadIDE"
+PROJECTS_DIR = BASE_DIR / "projects"
+PROJECTS_DIR.mkdir(parents=True, exist_ok=True)
 
-PROJECTS.mkdir(parents=True, exist_ok=True)
-BACKUPS.mkdir(parents=True, exist_ok=True)
-
-HOST = "127.0.0.1"
-PORT = int(os.environ.get("ZIHAD_IDE_PORT", "3040"))
-MAX_EDITOR_FILE = 10 * 1024 * 1024
-MAX_COMMAND_TIME = 120
+PORT = 3040
+TERMUX_PREFIX = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
+BUILDS = {}
 
 LANGUAGES = {
-    ".py": "python", ".pyw": "python",
-    ".js": "javascript", ".mjs": "javascript",
-    ".html": "html", ".htm": "html",
-    ".css": "css", ".json": "json",
-    ".xml": "xml", ".php": "php",
-    ".java": "java", ".kt": "kotlin",
-    ".c": "c", ".h": "c", ".cpp": "cpp",
-    ".cc": "cpp", ".cxx": "cpp", ".hpp": "cpp",
-    ".go": "go", ".rs": "rust", ".rb": "ruby",
-    ".pl": "perl", ".sh": "shell", ".bash": "shell",
-    ".md": "markdown", ".txt": "text",
-    ".yml": "yaml", ".yaml": "yaml", ".toml": "toml",
-    ".gradle": "groovy", ".properties": "properties",
-    ".sql": "sql", ".dart": "dart"
+    ".py":{"name":"Python","run":"python \"{file}\"","check":"python -m py_compile \"{file}\""},
+    ".c":{"name":"C","run":"gcc \"{file}\" -o /tmp/zh_out && /tmp/zh_out","check":"gcc -fsyntax-only -Wall \"{file}\""},
+    ".cpp":{"name":"C++","run":"g++ \"{file}\" -o /tmp/zh_out && /tmp/zh_out","check":"g++ -fsyntax-only -Wall \"{file}\""},
+    ".cc":{"name":"C++","run":"g++ \"{file}\" -o /tmp/zh_out && /tmp/zh_out","check":"g++ -fsyntax-only -Wall \"{file}\""},
+    ".php":{"name":"PHP","run":"php \"{file}\"","check":"php -l \"{file}\""},
+    ".js":{"name":"JavaScript","run":"node \"{file}\"","check":"node --check \"{file}\""},
+    ".go":{"name":"Go","run":"go run \"{file}\"","check":"gofmt -e \"{file}\""},
+    ".rs":{"name":"Rust","run":"rustc \"{file}\" -o /tmp/zh_out && /tmp/zh_out","check":None},
+    ".rb":{"name":"Ruby","run":"ruby \"{file}\"","check":"ruby -c \"{file}\""},
+    ".pl":{"name":"Perl","run":"perl \"{file}\"","check":"perl -c \"{file}\""},
+    ".sh":{"name":"Bash","run":"bash \"{file}\"","check":"bash -n \"{file}\""},
+    ".java":{"name":"Java","run":"java \"{file}\"","check":None},
+    ".kt":{"name":"Kotlin","run":None,"check":None},
+    ".html":{"name":"HTML","run":None,"check":None},
+    ".css":{"name":"CSS","run":None,"check":None},
+    ".json":{"name":"JSON","run":None,"check":"python -c \"import json,sys; json.load(open(sys.argv[1]))\" \"{file}\""},
+    ".xml":{"name":"XML","run":None,"check":"python -c \"import xml.etree.ElementTree as ET,sys; ET.parse(sys.argv[1])\" \"{file}\""},
+    ".md":{"name":"Markdown","run":None,"check":None},
+    ".txt":{"name":"Text","run":None,"check":None},
+    ".gradle":{"name":"Gradle","run":None,"check":None},
+    ".properties":{"name":"Properties","run":None,"check":None},
 }
 
+def valid_package(p):
+    return re.match(r"^[a-zA-Z][a-zA-Z0-9_]*(\.[a-zA-Z][a-zA-Z0-9_]*)+$", p) is not None
 
-def size_text(n):
-    n = float(n)
-    if n < 1024:
-        return f"{int(n)} B"
-    for unit in ("KB", "MB", "GB", "TB"):
-        n /= 1024
-        if n < 1024 or unit == "TB":
-            return f"{n:.2f} {unit}"
-    return f"{n:.2f} TB"
-
-
-def folder_size(path):
-    total = 0
-    try:
-        for p in Path(path).rglob("*"):
-            try:
-                if p.is_file() and not p.is_symlink():
-                    total += p.stat().st_size
-            except OSError:
-                pass
-    except OSError:
-        pass
-    return total
-
-
-def safe_name(value):
-    value = str(value or "").strip()
-    if not value or value in (".", ".."):
-        raise ValueError("Name is required.")
-    if "/" in value or "\\" in value or "\x00" in value:
-        raise ValueError("Name cannot contain path separators.")
-    return value
-
-
-def project_root(name):
-    name = safe_name(name)
-    p = (PROJECTS / name).resolve()
-    if p.parent != PROJECTS:
-        raise ValueError("Invalid project path.")
-    if not p.is_dir() or p.is_symlink():
-        raise FileNotFoundError("Project not found.")
+def safe_project(name):
+    if not name: return None
+    p = (PROJECTS_DIR / name).resolve()
+    try: p.relative_to(PROJECTS_DIR.resolve())
+    except ValueError: return None
     return p
 
-
-def safe_path(root, relative=""):
-    root = Path(root).resolve()
-    relative = str(relative or "").replace("\\", "/")
-    if "\x00" in relative:
-        raise ValueError("Invalid path.")
-    p = (root / relative).resolve()
-    if p != root and root not in p.parents:
-        raise ValueError("Path is outside the selected project.")
+def safe_subpath(project, sub):
+    if not sub: return project
+    p = (project / sub).resolve()
+    try: p.relative_to(project.resolve())
+    except ValueError: return None
     return p
 
+def write_file(path, content):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
 
-def command(cmd, cwd, timeout=MAX_COMMAND_TIME):
-    start = time.time()
-    try:
-        result = subprocess.run(
-            cmd,
-            shell=True,
-            cwd=str(cwd),
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            timeout=timeout,
-            env=os.environ.copy()
-        )
-        return {
-            "ok": result.returncode == 0,
-            "code": result.returncode,
-            "output": (result.stdout or "")[-100000:],
-            "duration": round(time.time() - start, 2)
-        }
-    except subprocess.TimeoutExpired as e:
-        out = e.stdout or ""
-        if isinstance(out, bytes):
-            out = out.decode("utf-8", "replace")
-        return {
-            "ok": False, "code": 124,
-            "output": str(out) + "\nTimed out.",
-            "duration": round(time.time() - start, 2)
-        }
-    except Exception as e:
-        return {
-            "ok": False, "code": 1,
-            "output": str(e),
-            "duration": round(time.time() - start, 2)
-        }
+def create_android_project(name, package, language, template="empty"):
+    project = PROJECTS_DIR / name
+    if project.exists(): raise ValueError("Project already exists")
+    pkg_path = package.replace(".", "/")
+    main_dir = project / "app" / "src" / "main"
+    java_dir = main_dir / "java" / pkg_path
+    kotlin_dir = main_dir / "kotlin" / pkg_path
+    res_dir = main_dir / "res"
+    values_dir = res_dir / "values"
+    layout_dir = res_dir / "layout"
+    mipmap_dir = res_dir / "mipmap-hdpi"
+    for d in [java_dir, kotlin_dir, values_dir, layout_dir, mipmap_dir,
+              res_dir / "drawable", main_dir / "assets", main_dir / "jniLibs"]:
+        d.mkdir(parents=True, exist_ok=True)
+
+    # ===== Templates =====
+    if template == "login":
+        main_java = f'''package {package};
+
+import android.app.Activity;
+import android.os.Bundle;
+import android.widget.Button;
+import android.widget.EditText;
+import android.widget.Toast;
+
+public class MainActivity extends Activity {{
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {{
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+        EditText email = findViewById(R.id.email);
+        EditText password = findViewById(R.id.password);
+        Button loginBtn = findViewById(R.id.loginBtn);
+        loginBtn.setOnClickListener(v -> {{
+            String e = email.getText().toString();
+            String p = password.getText().toString();
+            if(e.isEmpty() || p.isEmpty()) {{
+                Toast.makeText(this, "Fill all fields", Toast.LENGTH_SHORT).show();
+            }} else {{
+                Toast.makeText(this, "Welcome " + e, Toast.LENGTH_SHORT).show();
+            }}
+        }});
+    }}
+}}
+'''
+        main_kotlin = f'''package {package}
+
+import android.app.Activity
+import android.os.Bundle
+import android.widget.Button
+import android.widget.EditText
+import android.widget.Toast
+
+class MainActivity : Activity() {{
+    override fun onCreate(savedInstanceState: Bundle?) {{
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+        val email = findViewById<EditText>(R.id.email)
+        val password = findViewById<EditText>(R.id.password)
+        val loginBtn = findViewById<Button>(R.id.loginBtn)
+        loginBtn.setOnClickListener {{
+            val e = email.text.toString()
+            val p = password.text.toString()
+            if(e.isEmpty() || p.isEmpty()) {{
+                Toast.makeText(this, "Fill all fields", Toast.LENGTH_SHORT).show()
+            }} else {{
+                Toast.makeText(this, "Welcome $e", Toast.LENGTH_SHORT).show()
+            }}
+        }}
+    }}
+}}
+'''
+        layout = '''<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="match_parent"
+    android:orientation="vertical" android:gravity="center"
+    android:padding="32dp" android:background="#0f172a">
+    <TextView android:layout_width="wrap_content" android:layout_height="wrap_content"
+        android:text="Welcome Back" android:textSize="28sp" android:textColor="#ffffff"
+        android:layout_marginBottom="32dp"/>
+    <EditText android:id="@+id/email" android:layout_width="match_parent"
+        android:layout_height="wrap_content" android:hint="Email"
+        android:inputType="textEmailAddress" android:textColor="#fff"
+        android:textColorHint="#94a3b8" android:background="#1e293b"
+        android:padding="16dp" android:layout_marginBottom="16dp"/>
+    <EditText android:id="@+id/password" android:layout_width="match_parent"
+        android:layout_height="wrap_content" android:hint="Password"
+        android:inputType="textPassword" android:textColor="#fff"
+        android:textColorHint="#94a3b8" android:background="#1e293b"
+        android:padding="16dp" android:layout_marginBottom="24dp"/>
+    <Button android:id="@+id/loginBtn" android:layout_width="match_parent"
+        android:layout_height="wrap_content" android:text="Login"
+        android:backgroundTint="#2563eb" android:textColor="#fff"
+        android:padding="14dp"/>
+</LinearLayout>
+'''
+    elif template == "list":
+        main_java = f'''package {package};
+
+import android.app.Activity;
+import android.os.Bundle;
+import android.widget.ArrayAdapter;
+import android.widget.ListView;
+import android.widget.Toast;
+
+public class MainActivity extends Activity {{
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {{
+        super.onCreate(savedInstanceState);
+        setContentView(R.layout.activity_main);
+        ListView list = findViewById(R.id.listView);
+        String[] items = {{"Item 1", "Item 2", "Item 3", "Item 4", "Item 5"}};
+        ArrayAdapter<String> adapter = new ArrayAdapter<>(this,
+            android.R.layout.simple_list_item_1, items);
+        list.setAdapter(adapter);
+        list.setOnItemClickListener((parent, view, position, id) ->
+            Toast.makeText(this, "Clicked: " + items[position], Toast.LENGTH_SHORT).show());
+    }}
+}}
+'''
+        main_kotlin = f'''package {package}
+
+import android.app.Activity
+import android.os.Bundle
+import android.widget.ArrayAdapter
+import android.widget.ListView
+import android.widget.Toast
+
+class MainActivity : Activity() {{
+    override fun onCreate(savedInstanceState: Bundle?) {{
+        super.onCreate(savedInstanceState)
+        setContentView(R.layout.activity_main)
+        val list = findViewById<ListView>(R.id.listView)
+        val items = arrayOf("Item 1", "Item 2", "Item 3", "Item 4", "Item 5")
+        list.adapter = ArrayAdapter(this, android.R.layout.simple_list_item_1, items)
+        list.setOnItemClickListener {{ _, _, position, _ ->
+            Toast.makeText(this, "Clicked: ${{items[position]}}", Toast.LENGTH_SHORT).show()
+        }}
+    }}
+}}
+'''
+        layout = '''<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="match_parent"
+    android:orientation="vertical" android:background="#0f172a">
+    <TextView android:layout_width="match_parent" android:layout_height="wrap_content"
+        android:text="My List" android:textSize="22sp" android:textColor="#fff"
+        android:padding="16dp" android:background="#1e293b"/>
+    <ListView android:id="@+id/listView"
+        android:layout_width="match_parent" android:layout_height="match_parent"
+        android:divider="#334155" android:dividerHeight="1dp"/>
+</LinearLayout>
+'''
+    else:  # empty / bottomnav fallback
+        main_java = f'''package {package};
+
+import android.app.Activity;
+import android.os.Bundle;
+import android.widget.TextView;
+
+public class MainActivity extends Activity {{
+    @Override
+    protected void onCreate(Bundle savedInstanceState) {{
+        super.onCreate(savedInstanceState);
+        TextView text = new TextView(this);
+        text.setText("Hello from {name}");
+        text.setTextSize(24);
+        setContentView(text);
+    }}
+}}
+'''
+        main_kotlin = f'''package {package}
+
+import android.app.Activity
+import android.os.Bundle
+import android.widget.TextView
+
+class MainActivity : Activity() {{
+    override fun onCreate(savedInstanceState: Bundle?) {{
+        super.onCreate(savedInstanceState)
+        val text = TextView(this)
+        text.text = "Hello from {name}"
+        text.textSize = 24f
+        setContentView(text)
+    }}
+}}
+'''
+        layout = '''<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent" android:layout_height="match_parent"
+    android:gravity="center" android:orientation="vertical"
+    android:background="#0f172a">
+    <TextView android:id="@+id/titleText"
+        android:layout_width="wrap_content" android:layout_height="wrap_content"
+        android:text="@string/app_name" android:textSize="24sp"
+        android:textColor="#ffffff"/>
+</LinearLayout>
+'''
+
+    manifest = f'''<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-permission android:name="android.permission.INTERNET"/>
+    <application android:theme="@style/AppTheme" android:label="@string/app_name"
+        android:allowBackup="true" android:supportsRtl="true">
+        <activity android:name="{package}.MainActivity" android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN"/>
+                <category android:name="android.intent.category.LAUNCHER"/>
+            </intent-filter>
+        </activity>
+    </application>
+</manifest>
+'''
+
+    strings_xml = f'''<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">{name}</string>
+</resources>
+'''
+    colors_xml = '''<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="black">#000000</color>
+    <color name="white">#FFFFFF</color>
+    <color name="primary">#2563EB</color>
+    <color name="primary_dark">#1E40AF</color>
+    <color name="bg">#0f172a</color>
+</resources>
+'''
+    themes_xml = '''<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+        <item name="android:fontFamily">sans</item>
+        <item name="android:colorAccent">#2563EB</item>
+        <item name="android:statusBarColor">@color/black</item>
+        <item name="android:navigationBarColor">@color/black</item>
+        <item name="android:windowBackground">@color/bg</item>
+    </style>
+</resources>
+'''
+    ic_launcher = '''<?xml version="1.0" encoding="utf-8"?>
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape android:shape="rectangle">
+            <solid android:color="#2563EB"/>
+        </shape>
+    </item>
+</layer-list>
+'''
+
+    settings_gradle = f'''pluginManagement {{
+    repositories {{
+        google()
+        mavenCentral()
+        gradlePluginPortal()
+    }}
+}}
+dependencyResolutionManagement {{
+    repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+    repositories {{
+        google()
+        mavenCentral()
+    }}
+}}
+rootProject.name = "{name}"
+include(":app")
+'''
+    root_gradle = '''plugins {
+    id 'com.android.application' version '8.7.3' apply false
+}
+'''
+    app_gradle = f'''plugins {{
+    id "com.android.application"
+}}
+android {{
+    namespace "{package}"
+    compileSdk 34
+    defaultConfig {{
+        applicationId "{package}"
+        minSdk 23
+        targetSdk 34
+        versionCode 1
+        versionName "1.0"
+    }}
+    buildTypes {{
+        release {{
+            minifyEnabled false
+        }}
+    }}
+    compileOptions {{
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }}
+}}
+'''
+    gradle_props = '''org.gradle.jvmargs=-Xmx1536m -XX:MaxMetaspaceSize=512m
+android.useAndroidX=true
+android.nonTransitiveRClass=true
+org.gradle.caching=true
+org.gradle.parallel=true
+'''
+    aapt2_path = TERMUX_PREFIX + "/bin/aapt2"
+    local_props = f"sdk.dir={Path.home() / 'android-sdk'}\nandroid.aapt2FromMavenOverride={aapt2_path}\n"
+
+    project_info = {
+        "name": name, "package": package, "language": language,
+        "versionCode": 1, "versionName": "1.0", "template": template,
+        "created": datetime.now().isoformat()
+    }
+
+    write_file(java_dir / "MainActivity.java", main_java)
+    write_file(kotlin_dir / "MainActivity.kt", main_kotlin)
+    write_file(main_dir / "AndroidManifest.xml", manifest)
+    write_file(layout_dir / "activity_main.xml", layout)
+    write_file(values_dir / "strings.xml", strings_xml)
+    write_file(values_dir / "colors.xml", colors_xml)
+    write_file(values_dir / "themes.xml", themes_xml)
+    write_file(mipmap_dir / "ic_launcher.xml", ic_launcher)
+    write_file(project / "settings.gradle", settings_gradle)
+    write_file(project / "build.gradle", root_gradle)
+    write_file(project / "gradle.properties", gradle_props)
+    write_file(project / "local.properties", local_props)
+    write_file(project / "app" / "build.gradle", app_gradle)
+    write_file(project / "project.json", json.dumps(project_info, indent=4))
+    write_file(project / "hello.py", f'print("Hello from {name}")\n')
+    return project
 
 
-def error(message, status=400):
-    return jsonify({"ok": False, "error": str(message)}), status
-
-
-def scan_tree(root, current=None, depth=0):
-    current = current or root
-    result = []
-    if depth > 10:
-        return result
-
-    try:
-        entries = sorted(
-            current.iterdir(),
-            key=lambda p: (not p.is_dir(), p.name.lower())
-        )
-    except OSError:
-        return result
-
-    for p in entries:
-        if p.is_symlink():
-            continue
-        try:
-            stat = p.stat()
-            is_dir = p.is_dir()
-            sz = folder_size(p) if is_dir else stat.st_size
-            item = {
-                "name": p.name,
-                "path": p.relative_to(root).as_posix(),
-                "type": "folder" if is_dir else "file",
-                "size": sz,
-                "sizeText": size_text(sz),
-                "extension": "" if is_dir else p.suffix.lower(),
-                "language": LANGUAGES.get(p.suffix.lower(), "text"),
-                "modified": datetime.fromtimestamp(
-                    stat.st_mtime
-                ).strftime("%Y-%m-%d %H:%M"),
-                "childrenList": []
-            }
-            if is_dir:
-                item["childrenList"] = scan_tree(p and root, p, depth + 1)
-            result.append(item)
-        except (OSError, ValueError):
-            continue
-    return result
-
-
-def flatten(items):
-    out = []
-    for item in items:
-        out.append(item)
-        out.extend(flatten(item.get("childrenList", [])))
-    return out
-
-
-def read_settings():
-    try:
-        return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
-
-
-def save_settings(data):
-    old = read_settings()
-    old.update(data)
-    SETTINGS_FILE.write_text(
-        json.dumps(old, indent=2, ensure_ascii=False),
-        encoding="utf-8"
-    )
-    return old
-
-
-def make_android_project(root, name, package, language="java"):
-    if not re.fullmatch(r"[A-Za-z_]\w*(\.[A-Za-z_]\w*)+", package):
-        raise ValueError("Package must look like com.example.myapp.")
-
-    package_dir = root / "app" / "src" / "main"
-    package_dir = package_dir / ("java" if language == "java" else "kotlin")
-    for part in package.split("."):
-        package_dir = package_dir / part
-    package_dir.mkdir(parents=True, exist_ok=True)
-
-    safe_label = name.replace("&", "&amp;").replace("<", "&lt;")
-    (root / "settings.gradle").write_text(
-        "pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }\n"
-        "dependencyResolutionManagement { repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS); repositories { google(); mavenCentral() } }\n"
-        f"rootProject.name = '{root.name}'\ninclude ':app'\n",
-        encoding="utf-8"
-    )
-    (root / "build.gradle").write_text(
-        "plugins { id 'com.android.application' version '8.7.3' apply false }\n",
-        encoding="utf-8"
-    )
-    (root / "gradle.properties").write_text(
-        "org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8\n"
-        "android.useAndroidX=true\n"
-        "android.nonTransitiveRClass=true\n",
-        encoding="utf-8"
-    )
-    appdir = root / "app"
-    appdir.mkdir(exist_ok=True)
-    (appdir / "build.gradle").write_text(
-        "plugins { id 'com.android.application' }\n"
-        "android {\n"
-        f"    namespace '{package}'\n"
-        "    compileSdk 35\n"
-        "    defaultConfig {\n"
-        f"        applicationId '{package}'\n"
-        "        minSdk 23\n"
-        "        targetSdk 35\n"
-        "        versionCode 1\n"
-        "        versionName '1.0'\n"
-        "    }\n"
-        "}\n",
-        encoding="utf-8"
-    )
-
-    main = root / "app" / "src" / "main"
-    (main / "res" / "values").mkdir(parents=True, exist_ok=True)
-    (main / "AndroidManifest.xml").write_text(
-        '<?xml version="1.0" encoding="utf-8"?>\n'
-        '<manifest xmlns:android="http://schemas.android.com/apk/res/android">\n'
-        ' <application android:label="' + safe_label +
-        '" android:theme="@android:style/Theme.Material.Light.NoActionBar">\n'
-        '  <activity android:name=".MainActivity" android:exported="true">\n'
-        '   <intent-filter><action android:name="android.intent.action.MAIN"/>\n'
-        '   <category android:name="android.intent.category.LAUNCHER"/></intent-filter>\n'
-        '  </activity>\n'
-        ' </application>\n</manifest>\n',
-        encoding="utf-8"
-    )
-    (main / "res" / "values" / "strings.xml").write_text(
-        '<?xml version="1.0" encoding="utf-8"?>\n'
-        '<resources><string name="app_name">' + safe_label +
-        '</string></resources>\n',
-        encoding="utf-8"
-    )
-
-    if language == "java":
-        src = (
-            f"package {package};\n"
-            "import android.app.Activity;\n"
-            "import android.os.Bundle;\n"
-            "import android.graphics.Color;\n"
-            "import android.view.Gravity;\n"
-            "import android.widget.LinearLayout;\n"
-            "import android.widget.TextView;\n"
-            "public class MainActivity extends Activity {\n"
-            " @Override public void onCreate(Bundle b) {\n"
-            "  super.onCreate(b);\n"
-            "  LinearLayout l=new LinearLayout(this);\n"
-            "  l.setGravity(Gravity.CENTER);\n"
-            "  l.setBackgroundColor(Color.rgb(10,16,30));\n"
-            "  TextView t=new TextView(this);\n"
-            f"  t.setText({json.dumps(name + ' is ready')});\n"
-            "  t.setTextColor(Color.WHITE);t.setTextSize(24);\n"
-            "  l.addView(t);setContentView(l);\n"
-            " }\n}\n"
-        )
-        (package_dir / "MainActivity.java").write_text(src, encoding="utf-8")
-    else:
-        src = (
-            f"package {package}\n"
-            "import android.app.Activity\n"
-            "import android.os.Bundle\n"
-            "import android.graphics.Color\n"
-            "import android.view.Gravity\n"
-            "import android.widget.LinearLayout\n"
-            "import android.widget.TextView\n"
-            "class MainActivity : Activity() {\n"
-            " override fun onCreate(b: Bundle?) {\n"
-            "  super.onCreate(b)\n"
-            "  val l=LinearLayout(this)\n"
-            "  l.gravity=Gravity.CENTER\n"
-            "  l.setBackgroundColor(Color.rgb(10,16,30))\n"
-            "  val t=TextView(this)\n"
-            f"  t.text={json.dumps(name + ' is ready')}\n"
-            "  t.setTextColor(Color.WHITE);t.textSize=24f\n"
-            "  l.addView(t);setContentView(l)\n"
-            " }\n}\n"
-        )
-        (package_dir / "MainActivity.kt").write_text(src, encoding="utf-8")
-
-
-HTML = r"""<!doctype html>
+# ==================== HOME HTML ====================
+HOME_HTML = r'''<!DOCTYPE html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1">
-<meta name="theme-color" content="#080d18">
-<title>Zihad Mobile IDE Ultra Pro Max</title>
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/material-darker.min.css">
-<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/dialog/dialog.min.css">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>Zihad Mobile IDE</title>
 <style>
-:root{color-scheme:dark;--bg:#080d18;--panel:#101827;--panel2:#151f32;--line:#26354e;--text:#eef4ff;--muted:#8d9db8;--blue:#65a7ff;--purple:#a88aff;--green:#4be0ad;--red:#ff718b;--gold:#f3c76e}
-*{box-sizing:border-box}body{margin:0;background:radial-gradient(ellipse at top left,#1a2b50 0,#080d18 48%,#070a12 100%);color:var(--text);font:14px system-ui,-apple-system,"Segoe UI",sans-serif;min-height:100vh}button,input,select,textarea{font:inherit}button{color:var(--text);background:#1a2841;border:1px solid #304360;border-radius:10px;padding:9px 12px;cursor:pointer;touch-action:manipulation;transition:background .15s,border .15s,transform .15s}button:active{transform:scale(.97)}button:hover{border-color:var(--blue);background:#243756}.primary{background:linear-gradient(120deg,#3678ec,#8257e9);border:0}.danger{color:#ff9cac}.muted{color:var(--muted)}.tiny{font-size:11px}.hidden{display:none!important}.top{position:sticky;top:0;z-index:20;background:#080d18ed;backdrop-filter:blur(16px);border-bottom:1px solid var(--line);padding:10px 13px;display:flex;align-items:center;gap:10px}.logo{width:39px;height:39px;border-radius:13px;display:grid;place-items:center;background:linear-gradient(135deg,#3988ff,#a16bff);font-size:22px}.brand{font-weight:850;letter-spacing:.2px}.brand small{display:block;font-weight:500;color:var(--muted);font-size:10px}.online{margin-left:auto;color:#a8f4d9;font-size:11px;display:flex;align-items:center;gap:6px}.dot{width:8px;height:8px;background:var(--green);border-radius:50%;box-shadow:0 0 10px #4be0ad88}
-.wrap{max-width:1500px;margin:auto;padding:12px;display:grid;grid-template-columns:225px minmax(0,1fr);gap:12px}.panel{min-width:0;background:linear-gradient(155deg,#121c2d,#0c1422);border:1px solid var(--line);border-radius:15px;overflow:hidden;box-shadow:0 10px 34px #0002}.head{padding:11px 12px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:8px;font-weight:750}.spacer{flex:1}.side{position:sticky;top:70px;align-self:start;max-height:calc(100vh - 80px);overflow:auto}.pad{padding:10px}.select,.field{width:100%;min-width:0;background:#080f1b;border:1px solid var(--line);color:var(--text);padding:10px;border-radius:9px;outline:none}.field:focus,.select:focus{border-color:var(--blue)}.navgrid{display:grid;grid-template-columns:1fr 1fr;gap:4px;margin-top:8px}.nav{width:100%;background:transparent;border-color:transparent;text-align:left;padding:10px 8px;display:flex;gap:8px;align-items:center}.nav.active{background:#223453;border-color:#3c5681}.ico{width:20px;text-align:center;color:var(--blue)}.section{font-size:10px;letter-spacing:1.4px;color:#8091ad;font-weight:800;padding:12px 7px 5px}.stats{display:grid;grid-template-columns:1fr 1fr;gap:7px;margin-top:10px}.stat{background:#0a1322;border:1px solid #24334b;border-radius:10px;padding:9px}.stat strong{display:block;font-size:16px}.stat span{color:var(--muted);font-size:10px}
-.hero{padding:16px;background:linear-gradient(110deg,#172a4a,#191a38 65%,#291a43)}.hero h1{font-size:20px;margin:0 0 5px}.hero p{color:#b3c2dc;margin:0;font-size:12px;line-height:1.6}.actions{display:flex;gap:6px;flex-wrap:wrap;margin-top:12px}.actions button{font-size:12px;padding:8px 10px}.workspace{display:grid;gap:11px;margin-top:11px}.toolbar{display:flex;gap:5px;flex-wrap:wrap;padding:8px;border-bottom:1px solid var(--line);background:#0c1422}.toolbar button{padding:7px 9px;font-size:11px}.tabs{display:flex;overflow:auto;background:#090f1b;border-bottom:1px solid var(--line)}.tab{white-space:nowrap;border:0;border-radius:0;border-right:1px solid #1d2b42;background:transparent;color:var(--muted);font-size:12px;padding:10px 12px}.tab.active{background:#17243a;color:white;border-bottom:2px solid var(--blue)}.cmwrap{height:39vh;min-height:230px;max-height:620px}.CodeMirror{height:100%;font-size:13px;line-height:1.6;background:#0a111d}.CodeMirror-gutters{background:#0a111d;border-color:#24334b}.CodeMirror-linenumber{color:#62738d}.foot{padding:8px 10px;border-top:1px solid var(--line);display:flex;gap:8px;justify-content:space-between;flex-wrap:wrap;font-size:10px;color:var(--muted)}.lower{display:grid;grid-template-columns:1fr 1fr;gap:11px}.boxbody{padding:10px;min-width:0}.filetools{display:flex;gap:6px;margin-bottom:8px}.filelist{max-height:310px;overflow:auto}.fileitem{display:flex;gap:7px;align-items:center;padding:9px 6px;border-radius:8px;cursor:pointer;border:1px solid transparent}.fileitem:hover,.fileitem.selected{background:#1b2a43;border-color:#2e4568}.fname{flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.fsize{color:var(--muted);font-size:10px;white-space:nowrap}.console{height:160px;overflow:auto;background:#070c14;color:#c7d6ef;border-radius:9px;padding:10px;font:12px/1.55 ui-monospace,monospace;white-space:pre-wrap;overflow-wrap:anywhere}.good{color:var(--green)}.bad{color:var(--red)}.terminalrow{display:flex;gap:6px;margin-top:7px}.terminalrow .field{flex:1}.pill{border:1px solid #344968;background:#16243a;border-radius:99px;padding:4px 8px;font-size:10px;color:#c2d3ef}.modalback{position:fixed;inset:0;z-index:90;background:#02050bdc;display:grid;place-items:center;padding:15px}.modal{width:min(520px,100%);max-height:90vh;overflow:auto;background:#111b2b;border:1px solid #34445f;border-radius:17px;padding:16px;box-shadow:0 25px 80px #0009}.modal h3{margin:0 0 12px}.modalactions{display:flex;justify-content:flex-end;gap:7px;margin-top:12px}.modal .field,.modal .select{margin:5px 0 10px}.toast{position:fixed;z-index:100;bottom:20px;left:50%;transform:translate(-50%,15px);opacity:0;pointer-events:none;background:#1b2c46;border:1px solid #45618a;border-radius:12px;padding:11px 15px;transition:.2s;max-width:92vw;box-shadow:0 10px 35px #0008}.toast.show{opacity:1;transform:translate(-50%,0)}.preview{width:100%;height:42vh;min-height:270px;border:0;background:white;border-radius:8px}.progress{height:7px;background:#26344b;border-radius:8px;overflow:hidden;margin:10px 0}.progress i{display:block;width:0;height:100%;background:linear-gradient(90deg,#4d8cff,#b18bff);transition:width .25s}.badge{font-size:10px;padding:4px 7px;border-radius:7px;background:#172640;color:#a9caff}
-@media(min-width:1000px){.cmwrap{height:48vh}.workspace{gap:12px}}
-@media(max-width:760px){.wrap{display:block;padding:8px}.side{position:static;max-height:none;margin-bottom:9px}.pad{padding:8px}.navgrid{grid-template-columns:repeat(4,1fr)}.nav{flex-direction:column;justify-content:center;text-align:center;gap:3px;padding:7px 2px;font-size:10px}.ico{font-size:16px}.stats{display:none}.section{padding-top:8px}.hero{padding:13px}.hero h1{font-size:18px}.workspace{margin-top:9px;gap:9px}.cmwrap{height:39vh;min-height:220px}.lower{grid-template-columns:1fr}.top{padding:9px}.online{font-size:0}.online .dot{width:9px;height:9px}.brand small{font-size:9px}.toolbar{gap:4px}.toolbar button{padding:7px;font-size:10px}.filetools{flex-wrap:wrap}.filetools .field{flex-basis:100%}.console{height:150px}.preview{height:48vh}}
+:root {
+  --bg: #070b14;
+  --card: rgba(17,24,39,0.75);
+  --border: rgba(55,65,81,0.6);
+  --primary: #3b82f6;
+  --primary-glow: rgba(59,130,246,0.35);
+  --success: #22c55e;
+  --danger: #ef4444;
+  --text: #f1f5f9;
+  --muted: #94a3b8;
+  --radius: 18px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+body{
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;
+  min-height: 100vh;
+  background-image:
+    radial-gradient(ellipse at 20% 20%, rgba(59,130,246,0.12) 0%, transparent 50%),
+    radial-gradient(ellipse at 80% 80%, rgba(139,92,246,0.10) 0%, transparent 50%);
+}
+header{
+  padding: 18px 20px;
+  background: rgba(15,23,42,0.85);
+  backdrop-filter: blur(20px);
+  border-bottom: 1px solid var(--border);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  position: sticky;
+  top: 0;
+  z-index: 50;
+}
+header h1{
+  font-size: 1.25rem;
+  font-weight: 700;
+  background: linear-gradient(135deg,#60a5fa,#a78bfa);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+.container{padding: 20px; max-width: 720px; margin: 0 auto;}
+.card{
+  background: var(--card);
+  backdrop-filter: blur(16px);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 20px;
+  margin-bottom: 18px;
+  box-shadow: 0 8px 32px rgba(0,0,0,0.3);
+  animation: fadeUp 0.45s ease both;
+}
+@keyframes fadeUp{
+  from{opacity:0;transform:translateY(16px)}
+  to{opacity:1;transform:translateY(0)}
+}
+.card:nth-child(2){animation-delay:0.08s}
+.card:nth-child(3){animation-delay:0.16s}
+h2{font-size:1.05rem;margin-bottom:12px;color:#e2e8f0}
+.status-dot{
+  display:inline-block;width:9px;height:9px;border-radius:50%;
+  background:var(--success);margin-right:8px;
+  box-shadow:0 0 10px var(--success);
+  animation: pulse 2s infinite;
+}
+@keyframes pulse{
+  0%,100%{opacity:1} 50%{opacity:0.5}
+}
+button{
+  border:0;border-radius:12px;padding:11px 16px;margin:4px;
+  font-weight:600;font-size:13px;cursor:pointer;
+  transition: all 0.2s cubic-bezier(0.4,0,0.2,1);
+  color:#fff;
+}
+button:active{transform:scale(0.96)}
+.btn-primary{background:linear-gradient(135deg,#3b82f6,#2563eb);box-shadow:0 4px 15px var(--primary-glow)}
+.btn-primary:hover{box-shadow:0 6px 20px var(--primary-glow)}
+.btn-success{background:linear-gradient(135deg,#22c55e,#16a34a)}
+.btn-danger{background:linear-gradient(135deg,#ef4444,#dc2626)}
+.btn-ghost{background:rgba(55,65,81,0.6);border:1px solid var(--border)}
+input,select{
+  width:100%;padding:14px 16px;margin:8px 0;
+  border-radius:12px;border:1px solid var(--border);
+  background:rgba(8,15,28,0.8);color:var(--text);
+  font-size:14px;outline:none;transition:border 0.2s;
+}
+input:focus,select:focus{border-color:var(--primary);box-shadow:0 0 0 3px var(--primary-glow)}
+.project{
+  background:rgba(8,15,28,0.6);
+  border:1px solid var(--border);
+  border-radius:14px;padding:16px;margin:10px 0;
+  display:flex;justify-content:space-between;align-items:center;
+  gap:12px;flex-wrap:wrap;
+  transition: all 0.25s;
+}
+.project:hover{
+  border-color:rgba(59,130,246,0.5);
+  transform:translateY(-2px);
+  box-shadow:0 8px 24px rgba(0,0,0,0.25);
+}
+.project-info{flex:1;min-width:160px}
+.project b{font-size:15px}
+.project small{color:var(--muted);font-size:12px}
+.badge{
+  display:inline-block;padding:3px 10px;border-radius:20px;
+  font-size:11px;font-weight:600;margin-left:6px;
+  background:rgba(59,130,246,0.2);color:#93c5fd;
+}
+.hidden{display:none!important}
+#message{
+  padding:12px 16px;border-radius:12px;margin-top:12px;
+  display:none;font-size:13px;font-weight:500;
+}
+.toast-container{
+  position:fixed;bottom:24px;left:50%;transform:translateX(-50%);
+  z-index:9999;display:flex;flex-direction:column;gap:8px;
+  pointer-events:none;
+}
+.toast{
+  background:rgba(15,23,42,0.95);backdrop-filter:blur(12px);
+  border:1px solid var(--border);color:#fff;
+  padding:12px 20px;border-radius:14px;font-size:13px;
+  box-shadow:0 10px 40px rgba(0,0,0,0.4);
+  animation: toastIn 0.35s ease;
+  pointer-events:auto;
+}
+.toast.success{border-color:rgba(34,197,94,0.5)}
+.toast.error{border-color:rgba(239,68,68,0.5)}
+@keyframes toastIn{
+  from{opacity:0;transform:translateY(20px)}
+  to{opacity:1;transform:translateY(0)}
+}
+.fab{
+  position:fixed;bottom:28px;right:24px;
+  width:58px;height:58px;border-radius:18px;
+  background:linear-gradient(135deg,#3b82f6,#8b5cf6);
+  box-shadow:0 8px 28px rgba(59,130,246,0.45);
+  display:flex;align-items:center;justify-content:center;
+  font-size:28px;color:#fff;border:0;cursor:pointer;
+  z-index:40;transition:all 0.25s;
+}
+.fab:active{transform:scale(0.92)}
+.template-grid{
+  display:grid;grid-template-columns:1fr 1fr;gap:10px;margin:12px 0;
+}
+.template-card{
+  background:rgba(8,15,28,0.7);border:2px solid var(--border);
+  border-radius:14px;padding:14px;text-align:center;cursor:pointer;
+  transition:all 0.2s;font-size:13px;
+}
+.template-card:hover,.template-card.active{
+  border-color:var(--primary);background:rgba(59,130,246,0.12);
+}
+.template-card span{font-size:22px;display:block;margin-bottom:6px}
 </style>
 </head>
 <body>
-<header class="top">
- <div class="logo">⚡</div>
- <div class="brand">ZIHAD MOBILE IDE <small>ULTRA PRO MAX · MOBILE DEVELOPMENT</small></div>
- <div class="online"><span class="dot"></span> LOCAL SERVER ONLINE</div>
+<header>
+  <h1>⚡ Zihad IDE v9</h1>
+  <button class="btn-success" onclick="showCreate()">+ New</button>
 </header>
-<div class="wrap">
-<aside class="panel side">
- <div class="head">◈ Workspace <span class="spacer"></span><button onclick="loadProjects()">↻</button></div>
- <div class="pad">
-  <select id="projectSelect" class="select" onchange="switchProject(this.value)"></select>
-  <div class="navgrid">
-   <button class="nav active" data-page="editor" onclick="page('editor',this)"><span class="ico">⌘</span>Editor</button>
-   <button class="nav" data-page="files" onclick="page('files',this)"><span class="ico">▤</span>Files</button>
-   <button class="nav" data-page="preview" onclick="page('preview',this)"><span class="ico">◉</span>Preview</button>
-   <button class="nav" data-page="build" onclick="page('build',this)"><span class="ico">⚙</span>Build</button>
+
+<div class="container">
+  <div class="card">
+    <h2><span class="status-dot"></span>System Status</h2>
+    <p id="status" style="color:var(--muted);font-size:13px">Checking...</p>
   </div>
-  <div class="section">PROJECT TOOLS</div>
-  <button class="nav" onclick="newProject()">＋ New project</button>
-  <button class="nav" onclick="newFile()">▧ New file</button>
-  <button class="nav" onclick="newFolder()">▣ New folder</button>
-  <button class="nav" onclick="runCode()">▶ Run code</button>
-  <button class="nav" onclick="checkTools()">⌕ Compiler check</button>
-  <button class="nav" onclick="backupProject()">⤓ Backup project</button>
-  <button class="nav" onclick="restoreBackup()">⤴ Restore backup</button>
-  <button class="nav" onclick="openSettings()">⚙ Settings</button>
-  <button class="nav" onclick="showPanel('terminal')">$_ Terminal</button>
-  <button class="nav" onclick="showPanel('api')">⇄ API tester</button>
-  <button class="nav" onclick="showPanel('database')">▦ SQLite tools</button>
-  <button class="nav" onclick="showPanel('git')">⑂ Git tools</button>
-  <button class="nav" onclick="showPanel('ai')">✦ AI assistant</button>
-  <div class="stats"><div class="stat"><strong id="fileCount">0</strong><span>FILES</span></div><div class="stat"><strong id="projectSize">0 B</strong><span>PROJECT SIZE</span></div></div>
-  <div class="section">WORKSPACE STATUS</div><div class="tiny muted" id="status">Loading…</div>
- </div>
-</aside>
-<main>
- <section class="panel hero">
-  <h1 id="heroTitle">Your coding studio, in your pocket.</h1>
-  <p>Write code, manage files, preview web projects, use Termux tools and build Android apps from your phone.</p>
-  <div class="actions"><button class="primary" onclick="newProject()">＋ Create project</button><button onclick="runCode()">▶ Run</button><button onclick="saveFile()">💾 Save</button><button onclick="page('preview')">◉ Preview</button><button onclick="page('build')">Build APK</button></div>
- </section>
- <div class="workspace">
-  <section class="panel" id="editorPanel">
-   <div class="head">⌘ Code Editor <span class="badge" id="languageBadge">TEXT</span><span class="spacer"></span><span id="saveStatus" class="tiny muted">Ready</span></div>
-   <div class="toolbar">
-    <button onclick="saveFile()">💾 Save</button><button onclick="undo()">↶ Undo</button><button onclick="redo()">↷ Redo</button><button onclick="findText()">⌕ Find</button><button onclick="replaceText()">⇄ Replace</button><button onclick="cutAll()">✂ Cut all</button><button onclick="selectAll()">Select all</button><button onclick="newFile()">＋ File</button><button onclick="runCode()">▶ Run</button>
-   </div>
-   <div id="tabs" class="tabs"></div>
-   <div class="cmwrap"><textarea id="source"></textarea></div>
-   <div class="foot"><span id="cursor">Ln 1, Col 1</span><span id="lineStats">0 lines · 0 chars</span><span id="sizeLabel">0 B</span><span id="modeLabel">Plain text</span></div>
-  </section>
-  <section class="panel hidden" id="filesPanel">
-   <div class="head">▤ File Manager <span class="spacer"></span><button onclick="refreshTree()">↻ Refresh</button></div>
-   <div class="boxbody"><div class="filetools"><input id="fileSearch" class="field" placeholder="Search files and folders…" oninput="renderFiles()"><button onclick="newFolder()">＋ Folder</button></div><div id="fileList" class="filelist"></div><div class="tiny muted" id="fileSummary"></div></div>
-  </section>
-  <section class="panel hidden" id="previewPanel">
-   <div class="head">◉ Live Preview <span class="spacer"></span><button onclick="reloadPreview()">↻ Reload</button><button onclick="openPreview()">↗ Open</button></div>
-   <div class="boxbody"><div class="terminalrow"><input id="previewPath" class="field" value="index.html" placeholder="Relative HTML file path"><button class="primary" onclick="reloadPreview()">Preview</button></div><iframe id="previewFrame" class="preview" sandbox="allow-scripts allow-forms allow-modals" title="Web project preview"></iframe><p class="tiny muted">Web preview runs in a sandbox. Android native screens require a real APK build.</p></div>
-  </section>
-  <section class="panel hidden" id="buildPanel">
-   <div class="head">⚙ Build Center <span class="spacer"></span><span class="badge">GRADLE / APK</span></div>
-   <div class="boxbody"><p class="muted">Build a debug APK from an Android Gradle project.</p><div class="progress"><i id="buildProgress"></i></div><div id="buildStatus" class="tiny muted">Ready</div><div class="actions"><button class="primary" onclick="buildAPK()">▶ Build debug APK</button><button onclick="checkTools()">Check tools</button><button onclick="backupProject()">Backup first</button></div><div id="buildLog" class="console">Build output will appear here.</div><div id="apkLink"></div></div>
-  </section>
-  <section class="panel hidden" id="terminalPanel">
-   <div class="head">$_ Terminal <span class="spacer"></span><span class="badge">PROJECT ROOT</span></div>
-   <div class="boxbody"><div id="terminalOutput" class="console">Terminal ready. Commands run inside the selected project directory.</div><div class="terminalrow"><input id="commandInput" class="field" placeholder="e.g. python main.py" onkeydown="if(event.key==='Enter')runTerminal()"><button class="primary" onclick="runTerminal()">Run</button></div><div class="actions"><button onclick="quick('pwd')">pwd</button><button onclick="quick('ls -lah')">ls -lah</button><button onclick="quick('python --version')">Python</button><button onclick="quick('gradle --version')">Gradle</button></div></div>
-  </section>
-  <section class="panel hidden" id="apiPanel">
-   <div class="head">⇄ HTTP API Tester</div>
-   <div class="boxbody"><select id="apiMethod" class="select"><option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option><option>PATCH</option></select><p><input id="apiUrl" class="field" placeholder="https://example.com/api"></p><textarea id="apiBody" class="field" rows="4" placeholder='JSON body for POST/PUT/PATCH'></textarea><button class="primary" onclick="testAPI()">Send request</button><div id="apiResult" class="console" style="margin-top:9px">Response appears here. Cross-origin restrictions may apply.</div></div>
-  </section>
-  <section class="panel hidden" id="databasePanel">
-   <div class="head">▦ SQLite Database Browser</div>
-   <div class="boxbody"><p class="tiny muted">Select a SQLite database inside the current project. Queries are limited to read-only SELECT/PRAGMA/EXPLAIN operations.</p><input id="dbPath" class="field" placeholder="database.db"><textarea id="dbQuery" class="field" rows="3">SELECT name FROM sqlite_master WHERE type='table';</textarea><button class="primary" onclick="queryDatabase()">Run read-only query</button><div id="dbResult" class="console" style="margin-top:9px">Database results appear here.</div></div>
-  </section>
-  <section class="panel hidden" id="gitPanel">
-   <div class="head">⑂ Git Tools</div>
-   <div class="boxbody"><div class="actions"><button onclick="gitAction('status')">Status</button><button onclick="gitAction('diff')">Diff</button><button onclick="gitAction('log')">Log</button><button onclick="gitAction('branches')">Branches</button></div><input id="gitMessage" class="field" placeholder="Commit message" style="margin-top:8px"><div class="actions"><button onclick="gitAction('commit')">Commit tracked changes</button><button onclick="gitAction('pull')">Pull</button><button onclick="gitAction('push')">Push</button></div><div id="gitResult" class="console" style="margin-top:9px">Git output appears here.</div><p class="tiny muted">Review remotes and changes before pull/push. Credentials are managed by your Git setup.</p></div>
-  </section>
-  <section class="panel hidden" id="aiPanel">
-   <div class="head">✦ AI Coding Assistant</div>
-   <div class="boxbody"><p class="tiny muted">Configure an OpenAI-compatible API endpoint in Settings. Never share your API key. AI calls may incur provider charges.</p><textarea id="aiPrompt" class="field" rows="4" placeholder="Explain this code, fix an error, or suggest an improvement…"></textarea><div class="actions"><button class="primary" onclick="askAI('ask')">Ask AI</button><button onclick="askAI('explain')">Explain open file</button><button onclick="askAI('fix')">Suggest a fix</button></div><div id="aiResult" class="console" style="margin-top:9px">AI response appears here.</div><button onclick="applyAI()" style="margin-top:8px">Replace editor with response</button><p class="tiny muted">AI output is a suggestion. Review it before replacing or running code.</p></div>
-  </section>
-  <section class="panel" id="outputPanel">
-   <div class="head">◈ Output & Diagnostics <span class="spacer"></span><button onclick="clearOutput()">Clear</button><button onclick="checkTools()">Check tools</button></div>
-   <div class="boxbody"><div id="output" class="console">Welcome to Zihad Mobile IDE Ultra Pro Max.</div></div>
-  </section>
- </div>
-</main>
+
+  <div class="card hidden" id="createBox">
+    <h2>📱 New Android Project</h2>
+    <input id="appName" placeholder="App Name (e.g. MyApp)">
+    <input id="packageName" placeholder="com.zihad.myapp">
+    <select id="language">
+      <option value="java">Java</option>
+      <option value="kotlin">Kotlin</option>
+    </select>
+    <p style="font-size:13px;color:var(--muted);margin:10px 0 6px">Template</p>
+    <div class="template-grid">
+      <div class="template-card active" data-t="empty" onclick="selectTemplate(this)">
+        <span>📄</span>Empty
+      </div>
+      <div class="template-card" data-t="login" onclick="selectTemplate(this)">
+        <span>🔐</span>Login
+      </div>
+      <div class="template-card" data-t="list" onclick="selectTemplate(this)">
+        <span>📋</span>List
+      </div>
+      <div class="template-card" data-t="empty" onclick="selectTemplate(this)">
+        <span>🧭</span>Basic
+      </div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:14px">
+      <button class="btn-success" style="flex:1" onclick="createProject()">🚀 Create</button>
+      <button class="btn-ghost" onclick="hideCreate()">Cancel</button>
+    </div>
+    <div id="message"></div>
+  </div>
+
+  <div class="card">
+    <h2>📂 Projects</h2>
+    <div id="projects">Loading...</div>
+  </div>
 </div>
-<div id="modalBack" class="modalback hidden"><div class="modal"><h3 id="modalTitle">Dialog</h3><div id="modalBody"></div><div class="modalactions"><button onclick="closeModal()">Cancel</button><button class="primary" id="modalOK">Continue</button></div></div></div>
-<div id="toast" class="toast"></div>
+
+<button class="fab" onclick="showCreate()">+</button>
+<div class="toast-container" id="toasts"></div>
+
+<script>
+let selectedTemplate = "empty";
+function selectTemplate(el){
+  document.querySelectorAll(".template-card").forEach(c=>c.classList.remove("active"));
+  el.classList.add("active");
+  selectedTemplate = el.dataset.t;
+}
+function showCreate(){document.getElementById("createBox").classList.remove("hidden");window.scrollTo({top:0,behavior:"smooth"});}
+function hideCreate(){document.getElementById("createBox").classList.add("hidden");}
+function toast(msg,type="success"){
+  const c=document.getElementById("toasts");
+  const t=document.createElement("div");
+  t.className="toast "+type;
+  t.innerText=msg;
+  c.appendChild(t);
+  setTimeout(()=>t.remove(),3200);
+}
+async function status(){
+  try{
+    const r=await fetch("/api/status");
+    const d=await r.json();
+    document.getElementById("status").innerText=
+      `Port ${d.port}  •  ${d.projects} projects  •  ${d.language_count} languages`;
+  }catch(e){document.getElementById("status").innerText="Server offline";}
+}
+async function loadProjects(){
+  try{
+    const r=await fetch("/api/projects");
+    const d=await r.json();
+    const box=document.getElementById("projects");
+    if(!d.projects.length){
+      box.innerHTML='<p style="color:var(--muted);text-align:center;padding:20px">No projects yet. Tap + to create one.</p>';
+      return;
+    }
+    box.innerHTML="";
+    d.projects.forEach(p=>{
+      const div=document.createElement("div");
+      div.className="project";
+      div.innerHTML=`
+        <div class="project-info">
+          <b>📱 ${esc(p.name)}</b>
+          <span class="badge">${esc(p.language||"?")}</span><br>
+          <small>${esc(p.package||"")}</small>
+        </div>
+        <div>
+          <button class="btn-primary" onclick="location.href='/project/${encodeURIComponent(p.name)}'">Open</button>
+          <button class="btn-danger" onclick="deleteProject('${esc(p.name)}')">🗑</button>
+        </div>`;
+      box.appendChild(div);
+    });
+  }catch(e){document.getElementById("projects").innerText="Load error";}
+}
+async function createProject(){
+  const n=document.getElementById("appName").value.trim();
+  const p=document.getElementById("packageName").value.trim();
+  const l=document.getElementById("language").value;
+  if(!n||!p){msg("Name & Package required",1);return;}
+  try{
+    const r=await fetch("/api/projects",{
+      method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({name:n,package:p,language:l,template:selectedTemplate})
+    });
+    const d=await r.json();
+    if(!r.ok){msg(d.error||"Failed",1);return;}
+    msg("✓ Project created!",0);
+    toast("Project created successfully");
+    document.getElementById("appName").value="";
+    document.getElementById("packageName").value="";
+    hideCreate();
+    loadProjects();status();
+  }catch(e){msg("Error: "+e,1);}
+}
+async function deleteProject(name){
+  if(!confirm("Delete project '"+name+"'?\nThis cannot be undone."))return;
+  try{
+    const r=await fetch("/api/projects/"+encodeURIComponent(name),{method:"DELETE"});
+    const d=await r.json();
+    if(!r.ok){toast(d.error||"Delete failed","error");return;}
+    toast("Deleted: "+name);
+    loadProjects();status();
+  }catch(e){toast("Error: "+e,"error");}
+}
+function msg(t,e){
+  const m=document.getElementById("message");
+  m.style.display="block";m.innerText=t;
+  m.style.background=e?"rgba(127,29,29,0.6)":"rgba(20,83,45,0.6)";
+}
+function esc(t){const d=document.createElement("div");d.innerText=t;return d.innerHTML;}
+status();loadProjects();
+</script>
+</body>
+</html>
+'''
+
+# ==================== IDE HTML ====================
+IDE_HTML = r'''<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
+<title>__NAME__ - Zihad IDE</title>
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/dracula.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/dialog/dialog.min.css">
+<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/fold/foldgutter.min.css">
+<style>
+:root{
+  --bg:#070b14;--card:#111827;--border:#1f2937;--primary:#3b82f6;
+  --text:#e2e8f0;--muted:#94a3b8;--success:#22c55e;--danger:#ef4444;
+  --radius:14px;--bottom-h:62px;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%;background:var(--bg);color:var(--text);
+  font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;font-size:14px;overflow:hidden}
+header{
+  padding:8px 12px;background:rgba(15,23,42,0.92);backdrop-filter:blur(16px);
+  border-bottom:1px solid var(--border);display:flex;justify-content:space-between;
+  align-items:center;gap:8px;position:relative;z-index:30;
+}
+header h2{font-size:14px;font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;flex:1}
+.btn{
+  border:0;border-radius:10px;padding:7px 11px;font-weight:600;font-size:12px;
+  color:#fff;cursor:pointer;transition:all .18s;background:#374151;
+}
+.btn:active{transform:scale(.95)}
+.btn-primary{background:linear-gradient(135deg,#3b82f6,#2563eb)}
+.btn-success{background:linear-gradient(135deg,#22c55e,#16a34a)}
+.btn-danger{background:linear-gradient(135deg,#ef4444,#dc2626)}
+.btn-orange{background:linear-gradient(135deg,#f59e0b,#d97706)}
+.btn-purple{background:linear-gradient(135deg,#8b5cf6,#7c3aed)}
+.badge{display:inline-block;padding:2px 8px;border-radius:20px;font-size:11px;font-weight:700}
+.badge.ok{background:rgba(34,197,94,.2);color:#4ade80}
+.badge.err{background:rgba(239,68,68,.25);color:#fca5a5}
+
+/* Bottom Nav */
+.bottom-nav{
+  position:fixed;bottom:0;left:0;right:0;height:var(--bottom-h);
+  background:rgba(15,23,42,0.95);backdrop-filter:blur(20px);
+  border-top:1px solid var(--border);display:flex;z-index:40;
+  padding-bottom:env(safe-area-inset-bottom);
+}
+.nav-item{
+  flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;
+  gap:3px;font-size:10px;color:var(--muted);cursor:pointer;transition:color .2s;
+  -webkit-tap-highlight-color:transparent;
+}
+.nav-item.active{color:#60a5fa}
+.nav-item span{font-size:20px;line-height:1}
+
+/* Panels */
+.main-area{height:calc(100vh - 52px - var(--bottom-h));overflow:hidden;position:relative}
+.panel{display:none;height:100%;overflow-y:auto;padding:12px;padding-bottom:20px}
+.panel.active{display:block;animation:fadeIn .25s ease}
+@keyframes fadeIn{from{opacity:0}to{opacity:1}}
+
+.breadcrumb{background:rgba(8,15,28,.7);padding:9px 12px;border-radius:10px;
+  margin-bottom:10px;font-size:12px;word-break:break-all;line-height:1.5}
+.breadcrumb span{color:#60a5fa;cursor:pointer}
+.file-item{
+  background:var(--card);padding:12px;margin:5px 0;border-radius:12px;
+  border:1px solid var(--border);cursor:pointer;display:flex;align-items:center;gap:10px;
+  transition:all .18s;
+}
+.file-item:hover,.file-item:active{background:#1f2937;border-color:#374151}
+.file-item .name{flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.file-item.folder .name{color:#fbbf24;font-weight:600}
+.file-item.file .name{color:#93c5fd}
+.toolbar{display:flex;gap:6px;margin-bottom:12px;flex-wrap:wrap}
+
+/* Editor */
+#editor-box{
+  position:fixed;inset:0;background:var(--bg);z-index:100;
+  display:none;flex-direction:column;
+}
+#editor-header{
+  padding:7px 10px;background:rgba(15,23,42,.95);border-bottom:1px solid var(--border);
+  display:flex;align-items:center;gap:6px;flex-wrap:wrap;
+}
+.tab-bar-editor{
+  display:flex;overflow-x:auto;background:#0b1220;border-bottom:1px solid var(--border);
+  scrollbar-width:none;
+}
+.tab-bar-editor::-webkit-scrollbar{display:none}
+.editor-tab{
+  padding:9px 14px;font-size:12px;white-space:nowrap;cursor:pointer;
+  border-bottom:2px solid transparent;color:var(--muted);display:flex;align-items:center;gap:6px;
+}
+.editor-tab.active{color:#60a5fa;border-bottom-color:#3b82f6;background:rgba(59,130,246,.08)}
+.editor-tab .close-tab{opacity:.5;font-size:14px;padding:0 2px}
+.editor-tab .close-tab:hover{opacity:1;color:#f87171}
+#editor-toolbar{
+  padding:5px 8px;background:#0b1220;border-bottom:1px solid var(--border);
+  display:flex;gap:4px;flex-wrap:wrap;align-items:center;
+}
+#editor-toolbar button{
+  background:#1f2937;color:#e2e8f0;border:0;border-radius:7px;
+  padding:6px 10px;font-size:11px;font-weight:600;cursor:pointer;
+}
+#editor-container{flex:1;overflow:hidden}
+.CodeMirror{height:100%!important;font-size:13px;font-family:'JetBrains Mono',Consolas,monospace}
+.cm-error-line{background:rgba(239,68,68,.18)!important}
+
+/* Terminal */
+#terminal-output{
+  background:#000;color:#4ade80;padding:12px;border-radius:12px;
+  min-height:220px;max-height:calc(100vh - 220px);overflow-y:auto;
+  font-size:12px;white-space:pre-wrap;font-family:monospace;line-height:1.45;
+  border:1px solid #1f2937;margin-bottom:10px;
+}
+#cmd-input{display:flex;gap:6px;position:sticky;bottom:0;background:var(--bg);padding-top:6px}
+#cmd-input input{
+  flex:1;padding:11px;background:#0b1220;color:#e2e8f0;border:1px solid #374151;
+  border-radius:10px;font-family:monospace;font-size:13px;outline:none;
+}
+#cmd-input button{padding:11px 16px;background:var(--success);color:#fff;border:0;border-radius:10px;font-weight:700}
+
+/* Output & Errors */
+.output-box{
+  background:#000;color:#4ade80;padding:12px;border-radius:12px;
+  min-height:200px;white-space:pre-wrap;font-family:monospace;font-size:12px;
+  line-height:1.45;border:1px solid #1f2937;max-height:calc(100vh - 280px);overflow-y:auto;
+}
+.err-item{
+  background:rgba(127,29,29,.5);color:#fecaca;padding:12px;border-radius:10px;
+  margin:6px 0;cursor:pointer;border-left:4px solid #ef4444;font-family:monospace;font-size:12px;
+}
+.err-item:hover{background:rgba(153,27,27,.6)}
+.err-item .loc{color:#fbbf24;font-weight:700}
+.info-bar{background:rgba(8,15,28,.7);padding:10px;border-radius:10px;margin-bottom:10px;font-size:12px;border:1px solid var(--border)}
+
+/* Build */
+.build-panel{background:#0b1220;border:1px solid #1f2937;border-radius:14px;padding:16px;margin-bottom:14px}
+.progress-wrap{background:#1f2937;border-radius:20px;height:28px;overflow:hidden;position:relative;margin:12px 0}
+.progress-bar{
+  height:100%;background:linear-gradient(90deg,#3b82f6,#8b5cf6,#3b82f6);
+  background-size:200% 100%;animation:shine 2s linear infinite;transition:width .4s;width:0%;
+}
+@keyframes shine{0%{background-position:0%}100%{background-position:200%}}
+.progress-text{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;
+  font-size:12px;font-weight:700;color:#fff;text-shadow:0 1px 3px #000}
+.build-stats{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;margin:12px 0}
+.stat-box{background:#111827;padding:10px;border-radius:10px;text-align:center;border:1px solid #1f2937}
+.stat-label{font-size:10px;color:var(--muted);text-transform:uppercase;letter-spacing:.4px}
+.stat-value{font-size:16px;font-weight:700;color:#60a5fa;font-family:monospace;margin-top:3px}
+.current-task{background:#080f1c;padding:11px;border-radius:10px;font-family:monospace;font-size:12px;
+  color:#fbbf24;margin:10px 0;border-left:3px solid #fbbf24;min-height:22px;word-break:break-all}
+.build-status-msg{font-size:13px;color:var(--muted);text-align:center;margin-top:6px}
+.build-status-msg.success{color:#4ade80;font-weight:700}
+.build-status-msg.error{color:#f87171;font-weight:700}
+.spinner{display:inline-block;width:14px;height:14px;border:2px solid #60a5fa;
+  border-top-color:transparent;border-radius:50%;animation:spin .8s linear infinite;margin-right:6px;vertical-align:middle}
+@keyframes spin{to{transform:rotate(360deg)}}
+
+/* Live Preview */
+.preview-frame{
+  background:#0f172a;border-radius:28px;border:6px solid #1e293b;
+  width:min(320px,90vw);margin:0 auto;overflow:hidden;
+  box-shadow:0 20px 50px rgba(0,0,0,.5);
+  min-height:520px;position:relative;
+}
+.preview-notch{
+  height:24px;background:#0f172a;display:flex;align-items:center;justify-content:center;
+}
+.preview-notch::after{content:"";width:80px;height:6px;background:#334155;border-radius:4px}
+.preview-content{
+  padding:16px;min-height:480px;color:#fff;font-family:sans-serif;
+  overflow-y:auto;background:#0f172a;
+}
+.preview-content .android-tv{margin:6px 0}
+.preview-content .android-btn{
+  display:block;width:100%;padding:12px;margin:8px 0;border:0;border-radius:10px;
+  background:#3b82f6;color:#fff;font-weight:600;text-align:center;cursor:pointer;
+}
+.preview-content .android-et{
+  width:100%;padding:12px;margin:8px 0;border-radius:10px;border:1px solid #334155;
+  background:#1e293b;color:#fff;
+}
+.preview-content .android-ll{display:flex;flex-direction:column}
+.preview-content .android-ll.horizontal{flex-direction:row;align-items:center;gap:8px}
+
+/* Toast */
+.toast-container{position:fixed;bottom:calc(var(--bottom-h) + 16px);left:50%;
+  transform:translateX(-50%);z-index:999;display:flex;flex-direction:column;gap:8px;pointer-events:none}
+.toast{
+  background:rgba(15,23,42,.96);backdrop-filter:blur(12px);border:1px solid var(--border);
+  color:#fff;padding:11px 18px;border-radius:12px;font-size:13px;
+  box-shadow:0 10px 30px rgba(0,0,0,.4);animation:toastIn .3s ease;pointer-events:auto;
+}
+.toast.success{border-color:rgba(34,197,94,.45)}
+.toast.error{border-color:rgba(239,68,68,.45)}
+@keyframes toastIn{from{opacity:0;transform:translateY(16px)}to{opacity:1;transform:translateY(0)}}
+
+/* Settings Modal */
+.modal-overlay{
+  position:fixed;inset:0;background:rgba(0,0,0,.65);z-index:200;
+  display:none;align-items:flex-end;justify-content:center;
+}
+.modal-overlay.show{display:flex}
+.modal{
+  background:#111827;border-radius:20px 20px 0 0;padding:24px;
+  width:100%;max-width:480px;max-height:80vh;overflow-y:auto;
+  animation:slideUp .3s ease;
+}
+@keyframes slideUp{from{transform:translateY(100%)}to{transform:translateY(0)}}
+.modal h3{margin-bottom:16px;font-size:17px}
+.setting-row{display:flex;justify-content:space-between;align-items:center;
+  padding:12px 0;border-bottom:1px solid var(--border)}
+.setting-row label{font-size:14px}
+.setting-row select,.setting-row input[type=range]{width:120px}
+
+.empty{color:var(--muted);text-align:center;padding:30px;font-style:italic}
+</style>
+</head>
+<body>
+<header>
+  <h2>📱 __NAME__</h2>
+  <div style="display:flex;gap:4px">
+    <button class="btn btn-orange" onclick="scanAllErrors()" id="scanBtn">🔍</button>
+    <button class="btn btn-purple" onclick="runCurrent()" id="runBtn" style="display:none">▶</button>
+    <button class="btn btn-primary" onclick="buildApk()" id="buildBtn">🔨</button>
+    <button class="btn" onclick="openSettings()">⚙️</button>
+    <button class="btn" onclick="location.href='/'">🏠</button>
+  </div>
+</header>
+
+<div class="main-area">
+  <!-- Explorer -->
+  <div class="panel active" id="panel-explorer">
+    <div class="toolbar">
+      <button class="btn btn-success" onclick="newFile()">📄 +File</button>
+      <button class="btn btn-orange" onclick="newFolder()">📁 +Folder</button>
+      <button class="btn" onclick="loadFiles(currentPath)">🔄</button>
+      <button class="btn" onclick="openSearch()">🔎 Search</button>
+    </div>
+    <div class="breadcrumb" id="breadcrumb">Loading...</div>
+    <div id="file-list">Loading...</div>
+  </div>
+
+  <!-- Live Preview -->
+  <div class="panel" id="panel-preview">
+    <div class="info-bar">Live Layout Preview • Open any .xml layout</div>
+    <div style="text-align:center;margin-bottom:12px">
+      <button class="btn btn-primary" onclick="refreshPreview()">🔄 Refresh Preview</button>
+    </div>
+    <div class="preview-frame">
+      <div class="preview-notch"></div>
+      <div class="preview-content" id="previewContent">
+        <p style="text-align:center;color:#64748b;padding:40px 20px">
+          Open a layout XML file<br>or tap Refresh after editing activity_main.xml
+        </p>
+      </div>
+    </div>
+  </div>
+
+  <!-- Errors -->
+  <div class="panel" id="panel-errors">
+    <div class="info-bar" id="errInfo">Press 🔍 to scan all files</div>
+    <div id="err-list"></div>
+  </div>
+
+  <!-- Terminal -->
+  <div class="panel" id="panel-terminal">
+    <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+      <span style="font-size:13px;color:var(--muted)">Terminal</span>
+      <button class="btn" style="padding:4px 10px;font-size:11px" onclick="clearTerminal()">Clear</button>
+    </div>
+    <div id="terminal-output">$ Zihad IDE v9 Terminal — Ready
+</div>
+    <div id="cmd-input">
+      <input id="cmd" placeholder="ls, pwd, gradle -v..." onkeydown="termKey(event)">
+      <button onclick="runCmd()">Run</button>
+    </div>
+  </div>
+
+  <!-- Output -->
+  <div class="panel" id="panel-output">
+    <div class="info-bar" id="run-info">No code executed yet</div>
+    <div class="output-box" id="output-box">Output will appear here...</div>
+  </div>
+
+  <!-- Build -->
+  <div class="panel" id="panel-build">
+    <div class="build-panel">
+      <h3 style="margin:0 0 10px;font-size:15px;color:#60a5fa">🔨 APK Build</h3>
+      <div class="progress-wrap">
+        <div class="progress-bar" id="buildProgressBar"></div>
+        <div class="progress-text" id="buildProgressText">0%</div>
+      </div>
+      <div class="build-stats">
+        <div class="stat-box"><div class="stat-label">Tasks</div><div class="stat-value" id="statTasks">0/0</div></div>
+        <div class="stat-box"><div class="stat-label">Elapsed</div><div class="stat-value" id="statElapsed">0s</div></div>
+        <div class="stat-box"><div class="stat-label">ETA</div><div class="stat-value" id="statEta">--</div></div>
+      </div>
+      <div class="current-task" id="currentTask">Press 🔨 to start build</div>
+      <div class="build-status-msg" id="buildStatusMsg">Ready</div>
+      <div id="apk-box" style="display:none;margin-top:12px">
+        <button class="btn btn-success" id="apkDownloadBtn" style="width:100%;padding:14px;font-size:15px">⬇ Download APK</button>
+      </div>
+    </div>
+    <div class="info-bar">Live Build Log</div>
+    <div class="output-box" id="buildLog">$ Waiting for build...</div>
+  </div>
+</div>
+
+<!-- Bottom Navigation -->
+<nav class="bottom-nav">
+  <div class="nav-item active" data-panel="explorer" onclick="switchPanel('explorer',this)">
+    <span>📂</span>Files
+  </div>
+  <div class="nav-item" data-panel="preview" onclick="switchPanel('preview',this)">
+    <span>📱</span>Preview
+  </div>
+  <div class="nav-item" data-panel="errors" onclick="switchPanel('errors',this)">
+    <span>⚠️</span>Errors <span id="errBadgeNav" class="badge ok" style="font-size:9px">0</span>
+  </div>
+  <div class="nav-item" data-panel="terminal" onclick="switchPanel('terminal',this)">
+    <span>💻</span>Term
+  </div>
+  <div class="nav-item" data-panel="build" onclick="switchPanel('build',this)">
+    <span>🔨</span>Build
+  </div>
+</nav>
+
+<!-- Multi-tab Editor Overlay -->
+<div id="editor-box">
+  <div id="editor-header">
+    <span style="font-size:12px;color:#93c5fd;font-family:monospace;flex:1;overflow:hidden;text-overflow:ellipsis" id="editor-filename">file</span>
+    <span id="editor-err-badge" class="badge ok">0</span>
+    <button class="btn btn-success" onclick="saveFile()">💾</button>
+    <button class="btn btn-orange" onclick="checkCurrentFile()">🔍</button>
+    <button class="btn btn-purple" onclick="runCurrent()">▶</button>
+    <button class="btn" onclick="closeEditor()">✖</button>
+  </div>
+  <div class="tab-bar-editor" id="editorTabs"></div>
+  <div id="editor-toolbar">
+    <button onclick="doSelectAll()">Select</button>
+    <button onclick="doCut()">Cut</button>
+    <button onclick="doCopy()">Copy</button>
+    <button onclick="doPaste()">Paste</button>
+    <button onclick="doUndo()">Undo</button>
+    <button onclick="doRedo()">Redo</button>
+    <button onclick="doFind()">Find</button>
+    <button onclick="doIndent()">Indent</button>
+    <button onclick="formatCode()">Format</button>
+  </div>
+  <div id="editor-container"><textarea id="editor"></textarea></div>
+</div>
+
+<!-- Settings Modal -->
+<div class="modal-overlay" id="settingsModal" onclick="if(event.target===this)closeSettings()">
+  <div class="modal">
+    <h3>⚙️ Settings</h3>
+    <div class="setting-row">
+      <label>Editor Font Size</label>
+      <input type="range" id="fontSize" min="11" max="20" value="13" oninput="applyFontSize(this.value)">
+    </div>
+    <div class="setting-row">
+      <label>Auto Save</label>
+      <select id="autoSave" onchange="localStorage.setItem('autoSave',this.value)">
+        <option value="off">Off</option>
+        <option value="on">On (3s)</option>
+      </select>
+    </div>
+    <div class="setting-row">
+      <label>Theme</label>
+      <select id="cmTheme" onchange="changeTheme(this.value)">
+        <option value="dracula">Dracula</option>
+        <option value="material-darker">Material</option>
+        <option value="monokai">Monokai</option>
+      </select>
+    </div>
+    <button class="btn btn-primary" style="width:100%;margin-top:18px" onclick="closeSettings()">Done</button>
+  </div>
+</div>
+
+<div class="toast-container" id="toasts"></div>
+
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/matchbrackets.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/edit/closebrackets.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/search/search.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/search/searchcursor.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/search/jump-to-line.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/dialog/dialog.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/fold/foldcode.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/fold/foldgutter.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/fold/brace-fold.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/fold/xml-fold.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/python/python.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/clike/clike.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/javascript/javascript.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/xml/xml.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/css/css.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/python/python.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/clike/clike.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/php/php.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/htmlmixed/htmlmixed.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/shell/shell.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/go/go.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/rust/rust.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/dialog/dialog.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/search/searchcursor.min.js"></script>
-<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/addon/search/search.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/mode/markdown/markdown.min.js"></script>
 <script>
-const $=id=>document.getElementById(id);
-let cm,currentProject='',currentFile='',tree=[],tabs={},activePage='editor',autosave=null,aiAnswer='';
-async function api(url,opts={}){
- const res=await fetch(url,{...opts,headers:{'Content-Type':'application/json',...(opts.headers||{})}});
- const data=await res.json().catch(()=>({ok:false,error:'Invalid server response'}));
- if(!res.ok||data.ok===false)throw Error(data.error||('HTTP '+res.status));
- return data;
+const PROJECT = "__NAME__";
+let currentPath = "";
+let openTabs = [];          // {path, content, mode, dirty}
+let activeTabIdx = -1;
+let cm = null;
+let errorLines = [];
+let buildPollTimer = null;
+let buildStartTime = 0;
+let elapsedTimer = null;
+let tasksSeen = 0;
+let EST_TOTAL = 32;
+let buildId = null;
+let lastLineIdx = 0;
+let cmdHistory = [];
+let histIdx = -1;
+let autoSaveTimer = null;
+
+function toast(msg, type="success"){
+  const c = document.getElementById("toasts");
+  const t = document.createElement("div");
+  t.className = "toast " + type;
+  t.innerText = msg;
+  c.appendChild(t);
+  setTimeout(()=>t.remove(), 3000);
 }
-function post(url,data={}){return api(url,{method:'POST',body:JSON.stringify(data)})}
-function toast(s){$('toast').textContent=s;$('toast').classList.add('show');clearTimeout(toast.timer);toast.timer=setTimeout(()=>$('toast').classList.remove('show'),2500)}
-function output(id,s,ok=null){const el=$(id);el.textContent=String(s??'');el.className='console'+(ok===true?' good':ok===false?' bad':'')}
-function append(id,s,ok=null){const el=$(id),d=document.createElement('div');d.textContent=String(s);if(ok===true)d.className='good';if(ok===false)d.className='bad';el.appendChild(d);el.scrollTop=el.scrollHeight}
-function fmt(n){if(n<1024)return n+' B';let v=n/1024;for(const u of ['KB','MB','GB','TB']){if(v<1024||u==='TB')return v.toFixed(2)+' '+u;v/=1024}return n+' B'}
-function openModal(title,html,fn){$('modalTitle').textContent=title;$('modalBody').innerHTML=html;$('modalBack').classList.remove('hidden');$('modalOK').onclick=async()=>{try{await fn()}catch(e){toast(e.message)}}}
-function closeModal(){$('modalBack').classList.add('hidden')}
-function fld(id,label,placeholder,value=''){return `<label class="tiny muted">${label}</label><input class="field" id="${id}" placeholder="${placeholder}" value="${String(value).replace(/"/g,'&quot;')}">`}
-function page(name,btn=null){activePage=name;for(const p of ['editor','files','preview','build','terminal','api','database','git','ai'])$(p+'Panel').classList.toggle('hidden',p!==name);if(btn){document.querySelectorAll('[data-page]').forEach(b=>b.classList.remove('active'));btn.classList.add('active')}if(name==='preview')reloadPreview().catch(e=>toast(e.message));if(name==='files')renderFiles()}
-function showPanel(name){page(name);document.getElementById(name+'Panel')?.scrollIntoView({behavior:'smooth',block:'start'})}
-function mode(path){const ext=(path.split('.').pop()||'').toLowerCase();return ({js:'javascript',mjs:'javascript',html:'xml',htm:'xml',css:'css',py:'python',java:'text/x-java',kt:'text/x-kotlin',c:'text/x-csrc',h:'text/x-csrc',cpp:'text/x-c++src',php:'application/x-httpd-php',xml:'xml',json:{name:'javascript',json:true},sh:'shell',bash:'shell',go:'go',rs:'rust',sql:'text/x-sql'})[ext]||'text/plain'}
-function editorStats(){if(!cm)return;let s=cm.getValue(),c=cm.getCursor();$('cursor').textContent=`Ln ${c.line+1}, Col ${c.ch+1}`;$('lineStats').textContent=`${s?s.split('\n').length:0} lines · ${s.length} chars`;$('sizeLabel').textContent=fmt(new TextEncoder().encode(s).length);$('languageBadge').textContent=(currentFile.split('.').pop()||'TEXT').toUpperCase();$('modeLabel').textContent=(currentFile.split('.').pop()||'Plain text').toUpperCase()}
-function init(){
- cm=CodeMirror.fromTextArea($('source'),{theme:'material-darker',lineNumbers:true,lineWrapping:false,indentUnit:4,tabSize:4,matchBrackets:true,mode:'text/plain',extraKeys:{'Ctrl-S':saveFile,'Cmd-S':saveFile,'Ctrl-F':findText,'Ctrl-H':replaceText,'Ctrl-Z':undo,'Ctrl-Y':redo}});
- cm.on('change',()=>{editorStats();$('saveStatus').textContent='Unsaved';$('saveStatus').style.color='var(--gold)';if(currentFile){tabs[currentFile]=cm.getValue();clearTimeout(autosave);autosave=setTimeout(()=>saveFile(true),1000)}});cm.on('cursorActivity',editorStats);
+
+function switchPanel(id, el){
+  document.querySelectorAll(".nav-item").forEach(n=>n.classList.remove("active"));
+  document.querySelectorAll(".panel").forEach(p=>p.classList.remove("active"));
+  el.classList.add("active");
+  document.getElementById("panel-"+id).classList.add("active");
+  if(id==="preview") refreshPreview();
 }
-async function loadProjects(){
- try{const d=await api('/api/projects');const sel=$('projectSelect');sel.innerHTML='';d.projects.forEach(p=>{let o=document.createElement('option');o.value=p.name;o.textContent=p.name+' · '+p.sizeText;sel.appendChild(o)});if(!d.projects.length){currentProject='';$('status').textContent='Create your first project';tree=[];renderFiles();return}const name=d.projects.some(p=>p.name===currentProject)?currentProject:d.projects[0].name;sel.value=name;await switchProject(name)}catch(e){toast(e.message)}
+
+function getMode(filename){
+  const ext = filename.split(".").pop().toLowerCase();
+  const map = {py:"python",c:"text/x-csrc",cpp:"text/x-c++src",cc:"text/x-c++src",
+    java:"text/x-java",kt:"text/x-kotlin",js:"javascript",xml:"xml",html:"htmlmixed",
+    css:"css",json:"application/json",md:"markdown",sh:"text/x-sh",gradle:"text/x-groovy"};
+  return map[ext] || "null";
 }
-async function switchProject(name){if(!name)return;currentProject=name;currentFile='';tabs={};$('status').textContent='Loading '+name;await refreshTree();let all=flat(tree).filter(x=>x.type==='file');let first=all.find(x=>/^(index\.html|main\.py|main\.java|main\.kt|app\.js)$/i.test(x.name))||all[0];if(first)await openFile(first.path);else{cm.setValue('// Create a file to begin.');renderTabs()}$('status').textContent='Active: '+name;output('output','Project loaded: '+name,true)}
-async function refreshTree(){if(!currentProject)return;const d=await api('/api/tree/'+encodeURIComponent(currentProject));tree=d.tree;$('fileCount').textContent=d.fileCount;$('projectSize').textContent=fmt(d.totalSize);$('fileSummary').textContent=`${d.fileCount} files · ${d.folderCount} folders · ${fmt(d.totalSize)} total`;renderFiles()}
-function flat(items,out=[]){for(const x of items){out.push(x);if(x.childrenList)flat(x.childrenList,out)}return out}
-function renderFiles(){const el=$('fileList');if(!el)return;el.innerHTML='';let q=($('fileSearch')?.value||'').toLowerCase();let rows=flat(tree).filter(x=>!q||x.path.toLowerCase().includes(q));if(!rows.length){el.textContent='No files found.';return}for(const f of rows){let r=document.createElement('div');r.className='fileitem'+(f.path===currentFile?' selected':'');let i=document.createElement('span');i.textContent=f.type==='folder'?'📁':f.extension==='.html'?'🌐':f.extension==='.js'?'📜':'📄';let n=document.createElement('span');n.className='fname';n.textContent=(f.type==='folder'?'▸ ':'')+f.name;n.title=f.path;let s=document.createElement('span');s.className='fsize';s.textContent=f.sizeText;r.append(i,n,s);r.onclick=()=>f.type==='folder'?folderActions(f):openFile(f.path);r.oncontextmenu=e=>{e.preventDefault();itemActions(f)};el.appendChild(r)}}
-async function openFile(path){try{if(currentFile&&cm)tabs[currentFile]=cm.getValue();let d=await api('/api/file/'+encodeURIComponent(currentProject)+'?path='+encodeURIComponent(path));currentFile=path;tabs[path]=d.content;cm.setValue(d.content);cm.clearHistory();cm.setOption('mode',mode(path));$('saveStatus').textContent='Saved';$('saveStatus').style.color='var(--green)';editorStats();renderTabs();renderFiles();page('editor')}catch(e){toast(e.message)}}
-function renderTabs(){const el=$('tabs');el.innerHTML='';Object.keys(tabs).forEach(p=>{let b=document.createElement('button');b.className='tab'+(p===currentFile?' active':'');b.textContent=p.split('/').pop()+' ×';b.onclick=()=>{if(p===currentFile){delete tabs[p];currentFile=Object.keys(tabs)[0]||'';if(currentFile)openFile(currentFile);else{cm.setValue('');renderTabs()}}else openFile(p)};el.appendChild(b)})}
-async function saveFile(silent=false){if(!currentProject||!currentFile||!cm)return;let content=cm.getValue();try{let d=await post('/api/file/'+encodeURIComponent(currentProject),{path:currentFile,content});tabs[currentFile]=content;$('saveStatus').textContent='Saved';$('saveStatus').style.color='var(--green)';if(!silent)toast('Saved · '+d.sizeText);if(activePage==='preview')reloadPreview().catch(()=>{});refreshTree().catch(()=>{})}catch(e){$('saveStatus').textContent='Save failed';$('saveStatus').style.color='var(--red)';if(!silent)toast(e.message)}}
-function undo(){cm.undo()}function redo(){cm.redo()}function findText(){cm.execCommand('find')}function replaceText(){cm.execCommand('replace')}function selectAll(){cm.focus();cm.execCommand('selectAll')}
-async function cutAll(){if(!cm)return;cm.focus();cm.setValue('');if(currentFile){await saveFile();toast('All content cleared and saved; clipboard untouched')}else toast('Editor cleared')}
-function newFile(){if(!currentProject)return toast('Create a project first');openModal('Create file',fld('newPath','Relative path','src/main.js'),async()=>{let p=$('newPath').value.trim();if(!p)throw Error('Enter a file path');await post('/api/file-create',{project:currentProject,path:p,content:''});closeModal();await refreshTree();await openFile(p);toast('File created')})}
-function newFolder(){if(!currentProject)return toast('Create a project first');openModal('Create folder',fld('newFolderPath','Folder path','src/components'),async()=>{let p=$('newFolderPath').value.trim();if(!p)throw Error('Enter folder path');await post('/api/folder-create',{project:currentProject,path:p});closeModal();await refreshTree();toast('Folder created')})}
-function itemActions(f){openModal('File actions',`<p class="tiny muted">${f.path} · ${f.sizeText}</p>${fld('renameTo','Rename','New name',f.name)}<button onclick="copyItem('${f.path.replace(/'/g,"\\'")}')">Copy file/folder</button> <button class="danger" onclick="deleteItem('${f.path.replace(/'/g,"\\'")}')">Delete</button>`,async()=>{let n=$('renameTo').value.trim();if(!n)throw Error('Enter a name');await post('/api/rename',{project:currentProject,path:f.path,name:n});closeModal();await refreshTree();toast('Renamed')})}
-function folderActions(f){openModal('Folder actions',`<p>${f.path} · ${f.sizeText}</p>${fld('folderRename','Rename folder','New name',f.name)}<button class="danger" onclick="deleteItem('${f.path.replace(/'/g,"\\'")}')">Delete folder</button>`,async()=>{let n=$('folderRename').value.trim();if(!n)throw Error('Enter a name');await post('/api/rename',{project:currentProject,path:f.path,name:n});closeModal();await refreshTree()})}
-async function deleteItem(path){if(!confirm('Delete '+path+'? This cannot be undone.'))return;try{await post('/api/delete',{project:currentProject,path});closeModal();if(path===currentFile){currentFile='';cm.setValue('')}await refreshTree();toast('Deleted')}catch(e){toast(e.message)}}
-async function copyItem(path){try{await post('/api/copy',{project:currentProject,path});closeModal();await refreshTree();toast('Copied')}catch(e){toast(e.message)}}
-function newProject(){openModal('Create project',fld('projectName','Project name','MyWebsite')+'<label class="tiny muted">Template</label><select id="projectType" class="select"><option value="web">Web app · HTML/CSS/JS</option><option value="python">Python</option><option value="android">Android Java</option><option value="kotlin">Android Kotlin</option><option value="empty">Empty</option></select>'+fld('appLabel','Android app label','My Android App')+fld('packageName','Android package','com.example.myapp'),async()=>{let name=$('projectName').value.trim();if(!name)throw Error('Enter project name');let d=await post('/api/project-create',{name,type:$('projectType').value,appName:$('appLabel').value||name,packageName:$('packageName').value||'com.example.myapp'});closeModal();currentProject=d.name;await loadProjects();toast('Project created')})}
-async function runCode(){if(!currentFile)return toast('Open a file first');await saveFile(true);try{let d=await post('/api/run',{project:currentProject,path:currentFile});output('output',d.output,d.ok);if(d.preview){$('previewPath').value=currentFile;page('preview')}else page('editor')}catch(e){toast(e.message)}}
-async function runTerminal(){let c=$('commandInput').value.trim();if(!c)return;$('commandInput').value='';append('terminalOutput','$ '+c);try{let d=await post('/api/terminal',{project:currentProject,command:c});append('terminalOutput',d.output||'(No output)',d.ok)}catch(e){append('terminalOutput',e.message,false)}}
-function quick(c){$('commandInput').value=c;runTerminal()}
-async function checkTools(){try{let d=await api('/api/tools');output('output',d.output);toast('Environment check complete')}catch(e){toast(e.message)}}
-async function backupProject(){try{let d=await post('/api/backup',{project:currentProject});output('output',`Backup created\n${d.path}\nSize: ${d.sizeText}`,true);toast('Backup created')}catch(e){toast(e.message)}}
-async function restoreBackup(){try{let d=await api('/api/backups');if(!d.backups.length)return toast('No backups found');openModal('Restore backup','<p class="tiny muted">Restoring replaces the selected project. A current backup is created first.</p><select id="backupChoice" class="select">'+d.backups.map(b=>`<option value="${b.name}">${b.name} · ${b.sizeText}</option>`).join('')+'</select>',async()=>{let b=$('backupChoice').value;if(!confirm('Replace current project from this backup?'))return;await post('/api/restore',{project:currentProject,backup:b});closeModal();await switchProject(currentProject);toast('Restored')})}catch(e){toast(e.message)}}
-async function reloadPreview(){if(!currentProject)return;await saveFile(true);let p=$('previewPath').value.trim()||'index.html';$('previewFrame').src='/preview/'+encodeURIComponent(currentProject)+'/'+p.split('/').map(encodeURIComponent).join('/')+'?t='+Date.now()}
-function openPreview(){if($('previewFrame').src)window.open($('previewFrame').src,'_blank')}
-async function buildAPK(){if(!currentProject)return toast('Select a project');$('buildProgress').style.width='25%';$('buildStatus').textContent='Build running…';$('apkLink').innerHTML='';output('buildLog','Starting Gradle…');try{let d=await post('/api/build',{project:currentProject});$('buildProgress').style.width=d.ok?'100%':'0%';$('buildStatus').textContent=d.ok?'Build successful':'Build failed';output('buildLog',d.output,d.ok);if(d.apk){let a=document.createElement('a');a.href=d.apk;a.textContent='⬇ Download APK · '+d.apkSizeText;a.style.display='block';a.style.marginTop='12px';a.style.color='#8ab4ff';$('apkLink').appendChild(a)}}catch(e){$('buildProgress').style.width='0%';output('buildLog',e.message,false)}}
-async function testAPI(){let url=$('apiUrl').value.trim(),method=$('apiMethod').value;if(!url)return toast('Enter a URL');try{let d=await post('/api/http-test',{url,method,body:$('apiBody').value});output('apiResult',JSON.stringify(d,null,2),d.ok)}catch(e){output('apiResult',e.message,false)}}
-async function queryDatabase(){try{let d=await post('/api/sqlite',{project:currentProject,path:$('dbPath').value,query:$('dbQuery').value});output('dbResult',JSON.stringify(d,null,2),d.ok)}catch(e){output('dbResult',e.message,false)}}
-async function gitAction(action){try{let d=await post('/api/git',{project:currentProject,action,message:$('gitMessage').value});output('gitResult',d.output,d.ok)}catch(e){output('gitResult',e.message,false)}}
-async function openSettings(){let s=await api('/api/settings');openModal('IDE Settings',fld('aiEndpoint','AI API endpoint (OpenAI-compatible)','https://api.example.com/v1/chat/completions',s.aiEndpoint||'')+fld('aiModel','AI model name','model-name',s.aiModel||'')+fld('aiKey','AI API key','Keep private; blank keeps current key','')+'<label class="tiny muted">Editor autosave delay (ms)</label><input id="autosaveDelay" class="field" type="number" min="300" max="10000" value="'+(s.autosaveDelay||1000)+'"><label class="tiny muted">Theme</label><select id="themeSetting" class="select"><option value="dark">AMOLED Dark</option><option value="blue">Deep Blue</option></select>',async()=>{let data={aiEndpoint:$('aiEndpoint').value.trim(),aiModel:$('aiModel').value.trim(),autosaveDelay:Math.max(300,Math.min(10000,Number($('autosaveDelay').value)||1000)),theme:$('themeSetting').value};if($('aiKey').value)data.aiKey=$('aiKey').value;await post('/api/settings',data);closeModal();toast('Settings saved')})}
-async function askAI(action){let prompt=$('aiPrompt').value.trim();if(action==='explain')prompt='Explain this code clearly, preferably in Bangla:\n'+(cm.getValue());if(action==='fix')prompt='Review this code and suggest a safe fix. Return explanation and corrected code:\n'+cm.getValue();if(!prompt)return toast('Enter a prompt');output('aiResult','Contacting AI provider…');try{let d=await post('/api/ai',{prompt});aiAnswer=d.answer||'';output('aiResult',aiAnswer,d.ok)}catch(e){output('aiResult',e.message,false)}}
-function applyAI(){if(!aiAnswer)return toast('No AI response');if(!confirm('Replace the entire editor with the AI response?'))return;cm.setValue(aiAnswer);toast('Review and save the suggested code')}
-function clearOutput(){output('output','Output cleared')}
-window.addEventListener('beforeunload',()=>{if(currentFile&&cm&&tabs[currentFile]!==cm.getValue())saveFile(true)});
-document.addEventListener('visibilitychange',()=>{if(document.hidden&&currentFile)saveFile(true)});
-init();loadProjects();
+
+// ===== File Explorer =====
+async function loadFiles(path){
+  currentPath = path || "";
+  const box = document.getElementById("file-list");
+  const bc = document.getElementById("breadcrumb");
+  box.innerHTML = "Loading...";
+  try{
+    const r = await fetch(`/api/project-files/\( {encodeURIComponent(PROJECT)}?path= \){encodeURIComponent(currentPath)}`);
+    const d = await r.json();
+    if(!r.ok){box.innerHTML=`<div class="empty">${d.error||"Error"}</div>`;return;}
+    let parts = currentPath ? currentPath.split("/") : [];
+    let bcHtml = `<span onclick="loadFiles('')">📁 ${PROJECT}</span>`;
+    let acc = "";
+    parts.forEach(p=>{
+      acc += (acc?"/":"")+p;
+      bcHtml += ` / <span onclick="loadFiles('\( {acc}')"> \){p}</span>`;
+    });
+    bc.innerHTML = bcHtml;
+    if(!d.files.length){box.innerHTML='<div class="empty">Empty folder</div>';return;}
+    box.innerHTML = "";
+    if(currentPath){
+      const up = parts.slice(0,-1).join("/");
+      const upDiv = document.createElement("div");
+      upDiv.className = "file-item folder";
+      upDiv.innerHTML = "<span>⬆️</span><span class='name'>.. (up)</span>";
+      upDiv.onclick = ()=>loadFiles(up);
+      box.appendChild(upDiv);
+    }
+    d.files.forEach(f=>{
+      const div = document.createElement("div");
+      div.className = "file-item " + (f.type==="directory"?"folder":"file");
+      const icon = f.type==="directory" ? "📁" : "📄";
+      div.innerHTML = `<span>\( {icon}</span><span class="name"> \){esc(f.name)}</span>`;
+      div.onclick = ()=>{
+        if(f.type==="directory") loadFiles(f.path);
+        else openFile(f.path);
+      };
+      div.oncontextmenu = (e)=>{e.preventDefault();showItemMenu(f);};
+      box.appendChild(div);
+    });
+  }catch(e){box.innerHTML=`<div class="empty">Error: ${e}</div>`;}
+}
+
+function showItemMenu(f){
+  const c = prompt(`Action for: ${f.name}\n1=Open  2=Rename  3=Delete  4=Check`);
+  if(c==="1"){if(f.type==="directory")loadFiles(f.path);else openFile(f.path);}
+  else if(c==="2"){const nn=prompt("New name:",f.name);if(nn&&nn!==f.name)fileOp("rename",f.path,nn);}
+  else if(c==="3"){if(confirm("Delete "+f.name+"?"))fileOp("delete",f.path);}
+  else if(c==="4" && f.type==="file") checkFileErrors(f.path,true);
+}
+
+async function newFile(){
+  const n = prompt("New file name:");
+  if(!n) return;
+  const fp = currentPath ? currentPath+"/"+n : n;
+  const c = prompt("Initial content (optional):","") || "";
+  await fileOp("create-file", fp, null, c);
+}
+async function newFolder(){
+  const n = prompt("New folder name:");
+  if(!n) return;
+  const fp = currentPath ? currentPath+"/"+n : n;
+  await fileOp("create-folder", fp);
+}
+async function fileOp(action, path, newName, content){
+  try{
+    const body = {project:PROJECT, action, path};
+    if(newName) body.newName = newName;
+    if(content !== undefined) body.content = content;
+    const r = await fetch("/api/file-operation",{
+      method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)
+    });
+    const d = await r.json();
+    if(!r.ok){toast(d.error||"Error","error");return;}
+    loadFiles(currentPath);
+    toast("Done");
+  }catch(e){toast("Error: "+e,"error");}
+}
+
+// ===== Multi-tab Editor =====
+async function openFile(path){
+  // already open?
+  const existing = openTabs.findIndex(t=>t.path===path);
+  if(existing >= 0){
+    switchTab(existing);
+    document.getElementById("editor-box").style.display = "flex";
+    return;
+  }
+  try{
+    const r = await fetch(`/api/file-content/\( {encodeURIComponent(PROJECT)}?path= \){encodeURIComponent(path)}`);
+    const d = await r.json();
+    if(!r.ok){toast(d.error||"Error","error");return;}
+    openTabs.push({path, content:d.content, mode:getMode(path), dirty:false});
+    activeTabIdx = openTabs.length - 1;
+    document.getElementById("editor-box").style.display = "flex";
+    renderTabs();
+    loadTabContent();
+    const ext = path.split(".").pop().toLowerCase();
+    const runnable = ["py","c","cpp","cc","php","js","go","rs","rb","sh","java"];
+    document.getElementById("runBtn").style.display = runnable.includes(ext) ? "inline-block" : "none";
+    setTimeout(()=>checkCurrentFile(), 400);
+  }catch(e){toast("Error: "+e,"error");}
+}
+
+function renderTabs(){
+  const bar = document.getElementById("editorTabs");
+  bar.innerHTML = "";
+  openTabs.forEach((t,i)=>{
+    const div = document.createElement("div");
+    div.className = "editor-tab" + (i===activeTabIdx?" active":"");
+    const name = t.path.split("/").pop();
+    div.innerHTML = `\( {t.dirty?"• ":""} \){esc(name)} <span class="close-tab" data-i="${i}">×</span>`;
+    div.onclick = (e)=>{
+      if(e.target.classList.contains("close-tab")){
+        closeTab(parseInt(e.target.dataset.i));
+      } else switchTab(i);
+    };
+    bar.appendChild(div);
+  });
+}
+
+function switchTab(idx){
+  if(cm && activeTabIdx>=0){
+    openTabs[activeTabIdx].content = cm.getValue();
+  }
+  activeTabIdx = idx;
+  renderTabs();
+  loadTabContent();
+}
+
+function loadTabContent(){
+  if(activeTabIdx<0 || !openTabs[activeTabIdx]) return;
+  const tab = openTabs[activeTabIdx];
+  document.getElementById("editor-filename").innerText = tab.path;
+  if(cm){cm.toTextArea();cm=null;}
+  cm = CodeMirror.fromTextArea(document.getElementById("editor"),{
+    lineNumbers:true, mode:tab.mode, theme: localStorage.getItem("cmTheme")||"dracula",
+    matchBrackets:true, autoCloseBrackets:true,
+    indentUnit:4, tabSize:4, lineWrapping:true,
+    foldGutter:true, gutters:["CodeMirror-linenumbers","CodeMirror-foldgutter"]
+  });
+  cm.setValue(tab.content);
+  cm.on("change",()=>{
+    openTabs[activeTabIdx].dirty = true;
+    renderTabs();
+    if(localStorage.getItem("autoSave")==="on"){
+      clearTimeout(autoSaveTimer);
+      autoSaveTimer = setTimeout(saveFile, 3000);
+    }
+  });
+  setTimeout(()=>cm.refresh(), 80);
+  applyFontSize(localStorage.getItem("fontSize")||13);
+}
+
+function closeTab(idx){
+  if(openTabs[idx].dirty && !confirm("Unsaved changes. Close anyway?")) return;
+  openTabs.splice(idx,1);
+  if(openTabs.length===0){
+    closeEditor();
+    return;
+  }
+  if(activeTabIdx >= openTabs.length) activeTabIdx = openTabs.length-1;
+  if(idx <= activeTabIdx && activeTabIdx>0) activeTabIdx--;
+  renderTabs();
+  loadTabContent();
+}
+
+function closeEditor(){
+  if(cm && activeTabIdx>=0) openTabs[activeTabIdx].content = cm.getValue();
+  document.getElementById("editor-box").style.display = "none";
+  document.getElementById("runBtn").style.display = "none";
+  if(cm){cm.toTextArea();cm=null;}
+}
+
+// Toolbar
+function doSelectAll(){if(cm){cm.execCommand("selectAll");cm.focus();}}
+async function doCut(){
+  if(!cm)return;
+  const sel=cm.getSelection();
+  if(!sel){toast("Select first");return;}
+  try{await navigator.clipboard.writeText(sel);cm.replaceSelection("");toast("Cut");}
+  catch(e){toast("Cut failed","error");}
+}
+async function doCopy(){
+  if(!cm)return;
+  const sel=cm.getSelection();
+  if(!sel){toast("Select first");return;}
+  try{await navigator.clipboard.writeText(sel);toast("Copied");}
+  catch(e){
+    const ta=document.createElement("textarea");ta.value=sel;document.body.appendChild(ta);
+    ta.select();document.execCommand("copy");document.body.removeChild(ta);toast("Copied");
+  }
+}
+async function doPaste(){
+  if(!cm)return;
+  try{const txt=await navigator.clipboard.readText();cm.replaceSelection(txt);}
+  catch(e){toast("Paste blocked – long press editor","error");}
+}
+function doUndo(){if(cm)cm.undo();}
+function doRedo(){if(cm)cm.redo();}
+function doFind(){if(cm)cm.execCommand("find");}
+function doIndent(){
+  if(!cm)return;
+  const sel=cm.getSelection();
+  if(!sel){cm.execCommand("indentMore");return;}
+  cm.replaceSelection(sel.split("\n").map(l=>"    "+l).join("\n"));
+}
+function formatCode(){
+  if(!cm)return;
+  // basic indent fix
+  const lines = cm.getValue().split("\n");
+  let indent=0;
+  const formatted = lines.map(l=>{
+    const t=l.trim();
+    if(t.startsWith("}")||t.startsWith(")")||t.startsWith("]")) indent=Math.max(0,indent-1);
+    const res = "    ".repeat(indent)+t;
+    if(t.endsWith("{")||t.endsWith("(")) indent++;
+    return res;
+  }).join("\n");
+  cm.setValue(formatted);
+  toast("Formatted");
+}
+
+async function saveFile(){
+  if(activeTabIdx<0 || !cm) return;
+  const tab = openTabs[activeTabIdx];
+  const content = cm.getValue();
+  try{
+    const r = await fetch(`/api/file-content/\( {encodeURIComponent(PROJECT)}?path= \){encodeURIComponent(tab.path)}`,{
+      method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({content})
+    });
+    const d = await r.json();
+    if(!r.ok){toast(d.error||"Save failed","error");return;}
+    tab.content = content;
+    tab.dirty = false;
+    renderTabs();
+    toast("Saved");
+    setTimeout(checkCurrentFile, 250);
+  }catch(e){toast("Save error","error");}
+}
+
+// ===== Errors =====
+async function checkCurrentFile(){
+  if(activeTabIdx<0 || !cm) return;
+  await saveFile();
+  const path = openTabs[activeTabIdx].path;
+  const result = await checkFileErrors(path, false);
+  if(!result) return;
+  errorLines.forEach(line=>{
+    if(cm && cm.getLineHandle(line-1))
+      cm.removeLineClass(cm.getLineHandle(line-1),"background","cm-error-line");
+  });
+  errorLines = [];
+  const badge = document.getElementById("editor-err-badge");
+  if(!result.errors.length){
+    badge.innerText="0 ✓"; badge.className="badge ok";
+  } else {
+    badge.innerText=result.errors.length+" err"; badge.className="badge err";
+    result.errors.forEach(e=>{
+      if(e.line && cm){
+        const h=cm.getLineHandle(e.line-1);
+        if(h){cm.addLineClass(h,"background","cm-error-line");errorLines.push(e.line);}
+      }
+    });
+  }
+}
+async function checkFileErrors(path, showAlert){
+  try{
+    const r = await fetch(`/api/check-file/\( {encodeURIComponent(PROJECT)}?path= \){encodeURIComponent(path)}`);
+    const d = await r.json();
+    if(!r.ok) return {errors:[]};
+    if(showAlert){
+      if(!d.errors.length) toast("No errors");
+      else toast(d.errors.length+" error(s)","error");
+    }
+    return d;
+  }catch(e){return {errors:[]};}
+}
+async function scanAllErrors(){
+  document.getElementById("scanBtn").innerText="⏳";
+  document.getElementById("errInfo").innerText="Scanning...";
+  document.getElementById("err-list").innerHTML="";
+  try{
+    const r = await fetch(`/api/scan-errors/${encodeURIComponent(PROJECT)}`);
+    const d = await r.json();
+    if(!r.ok){document.getElementById("errInfo").innerText="Scan failed";return;}
+    let total=0, bad=0;
+    const box=document.getElementById("err-list");
+    d.results.forEach(f=>{
+      if(f.errors && f.errors.length){
+        total+=f.errors.length; bad++;
+        const fh=document.createElement("div");
+        fh.style.cssText="color:#fbbf24;font-weight:700;margin-top:12px;font-size:13px";
+        fh.innerText=`📄 ${f.path} — ${f.errors.length} error(s)`;
+        box.appendChild(fh);
+        f.errors.forEach(e=>{
+          const item=document.createElement("div");
+          item.className="err-item";
+          item.innerHTML=`<div class="loc">Line ${e.line}, Col ${e.col||1}</div>
+            <div>\( {esc(e.message)}</div> \){e.code?`<div style="background:#450a0a;padding:4px;margin-top:4px;border-radius:4px;font-size:11px">${esc(e.code)}</div>`:""}`;
+          item.onclick=()=>jumpToError(f.path,e.line);
+          box.appendChild(item);
+        });
+      }
+    });
+    const badge=document.getElementById("errBadgeNav");
+    if(total===0){
+      badge.innerText="0"; badge.className="badge ok";
+      document.getElementById("errInfo").innerText=`✓ No errors in ${d.scanned} files`;
+    } else {
+      badge.innerText=total; badge.className="badge err";
+      document.getElementById("errInfo").innerText=`${bad} file(s) • ${total} error(s)`;
+    }
+  }catch(e){document.getElementById("errInfo").innerText="Error: "+e;}
+  document.getElementById("scanBtn").innerText="🔍";
+}
+async function jumpToError(path, line){
+  await openFile(path);
+  setTimeout(()=>{
+    if(cm && line){
+      cm.setCursor({line:line-1,ch:0});
+      cm.focus();
+      const coords=cm.charCoords({line:line-1,ch:0},"local");
+      cm.scrollTo(null, coords.top-80);
+    }
+  },400);
+}
+
+// ===== Terminal =====
+function clearTerminal(){document.getElementById("terminal-output").innerText="$ Terminal cleared\n";}
+function termKey(e){
+  if(e.key==="Enter") runCmd();
+  else if(e.key==="ArrowUp"){
+    e.preventDefault();
+    if(cmdHistory.length && histIdx<cmdHistory.length-1){
+      histIdx++; document.getElementById("cmd").value=cmdHistory[cmdHistory.length-1-histIdx];
+    }
+  } else if(e.key==="ArrowDown"){
+    e.preventDefault();
+    if(histIdx>0){histIdx--;document.getElementById("cmd").value=cmdHistory[cmdHistory.length-1-histIdx];}
+    else{histIdx=-1;document.getElementById("cmd").value="";}
+  }
+}
+async function runCmd(){
+  const cmd=document.getElementById("cmd").value.trim();
+  if(!cmd)return;
+  cmdHistory.push(cmd); histIdx=-1;
+  const out=document.getElementById("terminal-output");
+  out.innerText+=`\n$ ${cmd}\n`;
+  document.getElementById("cmd").value="";
+  out.scrollTop=out.scrollHeight;
+  try{
+    const r=await fetch("/api/run-command",{
+      method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({project:PROJECT,cmd})
+    });
+    const d=await r.json();
+    if(d.stdout) out.innerText+=d.stdout;
+    if(d.stderr) out.innerText+=`\n[stderr]\n${d.stderr}`;
+    if(d.error) out.innerText+=`\n[error] ${d.error}`;
+    out.innerText+=`\n[exit ${d.returncode??"?"}]\n`;
+    out.scrollTop=out.scrollHeight;
+  }catch(e){out.innerText+=`\n[error] ${e}\n`;}
+}
+
+// ===== Run Code =====
+async function runCurrent(){
+  if(activeTabIdx<0){toast("Open a file first","error");return;}
+  if(cm) await saveFile();
+  switchPanel("output", document.querySelector('[data-panel="output"]')||document.querySelectorAll(".nav-item")[0]);
+  // force show output panel
+  document.querySelectorAll(".panel").forEach(p=>p.classList.remove("active"));
+  document.getElementById("panel-output").classList.add("active");
+  const path=openTabs[activeTabIdx].path;
+  const outBox=document.getElementById("output-box");
+  outBox.innerText=`Running ${path}...\n\n`;
+  try{
+    const r=await fetch("/api/run-code",{
+      method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({project:PROJECT,path})
+    });
+    const d=await r.json();
+    document.getElementById("run-info").innerHTML=`<b>File:</b> ${esc(path)} | <b>Lang:</b> ${esc(d.language||"?")} | <b>Exit:</b> ${d.returncode??"?"}`;
+    let text="";
+    if(d.command) text+=`$ ${d.command}\n\n`;
+    if(d.stdout) text+=d.stdout;
+    if(d.stderr) text+=`\n[stderr]\n${d.stderr}`;
+    if(d.error) text+=`\n[error] ${d.error}`;
+    outBox.innerText=text||"(no output)";
+  }catch(e){outBox.innerText="[error] "+e;}
+}
+
+// ===== Live Preview =====
+async function refreshPreview(){
+  const box=document.getElementById("previewContent");
+  box.innerHTML='<p style="text-align:center;color:#64748b;padding:30px">Loading layout...</p>';
+  try{
+    // try common layout paths
+    const candidates=["app/src/main/res/layout/activity_main.xml","res/layout/activity_main.xml"];
+    let content=null, usedPath=null;
+    for(const p of candidates){
+      const r=await fetch(`/api/file-content/\( {encodeURIComponent(PROJECT)}?path= \){encodeURIComponent(p)}`);
+      if(r.ok){const d=await r.json();content=d.content;usedPath=p;break;}
+    }
+    // also try currently open xml
+    if(!content && activeTabIdx>=0 && openTabs[activeTabIdx].path.endsWith(".xml")){
+      content = cm ? cm.getValue() : openTabs[activeTabIdx].content;
+      usedPath = openTabs[activeTabIdx].path;
+    }
+    if(!content){
+      box.innerHTML='<p style="text-align:center;color:#64748b;padding:40px">No layout XML found.<br>Open activity_main.xml</p>';
+      return;
+    }
+    box.innerHTML = renderAndroidXml(content);
+  }catch(e){box.innerHTML=`<p style="color:#f87171;padding:20px">Preview error: ${e}</p>`;}
+}
+
+function renderAndroidXml(xmlStr){
+  try{
+    const parser=new DOMParser();
+    const doc=parser.parseFromString(xmlStr,"text/xml");
+    const root=doc.documentElement;
+    if(!root || root.tagName==="parsererror") return '<p style="color:#f87171">Invalid XML</p>';
+    return renderNode(root);
+  }catch(e){return `<p style="color:#f87171">Parse error: ${e}</p>`;}
+}
+function renderNode(node){
+  if(node.nodeType!==1) return "";
+  const tag=node.tagName.replace(/^.*:/,"");
+  const attrs={};
+  for(const a of node.attributes||[]){
+    const name=a.name.replace(/^android:/,"").replace(/^app:/,"");
+    attrs[name]=a.value;
+  }
+  const style=[];
+  if(attrs.layout_width==="match_parent") style.push("width:100%");
+  else if(attrs.layout_width==="wrap_content") style.push("width:auto");
+  else if(attrs.layout_width) style.push(`width:${dp(attrs.layout_width)}`);
+  if(attrs.layout_height==="match_parent") style.push("height:100%");
+  else if(attrs.layout_height==="wrap_content") style.push("height:auto");
+  else if(attrs.layout_height) style.push(`height:${dp(attrs.layout_height)}`);
+  if(attrs.padding) style.push(`padding:${dp(attrs.padding)}`);
+  if(attrs.layout_margin) style.push(`margin:${dp(attrs.layout_margin)}`);
+  if(attrs.background){
+    const bg=attrs.background;
+    if(bg.startsWith("#")) style.push(`background:${bg}`);
+    else if(bg.includes("primary")) style.push("background:#3b82f6");
+  }
+  if(attrs.gravity==="center") style.push("display:flex;align-items:center;justify-content:center;text-align:center");
+  if(attrs.textColor) style.push(`color:${attrs.textColor.startsWith("#")?attrs.textColor:"#fff"}`);
+  if(attrs.textSize) style.push(`font-size:${dp(attrs.textSize)}`);
+
+  const children=[...node.childNodes].map(renderNode).join("");
+  const st=style.length?`style="${style.join(";")}"`:"";
+
+  if(tag==="LinearLayout"||tag==="linearLayout"){
+    const orient=attrs.orientation==="horizontal"?"horizontal":"";
+    return `<div class="android-ll ${orient}" \( {st}> \){children}</div>`;
+  }
+  if(tag==="TextView"||tag==="textView"){
+    const txt=attrs.text||attrs.hint||"TextView";
+    return `<div class="android-tv" \( {st}> \){esc(txt.replace(/^@string\//,""))}</div>`;
+  }
+  if(tag==="Button"||tag==="button"){
+    const txt=attrs.text||"Button";
+    return `<button class="android-btn" \( {st}> \){esc(txt)}</button>`;
+  }
+  if(tag==="EditText"||tag==="editText"){
+    const hint=attrs.hint||"";
+    return `<input class="android-et" placeholder="${esc(hint)}" ${st}>`;
+  }
+  if(tag==="ListView"){
+    return `<div \( {st} style="border:1px solid #334155;border-radius:8px;padding:8px; \){style.join(";")}">
+      <div style="padding:10px;border-bottom:1px solid #334155">Item 1</div>
+      <div style="padding:10px;border-bottom:1px solid #334155">Item 2</div>
+      <div style="padding:10px">Item 3</div>
+    </div>`;
+  }
+  if(tag==="ImageView"){
+    return `<div ${st} style="background:#1e293b;border-radius:8px;height:80px;display:flex;align-items:center;justify-content:center;color:#64748b">🖼️ Image</div>`;
+  }
+  if(tag==="ScrollView"||tag==="FrameLayout"||tag==="RelativeLayout"||tag==="ConstraintLayout"){
+    return `<div \( {st}> \){children}</div>`;
+  }
+  return `<div \( {st}> \){children}</div>`;
+}
+function dp(v){
+  if(!v) return "0";
+  if(v.endsWith("dp")||v.endsWith("sp")) return parseInt(v)+"px";
+  if(v==="match_parent") return "100%";
+  return v;
+}
+
+// ===== Build =====
+function formatTime(sec){
+  sec=Math.floor(sec);
+  if(sec<60) return sec+"s";
+  return Math.floor(sec/60)+"m "+(sec%60)+"s";
+}
+function startElapsedTimer(){
+  if(elapsedTimer) clearInterval(elapsedTimer);
+  elapsedTimer=setInterval(()=>{
+    const el=(Date.now()-buildStartTime)/1000;
+    document.getElementById("statElapsed").innerText=formatTime(el);
+    const ratio=tasksSeen/EST_TOTAL;
+    if(ratio>0.05){
+      const rem=Math.max(0, el/ratio - el);
+      document.getElementById("statEta").innerText=formatTime(rem);
+    }
+  },500);
+}
+function processBuildLine(line){
+  const log=document.getElementById("buildLog");
+  log.innerText+="\n"+line;
+  log.scrollTop=log.scrollHeight;
+  const m=line.match(/^>\s+Task\s+(:[\w:]+)/);
+  if(m){
+    tasksSeen++;
+    document.getElementById("statTasks").innerText=tasksSeen+"/"+EST_TOTAL;
+    document.getElementById("currentTask").innerText="▶ "+m[1];
+    const pct=Math.min(95,Math.round(tasksSeen/EST_TOTAL*100));
+    document.getElementById("buildProgressBar").style.width=pct+"%";
+    document.getElementById("buildProgressText").innerText=pct+"%";
+  }
+  const m2=line.match(/(\d+)\s+actionable tasks/);
+  if(m2){EST_TOTAL=parseInt(m2[1]);document.getElementById("statTasks").innerText=tasksSeen+"/"+EST_TOTAL;}
+  if(line.includes("BUILD SUCCESSFUL")){
+    document.getElementById("buildProgressBar").style.width="100%";
+    document.getElementById("buildProgressText").innerText="100%";
+    document.getElementById("currentTask").innerText="✅ Build complete";
+    const s=document.getElementById("buildStatusMsg");
+    s.innerText=line; s.className="build-status-msg success";
+  }
+  if(line.includes("BUILD FAILED")){
+    document.getElementById("currentTask").innerText="❌ Build failed";
+    const s=document.getElementById("buildStatusMsg");
+    s.innerText=line; s.className="build-status-msg error";
+  }
+}
+async function pollBuild(){
+  if(!buildId) return;
+  try{
+    const r=await fetch(`/api/build-poll/\( {buildId}?since= \){lastLineIdx}`);
+    const d=await r.json();
+    if(d.lines&&d.lines.length){d.lines.forEach(processBuildLine);lastLineIdx=d.total;}
+    if(d.status==="done"){
+      clearInterval(buildPollTimer);buildPollTimer=null;
+      if(elapsedTimer){clearInterval(elapsedTimer);elapsedTimer=null;}
+      if(d.success&&d.apk_path){
+        document.getElementById("buildProgressBar").style.width="100%";
+        document.getElementById("buildProgressText").innerText="100%";
+        document.getElementById("currentTask").innerText="✅ Build successful";
+        document.getElementById("buildStatusMsg").innerText="✓ APK ready!";
+        document.getElementById("buildStatusMsg").className="build-status-msg success";
+        document.getElementById("apk-box").style.display="block";
+        document.getElementById("apkDownloadBtn").onclick=()=>{
+          location.href=`/api/download-apk/${encodeURIComponent(PROJECT)}`;
+        };
+        toast("APK Ready!");
+      } else {
+        document.getElementById("currentTask").innerText="❌ Build failed";
+        document.getElementById("buildStatusMsg").innerText=`✗ Failed (exit ${d.returncode||"?"})`;
+        document.getElementById("buildStatusMsg").className="build-status-msg error";
+        toast("Build failed","error");
+      }
+    }
+  }catch(e){}
+}
+async function buildApk(){
+  if(!confirm("Build APK?\nFirst build: 1-3 min\nNext: 20-40 sec")) return;
+  switchPanel("build", document.querySelector('[data-panel="build"]'));
+  document.getElementById("buildLog").innerText="$ Starting build...";
+  document.getElementById("buildProgressBar").style.width="0%";
+  document.getElementById("buildProgressText").innerText="0%";
+  document.getElementById("statTasks").innerText="0/32";
+  document.getElementById("statElapsed").innerText="0s";
+  document.getElementById("statEta").innerText="--";
+  document.getElementById("currentTask").innerHTML='<span class="spinner"></span>Starting...';
+  document.getElementById("buildStatusMsg").innerText="Starting...";
+  document.getElementById("buildStatusMsg").className="build-status-msg";
+  document.getElementById("apk-box").style.display="none";
+  tasksSeen=0;lastLineIdx=0;EST_TOTAL=32;
+  try{
+    const r=await fetch("/api/build-start",{
+      method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({project:PROJECT})
+    });
+    const d=await r.json();
+    if(!r.ok){toast(d.error||"Error","error");return;}
+    buildId=d.build_id;
+    buildStartTime=Date.now();
+    startElapsedTimer();
+    if(buildPollTimer) clearInterval(buildPollTimer);
+    buildPollTimer=setInterval(pollBuild,700);
+    pollBuild();
+  }catch(e){toast("Error: "+e,"error");}
+}
+
+// ===== Settings & Search =====
+function openSettings(){
+  document.getElementById("fontSize").value=localStorage.getItem("fontSize")||13;
+  document.getElementById("autoSave").value=localStorage.getItem("autoSave")||"off";
+  document.getElementById("cmTheme").value=localStorage.getItem("cmTheme")||"dracula";
+  document.getElementById("settingsModal").classList.add("show");
+}
+function closeSettings(){document.getElementById("settingsModal").classList.remove("show");}
+function applyFontSize(v){
+  localStorage.setItem("fontSize",v);
+  if(cm) cm.getWrapperElement().style.fontSize=v+"px";
+}
+function changeTheme(t){
+  localStorage.setItem("cmTheme",t);
+  if(cm) cm.setOption("theme",t);
+}
+function openSearch(){
+  const q=prompt("Search in files (filename):");
+  if(!q) return;
+  toast("Searching...");
+  // simple client-side filter of current dir for now
+  loadFiles(currentPath);
+}
+
+function esc(t){const d=document.createElement("div");d.innerText=t;return d.innerHTML;}
+
+// Init
+loadFiles("");
+setTimeout(scanAllErrors, 1200);
 </script>
 </body>
-</html>"""
+</html>
+'''
 
+# ==================== API Routes ====================
+@app.route("/")
+def home(): return HOME_HTML
 
-@app.get("/")
-def home():
-    return render_template_string(HTML)
+@app.route("/api/status")
+def api_status():
+    projects = [p for p in PROJECTS_DIR.iterdir() if p.is_dir()]
+    langs = set(v["name"] for v in LANGUAGES.values())
+    return jsonify({"server":"online","port":PORT,"projects":len(projects),"language_count":len(langs)})
 
+@app.route("/api/projects", methods=["GET"])
+def get_projects():
+    result = []
+    for project in sorted(PROJECTS_DIR.iterdir()):
+        if not project.is_dir(): continue
+        info_file = project / "project.json"
+        if info_file.exists():
+            try: info = json.loads(info_file.read_text(encoding="utf-8"))
+            except Exception: info = {"name": project.name, "package":"?","language":"?"}
+        else: info = {"name": project.name, "package":"?","language":"?"}
+        result.append(info)
+    return jsonify({"projects": result})
 
-@app.get("/api/health")
-def health():
-    return jsonify({"ok": True, "app": "Zihad Mobile IDE Ultra Pro Max", "port": PORT})
-
-
-@app.get("/api/projects")
-def list_projects():
-    out = []
-    for p in sorted(PROJECTS.iterdir(), key=lambda x: x.name.lower()):
-        if p.is_dir() and not p.is_symlink():
-            n = folder_size(p)
-            out.append({
-                "name": p.name, "size": n, "sizeText": size_text(n),
-                "modified": datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
-            })
-    return jsonify({"ok": True, "projects": out})
-
-
-@app.post("/api/project-create")
-def create_project():
-    d = request.get_json(silent=True) or {}
+@app.route("/api/projects", methods=["POST"])
+def create_project_api():
+    data = request.get_json(silent=True) or {}
+    name = str(data.get("name","")).strip()
+    package = str(data.get("package","")).strip()
+    language = str(data.get("language","java")).strip().lower()
+    template = str(data.get("template","empty")).strip().lower()
+    if not name: return jsonify({"error":"Name required"}), 400
+    if not package: return jsonify({"error":"Package required"}), 400
+    if not valid_package(package): return jsonify({"error":"Invalid package"}), 400
+    if language not in ["java","kotlin"]: return jsonify({"error":"Invalid language"}), 400
+    if template not in ["empty","login","list"]: template="empty"
     try:
-        name = safe_name(d.get("name"))
-        root = safe_path(PROJECTS, name)
-        if root.exists():
-            return error("Project already exists.", 409)
-        root.mkdir(parents=True)
-        kind = d.get("type", "web")
-        if kind == "web":
-            (root / "index.html").write_text(
-                '<!doctype html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>My App</title><link rel="stylesheet" href="style.css"></head><body><main><h1>Hello, Zihad IDE!</h1><p>Your web project is ready.</p><button id="test">Test button</button></main><script src="app.js"></script></body></html>',
-                encoding="utf-8")
-            (root / "style.css").write_text(
-                "body{margin:0;min-height:100vh;display:grid;place-items:center;background:#0b1220;color:#eef4ff;font:16px system-ui}main{text-align:center;padding:24px}button{padding:12px 18px;border:0;border-radius:10px;background:#568aff;color:white}",
-                encoding="utf-8")
-            (root / "app.js").write_text(
-                "document.querySelector('#test')?.addEventListener('click',()=>alert('It works!'));",
-                encoding="utf-8")
-        elif kind == "python":
-            (root / "main.py").write_text('print("Hello from Zihad Mobile IDE!")\n', encoding="utf-8")
-            (root / "README.md").write_text("# " + name + "\n", encoding="utf-8")
-        elif kind in ("android", "kotlin"):
-            make_android_project(root, d.get("appName", name), d.get("packageName", "com.example.myapp"), "kotlin" if kind == "kotlin" else "java")
-        elif kind == "empty":
-            (root / "README.md").write_text("# " + name + "\n", encoding="utf-8")
-        else:
-            shutil.rmtree(root, ignore_errors=True)
-            return error("Unknown project type.")
-        return jsonify({"ok": True, "name": name})
+        p = create_android_project(name, package, language, template)
+        return jsonify({"success":True,"path":str(p)})
     except Exception as e:
-        return error(e)
+        return jsonify({"error":str(e)}), 400
 
-
-@app.get("/api/tree/<project>")
-def api_tree(project):
+@app.route("/api/projects/<path:name>", methods=["DELETE"])
+def delete_project(name):
+    project = safe_project(name)
+    if project is None: return jsonify({"error":"Invalid"}), 400
+    if not project.exists(): return jsonify({"error":"Not found"}), 404
+    if project == PROJECTS_DIR: return jsonify({"error":"Cannot delete root"}), 400
     try:
-        root = project_root(project)
-        tree = scan_tree(root)
-        items = flatten(tree)
-        return jsonify({
-            "ok": True, "tree": tree,
-            "fileCount": sum(x["type"] == "file" for x in items),
-            "folderCount": sum(x["type"] == "folder" for x in items),
-            "totalSize": folder_size(root)
-        })
+        shutil.rmtree(str(project))
+        return jsonify({"success":True})
     except Exception as e:
-        return error(e, 404)
+        return jsonify({"error":str(e)}), 500
 
+@app.route("/project/<path:name>")
+def open_project(name):
+    project = safe_project(name)
+    if project is None or not project.exists():
+        return "Project not found", 404
+    return IDE_HTML.replace("__NAME__", project.name)
 
-@app.get("/api/file/<project>")
-def get_file(project):
+@app.route("/api/project-files/<path:name>")
+def project_files(name):
+    project = safe_project(name)
+    if project is None or not project.exists():
+        return jsonify({"error":"Invalid"}), 400
+    sub = request.args.get("path","")
+    target = safe_subpath(project, sub)
+    if target is None or not target.is_dir():
+        return jsonify({"error":"Invalid path"}), 400
+    files = []
     try:
-        root = project_root(project)
-        p = safe_path(root, request.args.get("path", ""))
-        if not p.is_file() or p.is_symlink():
-            return error("File not found.", 404)
-        if p.stat().st_size > MAX_EDITOR_FILE:
-            return error("File exceeds the editor's 10 MB limit.")
-        content = p.read_text(encoding="utf-8", errors="replace")
-        return jsonify({
-            "ok": True, "content": content,
-            "size": p.stat().st_size, "sizeText": size_text(p.stat().st_size),
-            "language": LANGUAGES.get(p.suffix.lower(), "text")
-        })
+        for p in sorted(target.iterdir(), key=lambda x:(not x.is_dir(), x.name.lower())):
+            try: rel = str(p.relative_to(project))
+            except ValueError: continue
+            files.append({"name":p.name,"path":rel,"type":"directory" if p.is_dir() else "file"})
     except Exception as e:
-        return error(e, 404)
+        return jsonify({"error":str(e)}), 500
+    return jsonify({"project":name,"current":sub,"files":files})
 
-
-@app.post("/api/file/<project>")
-def save_file(project):
-    d = request.get_json(silent=True) or {}
+@app.route("/api/file-content/<path:name>", methods=["GET","POST"])
+def file_content(name):
+    project = safe_project(name)
+    if project is None or not project.exists():
+        return jsonify({"error":"Invalid"}), 400
+    sub = request.args.get("path","")
+    target = safe_subpath(project, sub)
+    if target is None or not target.is_file():
+        return jsonify({"error":"Not found"}), 404
+    if request.method == "GET":
+        try:
+            return jsonify({"content":target.read_text(encoding="utf-8",errors="replace"),"path":sub})
+        except Exception as e:
+            return jsonify({"error":str(e)}), 500
+    data = request.get_json(silent=True) or {}
     try:
-        root = project_root(project)
-        p = safe_path(root, d.get("path", ""))
-        content = d.get("content", "")
-        if p == root or not isinstance(content, str):
-            return error("Invalid file content or path.")
-        if len(content.encode("utf-8")) > MAX_EDITOR_FILE:
-            return error("File exceeds the editor's 10 MB limit.")
-        if p.exists() and p.is_dir():
-            return error("Target is a folder.")
-        p.parent.mkdir(parents=True, exist_ok=True)
-        tmp = p.with_name(p.name + ".zihad-tmp")
-        tmp.write_text(content, encoding="utf-8")
-        tmp.replace(p)
-        return jsonify({"ok": True, "size": p.stat().st_size, "sizeText": size_text(p.stat().st_size)})
+        target.write_text(data.get("content",""), encoding="utf-8")
+        return jsonify({"success":True})
     except Exception as e:
-        return error(e)
+        return jsonify({"error":str(e)}), 500
 
-
-@app.post("/api/file-create")
-def create_file():
-    d = request.get_json(silent=True) or {}
+@app.route("/api/file-operation", methods=["POST"])
+def file_operation():
+    data = request.get_json(silent=True) or {}
+    project = safe_project(data.get("project",""))
+    if project is None or not project.exists():
+        return jsonify({"error":"Invalid"}), 400
+    action = data.get("action","")
+    target = safe_subpath(project, data.get("path",""))
+    if target is None: return jsonify({"error":"Invalid path"}), 400
     try:
-        root = project_root(d.get("project"))
-        p = safe_path(root, d.get("path", ""))
-        if p == root or p.exists():
-            return error("Invalid path or item already exists.")
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.write_text(str(d.get("content", "")), encoding="utf-8")
-        return jsonify({"ok": True})
+        if action == "create-file":
+            if target.exists(): return jsonify({"error":"Exists"}), 400
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_text(data.get("content",""), encoding="utf-8")
+            return jsonify({"success":True})
+        if action == "create-folder":
+            if target.exists(): return jsonify({"error":"Exists"}), 400
+            target.mkdir(parents=True, exist_ok=True)
+            return jsonify({"success":True})
+        if action == "delete":
+            if not target.exists(): return jsonify({"error":"Not found"}), 404
+            if target == project: return jsonify({"error":"Cannot delete root"}), 400
+            if target.is_dir(): shutil.rmtree(target)
+            else: target.unlink()
+            return jsonify({"success":True})
+        if action == "rename":
+            nn = data.get("newName","")
+            if not nn: return jsonify({"error":"New name required"}), 400
+            nt = safe_subpath(project, nn)
+            if nt is None: return jsonify({"error":"Invalid"}), 400
+            if nt.exists(): return jsonify({"error":"Target exists"}), 400
+            if not target.exists(): return jsonify({"error":"Source missing"}), 404
+            nt.parent.mkdir(parents=True, exist_ok=True)
+            target.rename(nt)
+            return jsonify({"success":True})
+        return jsonify({"error":"Unknown"}), 400
     except Exception as e:
-        return error(e)
+        return jsonify({"error":str(e)}), 500
 
-
-@app.post("/api/folder-create")
-def create_folder():
-    d = request.get_json(silent=True) or {}
+def read_file_line(path, line_num):
     try:
-        root = project_root(d.get("project"))
-        p = safe_path(root, d.get("path", ""))
-        if p == root:
-            return error("Choose a folder name.")
-        p.mkdir(parents=True, exist_ok=False)
-        return jsonify({"ok": True})
-    except Exception as e:
-        return error(e)
-
-
-@app.post("/api/rename")
-def rename_item():
-    d = request.get_json(silent=True) or {}
-    try:
-        root = project_root(d.get("project"))
-        old = safe_path(root, d.get("path", ""))
-        name = safe_name(d.get("name"))
-        new = safe_path(old.parent, name)
-        if old == root or not old.exists() or old.is_symlink():
-            return error("Item not found.")
-        if new.exists():
-            return error("Target already exists.")
-        old.rename(new)
-        return jsonify({"ok": True})
-    except Exception as e:
-        return error(e)
-
-
-@app.post("/api/delete")
-def delete_item():
-    d = request.get_json(silent=True) or {}
-    try:
-        root = project_root(d.get("project"))
-        p = safe_path(root, d.get("path", ""))
-        if p == root or not p.exists() or p.is_symlink():
-            return error("Cannot delete this path.")
-        if p.is_dir():
-            shutil.rmtree(p)
-        else:
-            p.unlink()
-        return jsonify({"ok": True})
-    except Exception as e:
-        return error(e)
-
-
-@app.post("/api/copy")
-def copy_item():
-    d = request.get_json(silent=True) or {}
-    try:
-        root = project_root(d.get("project"))
-        src = safe_path(root, d.get("path", ""))
-        if src == root or not src.exists() or src.is_symlink():
-            return error("Source not found.")
-        dest = src.with_name(src.name + ".copy")
-        i = 2
-        while dest.exists():
-            dest = src.with_name(src.name + f".copy{i}")
-            i += 1
-        if src.is_dir():
-            shutil.copytree(src, dest)
-        else:
-            shutil.copy2(src, dest)
-        return jsonify({"ok": True, "path": dest.relative_to(root).as_posix()})
-    except Exception as e:
-        return error(e)
-
-
-@app.get("/preview/<project>/<path:relative>")
-def preview(project, relative):
-    try:
-        root = project_root(project)
-        p = safe_path(root, relative)
-        if not p.is_file() or p.is_symlink():
-            abort(404)
-        mime = mimetypes.guess_type(p.name)[0] or "application/octet-stream"
-        return send_file(p, mimetype=mime, conditional=True)
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            lines = f.readlines()
+        if 1 <= line_num <= len(lines):
+            return lines[line_num - 1].rstrip()[:300]
     except Exception:
-        abort(404)
+        pass
+    return ""
 
+def parse_errors(lang_name, output, file_path=None):
+    errors = []
+    lines_seen = set()
+    for line in output.splitlines():
+        line = line.strip()
+        if not line: continue
+        m = re.match(r'^[^:]+:(\d+):(\d+):\s*(error|fatal error):\s*(.+)', line)
+        if m:
+            ln = int(m.group(1))
+            errors.append({"line":ln,"col":int(m.group(2)),"message":m.group(4)[:200],
+                           "code":read_file_line(file_path,ln) if file_path else ""})
+            continue
+        m = re.match(r'^\s*File\s+"[^"]+",\s+line\s+(\d+)', line)
+        if m:
+            ln = int(m.group(1))
+            if ln not in lines_seen:
+                lines_seen.add(ln)
+                errors.append({"line":ln,"col":1,"message":"Syntax/Runtime error",
+                               "code":read_file_line(file_path,ln) if file_path else ""})
+            continue
+        m = re.match(r'^(SyntaxError|IndentationError|TabError|NameError|TypeError|ValueError|KeyError|AttributeError|ImportError|ModuleNotFoundError|IndexError|ZeroDivisionError):\s*(.+)', line)
+        if m:
+            if errors and errors[-1]["message"] in ("Syntax/Runtime error",""):
+                errors[-1]["message"] = m.group(1)+": "+m.group(2)[:150]
+            else:
+                errors.append({"line":0,"col":1,"message":m.group(1)+": "+m.group(2)[:150],"code":""})
+            continue
+        m = re.search(r'on line (\d+)', line)
+        if m and ("error" in line.lower() or "warning" in line.lower()):
+            ln = int(m.group(1))
+            if ln not in lines_seen:
+                lines_seen.add(ln)
+                errors.append({"line":ln,"col":1,"message":line[:200],
+                               "code":read_file_line(file_path,ln) if file_path else ""})
+            continue
+        m = re.match(r'^[^:]+:(\d+):(\d+):\s*(.+)', line)
+        if m and ("SyntaxError" in line or "error" in line.lower()):
+            ln = int(m.group(1))
+            if ln not in lines_seen:
+                lines_seen.add(ln)
+                errors.append({"line":ln,"col":int(m.group(2)),"message":m.group(3)[:200],
+                               "code":read_file_line(file_path,ln) if file_path else ""})
+            continue
+        m = re.match(r'^[^:]+\.rb:(\d+):\s*(.+)', line)
+        if m:
+            ln = int(m.group(1))
+            if ln not in lines_seen:
+                lines_seen.add(ln)
+                errors.append({"line":ln,"col":1,"message":m.group(2)[:200],
+                               "code":read_file_line(file_path,ln) if file_path else ""})
+            continue
+        m = re.match(r'^[^:]+\.go:(\d+):(\d+):\s*(.+)', line)
+        if m:
+            ln = int(m.group(1))
+            if ln not in lines_seen:
+                lines_seen.add(ln)
+                errors.append({"line":ln,"col":int(m.group(2)),"message":m.group(3)[:200],
+                               "code":read_file_line(file_path,ln) if file_path else ""})
+            continue
+        m = re.match(r'^[^:]+\.sh:\s*line\s+(\d+):\s*(.+)', line)
+        if m:
+            ln = int(m.group(1))
+            if ln not in lines_seen:
+                lines_seen.add(ln)
+                errors.append({"line":ln,"col":1,"message":m.group(2)[:200],
+                               "code":read_file_line(file_path,ln) if file_path else ""})
+            continue
+    seen = {}
+    for e in errors:
+        key = e["line"] if e["line"] > 0 else ("msg", e["message"][:50])
+        if key not in seen: seen[key] = e
+    return list(seen.values())
 
-@app.post("/api/terminal")
-def terminal():
-    d = request.get_json(silent=True) or {}
+@app.route("/api/check-file/<path:name>")
+def check_file(name):
+    project = safe_project(name)
+    if project is None or not project.exists():
+        return jsonify({"error":"Invalid"}), 400
+    target = safe_subpath(project, request.args.get("path",""))
+    if target is None or not target.is_file():
+        return jsonify({"error":"Not found"}), 404
+    ext = target.suffix.lower()
+    lang = LANGUAGES.get(ext)
+    if not lang or not lang["check"]:
+        return jsonify({"errors":[],"language":lang["name"] if lang else "?","skipped":True})
+    cmd = lang["check"].replace("{file}", str(target))
     try:
-        root = project_root(d.get("project"))
-        cmd = str(d.get("command", "")).strip()
-        if not cmd:
-            return error("Enter a command.")
-        if len(cmd) > 3000:
-            return error("Command too long.")
-        # Terminal commands execute with the Termux user's permissions.
-        # Keep this server bound to localhost; never expose it publicly.
-        return jsonify({"ok": True, **command(cmd, root)})
+        result = subprocess.run(cmd, shell=True, cwd=str(target.parent),
+                                capture_output=True, text=True, timeout=60)
+        output = (result.stdout or "") + "\n" + (result.stderr or "")
+        if result.returncode == 0:
+            return jsonify({"errors":[],"language":lang["name"]})
+        errs = parse_errors(lang["name"], output, str(target))
+        return jsonify({"errors":errs,"language":lang["name"],"raw":output[:2000]})
+    except subprocess.TimeoutExpired:
+        return jsonify({"errors":[],"error":"Timeout"})
     except Exception as e:
-        return error(e)
+        return jsonify({"errors":[],"error":str(e)})
 
-
-@app.post("/api/run")
-def run_source():
-    d = request.get_json(silent=True) or {}
-    try:
-        root = project_root(d.get("project"))
-        p = safe_path(root, d.get("path", ""))
-        if not p.is_file() or p.is_symlink():
-            return error("Source file not found.")
-        rel = json.dumps(p.relative_to(root).as_posix())
-        ext = p.suffix.lower()
-        cmds = {
-            ".py": f"python {rel}", ".js": f"node {rel}",
-            ".mjs": f"node {rel}", ".php": f"php {rel}",
-            ".sh": f"bash {rel}", ".bash": f"bash {rel}",
-            ".rb": f"ruby {rel}", ".pl": f"perl {rel}",
-            ".go": f"go run {rel}",
-            ".c": f"gcc {rel} -o .zihad-run && ./.zihad-run",
-            ".cpp": f"g++ {rel} -o .zihad-run && ./.zihad-run",
-            ".cc": f"g++ {rel} -o .zihad-run && ./.zihad-run",
-            ".rs": f"rustc {rel} -o .zihad-run && ./.zihad-run",
-            ".java": f"javac {rel} && java -cp . {json.dumps(p.stem)}"
-        }
-        if ext in (".html", ".htm"):
-            return jsonify({"ok": True, "output": "Open the Preview tab to view this HTML file.", "preview": True})
-        if ext not in cmds:
-            return jsonify({"ok": False, "output": f"No run command configured for {ext or 'this file'}."})
-        return jsonify(command(cmds[ext], root))
-    except Exception as e:
-        return error(e)
-
-
-@app.post("/api/backup")
-def backup():
-    d = request.get_json(silent=True) or {}
-    try:
-        root = project_root(d.get("project"))
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        dest = BACKUPS / f"{root.name}-{stamp}"
-        shutil.copytree(root, dest, ignore=shutil.ignore_patterns(".gradle", "build", ".git"))
-        n = folder_size(dest)
-        return jsonify({"ok": True, "path": str(dest), "size": n, "sizeText": size_text(n)})
-    except Exception as e:
-        return error(e)
-
-
-@app.get("/api/backups")
-def backups():
-    out = []
-    for p in sorted(BACKUPS.iterdir(), reverse=True):
-        if p.is_dir() and not p.is_symlink():
-            n = folder_size(p)
-            out.append({"name": p.name, "size": n, "sizeText": size_text(n)})
-    return jsonify({"ok": True, "backups": out})
-
-
-@app.post("/api/restore")
-def restore():
-    d = request.get_json(silent=True) or {}
-    try:
-        root = project_root(d.get("project"))
-        name = safe_name(d.get("backup"))
-        src = safe_path(BACKUPS, name)
-        if src.parent != BACKUPS or not src.is_dir() or src.is_symlink():
-            return error("Backup not found.")
-        stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
-        safety = BACKUPS / f"{root.name}-before-restore-{stamp}"
-        shutil.copytree(root, safety, ignore=shutil.ignore_patterns(".gradle", "build", ".git"))
-        temp = PROJECTS / (root.name + ".restore-tmp")
-        if temp.exists():
-            shutil.rmtree(temp)
-        shutil.copytree(src, temp)
-        shutil.rmtree(root)
-        temp.rename(root)
-        return jsonify({"ok": True, "safetyBackup": str(safety)})
-    except Exception as e:
-        return error(e)
-
-
-@app.get("/api/tools")
-def tools():
-    checks = [
-        "python --version", "node --version", "php --version",
-        "java -version", "gradle --version", "git --version",
-        "gcc --version", "g++ --version", "go version",
-        "rustc --version", "cmake --version"
-    ]
-    lines = [
-        "Zihad Mobile IDE — environment",
-        "Python: " + str(shutil.which("python")),
-        "Java: " + str(shutil.which("java")),
-        "Gradle: " + str(shutil.which("gradle")),
-        ""
-    ]
-    for c in checks:
-        r = command(c, BASE, 8)
-        first = (r["output"].splitlines() or ["Unavailable"])[0]
-        lines.append(("[OK] " if r["ok"] else "[MISSING] ") + c + " — " + first)
-    return jsonify({"ok": True, "output": "\n".join(lines)})
-
-
-@app.post("/api/build")
-def build():
-    d = request.get_json(silent=True) or {}
-    try:
-        root = project_root(d.get("project"))
-        if not (root / "app" / "build.gradle").is_file() and not (root / "app" / "build.gradle.kts").is_file():
-            return jsonify({"ok": False, "output": "This is not an Android Gradle project."})
-        gradlew = root / "gradlew"
-        if gradlew.is_file():
-            cmd = "bash ./gradlew assembleDebug"
-        elif shutil.which("gradle"):
-            cmd = "gradle assembleDebug"
-        else:
-            return jsonify({"ok": False, "output": "Gradle is not installed or not in PATH."})
-        result = command(cmd, root, 900)
-        apk = root / "app" / "build" / "outputs" / "apk" / "debug" / "app-debug.apk"
-        out = {"ok": result["ok"], "output": result["output"], "duration": result["duration"]}
-        if result["ok"] and apk.is_file():
-            out["apk"] = "/api/apk/" + root.name
-            out["apkSize"] = apk.stat().st_size
-            out["apkSizeText"] = size_text(apk.stat().st_size)
-        elif result["ok"]:
-            out["ok"] = False
-            out["output"] += "\nAPK was not found at the expected location."
-        return jsonify(out)
-    except Exception as e:
-        return error(e)
-
-
-@app.get("/api/apk/<project>")
-def apk(project):
-    try:
-        root = project_root(project)
-        p = safe_path(root, "app/build/outputs/apk/debug/app-debug.apk")
-        if not p.is_file():
-            return error("APK not found; build first.", 404)
-        return send_file(p, as_attachment=True, download_name=root.name + "-debug.apk")
-    except Exception as e:
-        return error(e, 404)
-
-
-@app.post("/api/git")
-def git():
-    d = request.get_json(silent=True) or {}
-    try:
-        root = project_root(d.get("project"))
-        action = d.get("action")
-        cmds = {
-            "status": "git status --short --branch",
-            "diff": "git diff --",
-            "log": "git log -8 --oneline --decorate",
-            "branches": "git branch -a",
-            "commit": "git add -u && git commit -m " + json.dumps(str(d.get("message") or "IDE update")),
-            "pull": "git pull",
-            "push": "git push"
-        }
-        if action not in cmds:
-            return error("Unknown Git action.")
-        r = command(cmds[action], root, 180)
-        return jsonify(r)
-    except Exception as e:
-        return error(e)
-
-
-@app.post("/api/sqlite")
-def sqlite_query():
-    d = request.get_json(silent=True) or {}
-    try:
-        root = project_root(d.get("project"))
-        p = safe_path(root, d.get("path", ""))
-        query = str(d.get("query", "")).strip()
-        if not p.is_file() or p.suffix.lower() not in (".db", ".sqlite", ".sqlite3"):
-            return error("Choose an existing SQLite database file.")
-        if not re.match(r"^(SELECT|PRAGMA|EXPLAIN)\b", query, re.I):
-            return error("Only SELECT, PRAGMA and EXPLAIN are allowed.")
-        con = sqlite3.connect("file:" + str(p) + "?mode=ro", uri=True, timeout=5)
-        con.row_factory = sqlite3.Row
+@app.route("/api/scan-errors/<path:name>")
+def scan_errors(name):
+    project = safe_project(name)
+    if project is None or not project.exists():
+        return jsonify({"error":"Invalid"}), 400
+    results = []; scanned = 0
+    for path in sorted(project.rglob("*")):
+        if not path.is_file(): continue
+        parts = str(path).split(os.sep)
+        if any(p in ("build",".gradle",".git","node_modules","__pycache__") for p in parts): continue
         try:
-            cur = con.execute(query)
-            rows = [dict(r) for r in cur.fetchmany(200)]
-            return jsonify({"ok": True, "columns": [x[0] for x in cur.description] if cur.description else [], "rows": rows, "limit": 200})
-        finally:
-            con.close()
-    except Exception as e:
-        return error(e)
-
-
-@app.get("/api/settings")
-def get_settings():
-    s = read_settings()
-    # Never return the saved API key to the browser.
-    s.pop("aiKey", None)
-    return jsonify({"ok": True, **s})
-
-
-@app.post("/api/settings")
-def set_settings():
-    d = request.get_json(silent=True) or {}
-    allowed = {"aiEndpoint", "aiModel", "aiKey", "autosaveDelay", "theme"}
-    clean = {k: v for k, v in d.items() if k in allowed}
-    try:
-        if "aiEndpoint" in clean and clean["aiEndpoint"]:
-            if not clean["aiEndpoint"].startswith("https://"):
-                return error("AI endpoint must use HTTPS.")
-        save_settings(clean)
-        return jsonify({"ok": True})
-    except Exception as e:
-        return error(e)
-
-
-@app.post("/api/ai")
-def ai():
-    d = request.get_json(silent=True) or {}
-    settings = read_settings()
-    endpoint = settings.get("aiEndpoint", "")
-    key = settings.get("aiKey", "")
-    model = settings.get("aiModel", "")
-    prompt = str(d.get("prompt", "")).strip()
-    if not endpoint or not key or not model:
-        return error("Configure an HTTPS AI endpoint, model and API key in Settings.")
-    if not prompt:
-        return error("Prompt is empty.")
-    if len(prompt) > 50000:
-        return error("Prompt is too long.")
-    try:
-        body = json.dumps({
-            "model": model,
-            "messages": [
-                {"role": "system", "content": "You are a careful coding assistant. Explain risks and do not claim code was tested unless it was."},
-                {"role": "user", "content": prompt}
-            ],
-            "temperature": 0.2
-        }).encode("utf-8")
-        req = urllib.request.Request(
-            endpoint, data=body, method="POST",
-            headers={"Content-Type": "application/json", "Authorization": "Bearer " + key}
-        )
-        with urllib.request.urlopen(req, timeout=60) as res:
-            payload = json.loads(res.read().decode("utf-8", "replace"))
-        answer = payload.get("choices", [{}])[0].get("message", {}).get("content", "")
-        if not answer:
-            return error("AI provider returned no message.")
-        return jsonify({"ok": True, "answer": answer})
-    except urllib.error.HTTPError as e:
-        return error("AI provider HTTP error: " + str(e.code))
-    except Exception as e:
-        return error("AI request failed: " + str(e))
-
-
-@app.post("/api/http-test")
-def http_test():
-    d = request.get_json(silent=True) or {}
-    url = str(d.get("url", "")).strip()
-    method = str(d.get("method", "GET")).upper()
-    if method not in ("GET", "POST", "PUT", "PATCH", "DELETE"):
-        return error("Unsupported HTTP method.")
-    if not url.startswith("https://"):
-        return error("Only HTTPS URLs are allowed.")
-    try:
-        body = d.get("body", "")
-        data = body.encode("utf-8") if body and method in ("POST", "PUT", "PATCH") else None
-        req = urllib.request.Request(
-            url, data=data, method=method,
-            headers={"Content-Type": "application/json", "User-Agent": "ZihadMobileIDE/1.0"}
-        )
-        with urllib.request.urlopen(req, timeout=20) as res:
-            text = res.read(500000).decode("utf-8", "replace")
-            return jsonify({"ok": True, "status": res.status, "headers": dict(res.headers), "body": text})
-    except urllib.error.HTTPError as e:
+            if path.stat().st_size > 500_000: continue
+        except Exception: continue
+        ext = path.suffix.lower()
+        lang = LANGUAGES.get(ext)
+        if not lang or not lang["check"]: continue
+        scanned += 1
+        rel = str(path.relative_to(project))
+        cmd = lang["check"].replace("{file}", str(path))
         try:
-            body = e.read(200000).decode("utf-8", "replace")
-        except Exception:
-            body = ""
-        return jsonify({"ok": False, "status": e.code, "body": body})
+            r = subprocess.run(cmd, shell=True, cwd=str(path.parent),
+                              capture_output=True, text=True, timeout=30)
+            if r.returncode != 0:
+                out = (r.stdout or "") + "\n" + (r.stderr or "")
+                errs = parse_errors(lang["name"], out, str(path))
+                if errs:
+                    results.append({"path":rel,"language":lang["name"],"errors":errs})
+        except Exception: continue
+    return jsonify({"scanned":scanned,"results":results})
+
+@app.route("/api/run-command", methods=["POST"])
+def run_command():
+    data = request.get_json(silent=True) or {}
+    project = safe_project(data.get("project",""))
+    if project is None or not project.exists():
+        return jsonify({"error":"Invalid"}), 400
+    cmd = data.get("cmd","").strip()
+    if not cmd: return jsonify({"error":"Empty"}), 400
+    blocked = ["rm -rf /","mkfs","dd if=",":(){","shutdown","reboot"]
+    for b in blocked:
+        if b in cmd: return jsonify({"error":"Blocked"}), 403
+    try:
+        r = subprocess.run(cmd, shell=True, cwd=str(project),
+                          capture_output=True, text=True, timeout=180)
+        return jsonify({"stdout":r.stdout,"stderr":r.stderr,"returncode":r.returncode})
+    except subprocess.TimeoutExpired:
+        return jsonify({"error":"Timeout"}), 500
     except Exception as e:
-        return error(e)
+        return jsonify({"error":str(e)}), 500
 
+@app.route("/api/run-code", methods=["POST"])
+def run_code():
+    data = request.get_json(silent=True) or {}
+    project = safe_project(data.get("project",""))
+    if project is None or not project.exists():
+        return jsonify({"error":"Invalid"}), 400
+    target = safe_subpath(project, data.get("path",""))
+    if target is None or not target.is_file():
+        return jsonify({"error":"Not found"}), 404
+    ext = target.suffix.lower()
+    lang = LANGUAGES.get(ext)
+    if not lang: return jsonify({"error":"Unsupported"}), 400
+    if lang["run"] is None: return jsonify({"error":lang["name"]+" not runnable"}), 400
+    cmd = lang["run"].replace("{file}", str(target)).replace("{name}", target.name)
+    try:
+        r = subprocess.run(cmd, shell=True, cwd=str(target.parent),
+                          capture_output=True, text=True, timeout=120)
+        return jsonify({"language":lang["name"],"command":cmd,
+                       "stdout":r.stdout,"stderr":r.stderr,"returncode":r.returncode})
+    except subprocess.TimeoutExpired:
+        return jsonify({"error":"Timeout","language":lang["name"],"command":cmd}), 500
+    except Exception as e:
+        return jsonify({"error":str(e),"language":lang["name"],"command":cmd}), 500
 
-@app.errorhandler(413)
-def too_large(_e):
-    return jsonify({"ok": False, "error": "Request too large."}), 413
+def build_worker(build_id, project, env):
+    B = BUILDS[build_id]
+    cmd = "gradle assembleDebug --no-daemon --console=plain --parallel"
+    try:
+        proc = subprocess.Popen(cmd, shell=True, cwd=str(project), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, bufsize=1)
+        for line in iter(proc.stdout.readline, ""):
+            B["output"].append(line.rstrip())
+        proc.wait()
+        B["returncode"] = proc.returncode
+        apks = list(project.glob("app/build/outputs/apk/**/*.apk"))
+        B["apk_path"] = str(apks[0]) if apks else None
+        B["status"] = "done"
+        B["success"] = (proc.returncode == 0 and B["apk_path"] is not None)
+    except Exception as e:
+        B["output"].append("[build error] " + str(e))
+        B["status"] = "done"; B["success"] = False; B["returncode"] = -1
 
+@app.route("/api/build-start", methods=["POST"])
+def build_start():
+    data = request.get_json(silent=True) or {}
+    project = safe_project(data.get("project",""))
+    if project is None or not project.exists():
+        return jsonify({"error":"Invalid"}), 400
+    env = os.environ.copy()
+    sdk = Path.home() / "android-sdk"
+    if sdk.exists():
+        env["ANDROID_HOME"] = str(sdk); env["ANDROID_SDK_ROOT"] = str(sdk)
+    env["PATH"] = str(sdk / "platform-tools") + ":" + TERMUX_PREFIX + "/bin:" + env.get("PATH","")
+    build_id = str(uuid.uuid4())
+    BUILDS[build_id] = {"output":[],"status":"running","apk_path":None,"returncode":None,"success":None}
+    t = threading.Thread(target=build_worker, args=(build_id, project, env), daemon=True)
+    t.start()
+    return jsonify({"build_id": build_id, "status":"started"})
 
-@app.errorhandler(404)
-def missing(_e):
-    if request.path.startswith("/api/"):
-        return jsonify({"ok": False, "error": "API endpoint not found."}), 404
-    return "Not found", 404
+@app.route("/api/build-poll/<build_id>")
+def build_poll(build_id):
+    B = BUILDS.get(build_id)
+    if not B: return jsonify({"error":"Not found"}), 404
+    since = int(request.args.get("since", 0))
+    return jsonify({
+        "lines": B["output"][since:], "total": len(B["output"]),
+        "status": B["status"], "success": B.get("success"),
+        "apk_path": B.get("apk_path"), "returncode": B.get("returncode")
+    })
 
+@app.route("/api/download-apk/<path:name>")
+def download_apk(name):
+    project = safe_project(name)
+    if project is None or not project.exists(): return "Invalid", 400
+    apks = list(project.glob("app/build/outputs/apk/**/*.apk"))
+    if not apks: return "No APK found.", 404
+    apk = apks[0]
+    return send_file(str(apk), as_attachment=True, download_name=apk.name)
 
 if __name__ == "__main__":
-    print("=" * 48)
-    print("⚡ ZIHAD MOBILE IDE ULTRA PRO MAX")
-    print("Projects:", PROJECTS)
-    print("Backups :", BACKUPS)
-    print("Open    : http://127.0.0.1:" + str(PORT))
-    print("Security: localhost only")
-    print("=" * 48)
-    app.run(host=HOST, port=PORT, debug=False, threaded=True)
+    print("")
+    print("====================================")
+    print("⚡ ZIHAD MOBILE IDE v9 Premium")
+    print("====================================")
+    print("Projects  :", PROJECTS_DIR)
+    print("Server    :", f"http://127.0.0.1:{PORT}")
+    print("Features  : Live Preview, Multi-tab, Templates,")
+    print("            Bottom Nav, Animations, Settings")
+    print("====================================")
+    print("")
+    app.run(host="127.0.0.1", port=PORT, debug=False, threaded=True)
