@@ -4885,9 +4885,20 @@ setTimeout(function(){try{
 </html>
 '''
 
+@app.route("/api/download-file/<path:name>")
+def download_single_file(name):
+    project = safe_project(name)
+    if project is None or not project.exists():
+        return jsonify({"error": "Invalid"}), 400
+    sub = request.args.get("path", "")
+    target = safe_subpath(project, sub)
+    if target is None or not target.is_file():
+        return jsonify({"error": "Not found"}), 404
+    return send_file(str(target), as_attachment=True, download_name=target.name)
 # ============================================================
 # MAIN
 # ============================================================
+
 if __name__ == "__main__":
     print("")
     print("=================================================")
