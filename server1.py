@@ -1,10 +1,10 @@
 # ============================================================
-# ZIHAD MOBILE IDE v12.0 — ULTIMATE EDITION
+# ZIHAD MOBILE IDE v13.0 — ULTIMATE EDITION
 # PART 1/3 : Imports + Config + Helpers + Templates + Home
 # ============================================================
 from flask import Flask, jsonify, request, send_file, Response
 from pathlib import Path
-import json, re, subprocess, shutil, os, threading, time, uuid, zipfile, io, sys, base64, hashlib
+import json, re, subprocess, shutil, os, threading, time, uuid, zipfile, io, sys, base64, hashlib, sqlite3
 from datetime import datetime
 from werkzeug.utils import secure_filename
 
@@ -46,6 +46,7 @@ BOOKMARKS_FILE      = BASE_DIR / "bookmarks.json"
 SETTINGS_FILE       = BASE_DIR / "settings.json"
 APK_HISTORY_FILE    = BASE_DIR / "apk_history.json"
 SNIPPETS_FILE       = BASE_DIR / "snippets.json"
+IDE_SETTINGS_FILE   = BASE_DIR / "ide_settings.json"
 
 PORT = 3097
 TERMUX_PREFIX = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
@@ -78,6 +79,7 @@ LANGUAGES = {
     ".txt": {"name": "Text", "run": None, "check": None},
     ".gradle": {"name": "Gradle", "run": None, "check": None},
     ".properties": {"name": "Properties", "run": None, "check": None},
+    ".sql": {"name": "SQL", "run": None, "check": None},
 }
 
 GRADLE_HINTS = {
@@ -465,9 +467,14 @@ android {{
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }}
+    dependencies {{
+        implementation 'androidx.appcompat:appcompat:1.6.1'
+        implementation 'com.google.android.material:material:1.11.0'
+        implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
+    }}
 }}
 '''
-    gradle_props = '''org.gradle.jvmargs=-Xmx1536m -XX:MaxMetaspaceSize=512m
+    gradle_props = '''org.gradle.jvmargs=-Xmx2048m -XX:MaxMetaspaceSize=512m
 android.useAndroidX=true
 android.nonTransitiveRClass=true
 org.gradle.caching=true
@@ -499,6 +506,26 @@ org.gradle.parallel=true
     write_file(project / "project.json", json.dumps(project_info, indent=4))
     write_file(project / "hello.py", f'print("Hello from {name}")\n')
     write_file(project / ".gitignore", "build/\n.gradle/\nlocal.properties\n*.iml\n.idea/\n")
+    
+    # 🔴 Force update wrapper based on global settings before build
+    ide_settings = load_json(IDE_SETTINGS_FILE, {"gradleVersion": "8.11.1"})
+    gradle_ver = ide_settings.get("gradleVersion", "8.11.1")
+    
+    wrapper_dir = project / "gradle" / "wrapper"
+    wrapper_dir.mkdir(parents=True, exist_ok=True)
+    wrapper_props = f"""distributionBase=GRADLE_USER_HOME
+distributionPath=wrapper/dists
+distributionUrl=https\\://services.gradle.org/distributions/gradle-{gradle_ver}-bin.zip
+zipStoreBase=GRADLE_USER_HOME
+zipStorePath=wrapper/dists
+"""
+    write_file(wrapper_dir / "gradle-wrapper.properties", wrapper_props)
+    
+    try:
+        subprocess.run(f"gradle wrapper --gradle-version {gradle_ver}", shell=True, cwd=str(project), capture_output=True, timeout=60)
+    except Exception as e:
+        print("Failed to generate wrapper:", e)
+
     return project
 
 # ============================================================
@@ -507,7 +534,7 @@ org.gradle.parallel=true
 HOME_HTML = r'''<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<title>Zihad Mobile IDE v12</title>
+<title>Zihad Mobile IDE v13</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 <style>
 :root{--bg:#070b14;--card:rgba(17,24,39,.85);--border:rgba(55,65,81,.6);--primary:#3b82f6;--text:#f1f5f9;--muted:#94a3b8;--radius:18px}
@@ -550,7 +577,7 @@ body.light .project,body.light .apk-item,body.light .template-card{background:#f
 </style></head>
 <body>
 <header>
-  <h1><i class="fa-solid fa-bolt"></i> Zihad IDE v12</h1>
+  <h1><i class="fa-solid fa-bolt"></i> Zihad IDE v13</h1>
   <div style="display:flex;gap:2px;flex-wrap:wrap">
     <button class="btn-ghost" onclick="toggleTheme()" id="themeBtn"><i class="fa-solid fa-moon"></i></button>
     <button class="btn-ghost" onclick="location.href='/api/backup'"><i class="fa-solid fa-floppy-disk"></i></button>
@@ -624,7 +651,6 @@ status();loadProjects();
 # ============================================================
 # END OF PART 1 — Paste PART 2 BELOW THIS LINE
 # ============================================================
-
 # ============================================================
 # PART 2/3 : ALL FLASK ROUTES
 # ============================================================
@@ -639,7 +665,7 @@ def api_status():
     projects = [p for p in PROJECTS_DIR.iterdir() if p.is_dir()]
     langs = set(v["name"] for v in LANGUAGES.values())
     return jsonify({"server": "online", "port": PORT, "projects": len(projects),
-                    "language_count": len(langs), "version": "12.0"})
+                    "language_count": len(langs), "version": "13.0"})
 
 # ---------------- PROJECTS ----------------
 @app.route("/api/projects", methods=["GET"])
@@ -816,7 +842,6 @@ def file_content(name):
             try: backup_file_version(name, sub, target.read_text(encoding="utf-8", errors="replace"))
             except: pass
         target.write_text(new_content, encoding="utf-8")
-        # Trigger auto-build if enabled (in background)
         try:
             proj_settings = load_json(SETTINGS_FILE, {}).get(name, {})
             if proj_settings.get("autoBuild"):
@@ -992,6 +1017,151 @@ def firebase_inject():
             txt = txt.rstrip() + '\nplugins { id "com.google.gms.google-services" version "4.4.2" apply false }\n'
             root_gradle.write_text(txt, encoding="utf-8")
     return jsonify({"success": True})
+
+# ---------------- NEW: PACKAGES, DEPS & SDK ----------------
+@app.route("/api/packages", methods=["GET"])
+def list_packages():
+    try:
+        r = subprocess.run("pkg list-installed", shell=True, capture_output=True, text=True)
+        packages = []
+        for line in r.stdout.splitlines():
+            if "/" in line:
+                parts = line.split()
+                if len(parts) >= 2:
+                    packages.append({"name": parts[0].split('/')[0], "version": parts[1]})
+        return jsonify({"packages": packages})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/packages/upgrade", methods=["POST"])
+def upgrade_package():
+    data = request.get_json(silent=True) or {}
+    pkg = data.get("package", "").strip()
+    if not pkg: return jsonify({"error": "Package name required"}), 400
+    try:
+        cmd = f"pkg upgrade -y {pkg}" if pkg != "--all" else "pkg upgrade -y"
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
+        return jsonify({"success": True, "output": r.stdout})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/project-deps/<path:name>")
+def project_deps(name):
+    project = safe_project(name)
+    if not project: return jsonify({"error": "Invalid"}), 400
+    deps = []
+    gradle_file = project / "app" / "build.gradle"
+    if gradle_file.exists():
+        txt = gradle_file.read_text(encoding="utf-8")
+        matches = re.findall(r"(?:implementation|api|compileOnly)\s+['\"]([^'\"]+)['\"]", txt)
+        for m in matches: deps.append(m)
+    root_gradle = project / "build.gradle"
+    if root_gradle.exists():
+        txt = root_gradle.read_text(encoding="utf-8")
+        matches = re.findall(r"id\s+['\"]([^'\"]+)['\"]\s+version\s+['\"]([^'\"]+)['\"]", txt)
+        for m in matches: deps.append(f"Plugin: {m[0]} v{m[1]}")
+    return jsonify({"dependencies": deps})
+
+@app.route("/api/project-deps/update/<path:name>", methods=["POST"])
+def update_project_deps(name):
+    project = safe_project(name)
+    if not project: return jsonify({"error": "Invalid"}), 400
+    gradle_file = project / "app" / "build.gradle"
+    if not gradle_file.exists(): return jsonify({"error": "No app/build.gradle"}), 404
+    txt = gradle_file.read_text(encoding="utf-8")
+    
+    # Auto update known dependencies to newer versions
+    updates = {
+        "androidx.appcompat:appcompat": "1.7.0",
+        "com.google.android.material:material": "1.12.0",
+        "androidx.constraintlayout:constraintlayout": "2.2.0"
+    }
+    count = 0
+    for lib, ver in updates.items():
+        pattern = r"['\"]" + re.escape(lib) + r":[\d\.]+['\"]"
+        if re.search(pattern, txt):
+            txt = re.sub(pattern, f"'{lib}:{ver}'", txt)
+            count += 1
+            
+    if count > 0:
+        gradle_file.write_text(txt, encoding="utf-8")
+        return jsonify({"success": True, "updated": count})
+    return jsonify({"success": True, "updated": 0, "msg": "Already up to date"})
+
+@app.route("/api/sdk-update", methods=["POST"])
+def sdk_update():
+    data = request.get_json(silent=True) or {}
+    project = safe_project(data.get("project", ""))
+    if not project: return jsonify({"error": "Invalid"}), 400
+    gradle_file = project / "app" / "build.gradle"
+    if not gradle_file.exists(): return jsonify({"error": "No build.gradle"}), 404
+    txt = gradle_file.read_text(encoding="utf-8")
+    sdk = str(data.get("compileSdk", "34"))
+    txt = re.sub(r"compileSdk\s+\d+", f"compileSdk {sdk}", txt)
+    txt = re.sub(r"targetSdk\s+\d+", f"targetSdk {sdk}", txt)
+    gradle_file.write_text(txt, encoding="utf-8")
+    return jsonify({"success": True})
+
+# ---------------- NEW: APK ANALYZER & SQLITE ----------------
+@app.route("/api/apk-analyze/<path:name>")
+def apk_analyze(name):
+    project = safe_project(name)
+    if not project: return jsonify({"error": "Invalid"}), 400
+    apks = list(project.glob("app/build/outputs/apk/**/*.apk"))
+    if not apks: return jsonify({"error": "No APK built yet"}), 404
+    target_apk = str(apks[0])
+    try:
+        r = subprocess.run(f"aapt dump badging {target_apk}", shell=True, capture_output=True, text=True)
+        if r.returncode != 0:
+            r = subprocess.run(f"$PREFIX/bin/aapt2 dump badging {target_apk}", shell=True, capture_output=True, text=True)
+        return jsonify({"success": True, "info": r.stdout})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/db-tables/<path:name>")
+def db_tables(name):
+    project = safe_project(name)
+    if not project: return jsonify({"error": "Invalid"}), 400
+    db_path = request.args.get("path", "")
+    target = safe_subpath(project, db_path)
+    if not target or not target.exists() or not target.is_file():
+        return jsonify({"error": "File not found"}), 404
+    try:
+        conn = sqlite3.connect(str(target))
+        cursor = conn.cursor()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        tables = [row[0] for row in cursor.fetchall()]
+        conn.close()
+        return jsonify({"tables": tables})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/db-query/<path:name>", methods=["POST"])
+def db_query(name):
+    project = safe_project(name)
+    if not project: return jsonify({"error": "Invalid"}), 400
+    data = request.get_json(silent=True) or {}
+    db_path = data.get("path", "")
+    query = data.get("query", "").strip()
+    if not query: return jsonify({"error": "Query empty"}), 400
+    target = safe_subpath(project, db_path)
+    if not target or not target.exists():
+        return jsonify({"error": "File not found"}), 404
+    try:
+        conn = sqlite3.connect(str(target))
+        cursor = conn.cursor()
+        cursor.execute(query)
+        if query.lower().startswith("select"):
+            columns = [description[0] for description in cursor.description] if cursor.description else []
+            rows = cursor.fetchall()
+            conn.close()
+            return jsonify({"success": True, "columns": columns, "rows": rows})
+        else:
+            conn.commit()
+            conn.close()
+            return jsonify({"success": True, "msg": "Query executed successfully"})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 # ---------------- APKs ----------------
 @app.route("/api/apks")
@@ -1306,8 +1476,14 @@ def pty_stop(sid):
 # ---------------- BUILD ----------------
 def build_worker(build_id, project, env):
     B = BUILDS[build_id]
-    cmd = "gradle assembleDebug --no-daemon --console=plain --parallel"
     try:
+        # Force update wrapper based on global settings before build
+        ide_settings = load_json(IDE_SETTINGS_FILE, {"gradleVersion": "8.11.1"})
+        gradle_ver = ide_settings.get("gradleVersion", "8.11.1")
+        subprocess.run(f"gradle wrapper --gradle-version {gradle_ver}", shell=True, cwd=str(project), capture_output=True, timeout=60)
+
+        cmd = "./gradlew assembleDebug --no-daemon --console=plain --parallel"
+        
         B["started"] = B.get("started", time.time())
         proc = subprocess.Popen(cmd, shell=True, cwd=str(project), env=env,
                                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -1521,6 +1697,16 @@ def settings_mgr(name):
     all_s[name] = cur
     save_json(SETTINGS_FILE, all_s)
     return jsonify({"success": True, "settings": cur})
+
+@app.route("/api/ide-settings", methods=["GET", "POST"])
+def ide_settings():
+    settings = load_json(IDE_SETTINGS_FILE, {"gradleVersion": "8.11.1"})
+    if request.method == "GET":
+        return jsonify(settings)
+    data = request.get_json(silent=True) or {}
+    settings.update(data)
+    save_json(IDE_SETTINGS_FILE, settings)
+    return jsonify({"success": True, "settings": settings})
 
 # ---------------- NOTIFICATIONS ----------------
 @app.route("/api/notifications")
@@ -1895,8 +2081,13 @@ def sign_release(name):
         env["ANDROID_HOME"] = str(sdk)
         env["ANDROID_SDK_ROOT"] = str(sdk)
     env["PATH"] = str(sdk / "platform-tools") + ":" + TERMUX_PREFIX + "/bin:" + env.get("PATH", "")
+    
+    ide_settings = load_json(IDE_SETTINGS_FILE, {"gradleVersion": "8.11.1"})
+    gradle_ver = ide_settings.get("gradleVersion", "8.11.1")
+    subprocess.run(f"gradle wrapper --gradle-version {gradle_ver}", shell=True, cwd=str(project), capture_output=True, timeout=60)
+
     try:
-        r = subprocess.run("gradle assembleRelease --no-daemon --console=plain",
+        r = subprocess.run("./gradlew assembleRelease --no-daemon --console=plain",
                            shell=True, cwd=str(project), env=env,
                            capture_output=True, text=True, timeout=900)
         apks = list(project.glob("app/build/outputs/apk/release/*.apk"))
@@ -2354,7 +2545,7 @@ def pwa_manifest():
 @app.route("/sw.js")
 def service_worker():
     sw = """
-const CACHE='zihad-ide-v12';
+const CACHE='zihad-ide-v13';
 self.addEventListener('install',e=>self.skipWaiting());
 self.addEventListener('activate',e=>e.waitUntil(clients.claim()));
 self.addEventListener('fetch',e=>{
@@ -2367,7 +2558,6 @@ self.addEventListener('fetch',e=>{
 # ============================================================
 # END OF PART 2 — Paste PART 3 BELOW THIS LINE
 # ============================================================
-
 # ============================================================
 # PART 3/3 : IDE_HTML (Full UI) + Main Block
 # ============================================================
@@ -2379,7 +2569,7 @@ IDE_HTML = r'''<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <meta name="theme-color" content="#3b82f6">
 <link rel="manifest" href="/manifest.json">
-<title>__NAME__ - Zihad IDE v12</title>
+<title>__NAME__ - Zihad IDE v13</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/dracula.min.css">
@@ -2416,7 +2606,7 @@ header h2 i{color:#60a5fa}
 .nav-item.active{color:#60a5fa}
 .nav-item.active::before{content:"";position:absolute;top:0;left:22%;right:22%;height:3px;background:linear-gradient(90deg,transparent,#3b82f6,transparent);border-radius:3px}
 .nav-item i{font-size:18px}
-.main-area{height:calc(100vh - var(--header-h) - var(--bottom-h));overflow:hidden}
+.main-area{height:calc(100vh - var(--header-h) - var(--bottom-h));overflow:hidden;transition:max-width 0.3s ease,width 0.3s ease}
 .panel{display:none;height:100%;overflow-y:auto;padding:10px;padding-bottom:140px;-webkit-overflow-scrolling:touch}
 .panel.active{display:block}
 .breadcrumb{background:rgba(8,15,28,.7);padding:8px 11px;border-radius:10px;margin-bottom:8px;font-size:12px;word-break:break-all}
@@ -2575,7 +2765,7 @@ header h2 i{color:#60a5fa}
   </div>
 </header>
 
-<div class="main-area">
+<div class="main-area" id="mainArea">
   <!-- FILES -->
   <div class="panel active" id="panel-explorer">
     <div class="toolbar">
@@ -2684,10 +2874,24 @@ header h2 i{color:#60a5fa}
           <button class="btn btn-primary" style="flex:1;padding:11px" onclick="adbInstall()"><i class="fa-solid fa-mobile-button"></i> ADB Install</button>
           <button class="btn btn-danger" style="flex:1;padding:11px" onclick="cleanBuild()"><i class="fa-solid fa-broom"></i> Clean</button>
         </div>
+        <button class="btn btn-orange" style="width:100%;padding:11px;margin-top:6px" onclick="analyzeApk()"><i class="fa-solid fa-magnifying-glass-chart"></i> Analyze APK</button>
       </div>
     </div>
     <div class="info-bar"><i class="fa-solid fa-list-check"></i> Live Build Log</div>
     <div class="output-box" id="buildLog">$ Waiting...</div>
+  </div>
+
+  <!-- PACKAGES -->
+  <div class="panel" id="panel-packages">
+    <div class="info-bar"><i class="fa-solid fa-boxes-stacked"></i> Termux Packages</div>
+    <div class="toolbar">
+      <button class="btn btn-primary" onclick="loadPackages()"><i class="fa-solid fa-rotate"></i> Refresh</button>
+      <button class="btn btn-success" onclick="upgradeAll()"><i class="fa-solid fa-arrow-up"></i> Upgrade All</button>
+      <button class="btn btn-purple" onclick="showProjectDeps()"><i class="fa-solid fa-cubes"></i> Project Deps</button>
+    </div>
+    <div id="pkgList" style="background:#0b1220;border-radius:10px;padding:10px;max-height:calc(100vh - 280px);overflow-y:auto;font-family:monospace;font-size:12px;">
+      <div class="empty">Loading...</div>
+    </div>
   </div>
 
   <!-- GIT -->
@@ -2771,6 +2975,7 @@ header h2 i{color:#60a5fa}
   <div class="nav-item" data-panel="errors" onclick="switchPanel('errors',this)"><i class="fa-solid fa-bug"></i><span>Errors</span></div>
   <div class="nav-item" data-panel="terminal" onclick="switchPanel('terminal',this)"><i class="fa-solid fa-terminal"></i><span>Term</span></div>
   <div class="nav-item" data-panel="build" onclick="switchPanel('build',this)"><i class="fa-solid fa-hammer"></i><span>Build</span></div>
+  <div class="nav-item" data-panel="packages" onclick="switchPanel('packages',this)"><i class="fa-solid fa-boxes-stacked"></i><span>Pkgs</span></div>
   <div class="nav-item" data-panel="git" onclick="switchPanel('git',this)"><i class="fa-brands fa-git-alt"></i><span>Git</span></div>
   <div class="nav-item" data-panel="logcat" onclick="switchPanel('logcat',this)"><i class="fa-solid fa-list-ul"></i><span>Log</span></div>
   <div class="nav-item" data-panel="kanban" onclick="switchPanel('kanban',this)"><i class="fa-solid fa-list-check"></i><span>Todo</span></div>
@@ -2833,6 +3038,16 @@ header h2 i{color:#60a5fa}
       <option value="en">English</option>
       <option value="bn">বাংলা</option>
     </select>
+    <label style="font-size:12px">Global Gradle Version</label>
+    <div style="display:flex;gap:6px;margin:5px 0">
+      <input type="text" id="gradleVerInput" placeholder="e.g. 8.11.1" style="flex:1;margin:0">
+      <button class="btn btn-success" onclick="saveIdeSettings()">Save</button>
+    </div>
+    <label style="font-size:12px">Compile SDK Version</label>
+    <div style="display:flex;gap:6px;margin:5px 0">
+      <input type="number" id="compileSdkInput" placeholder="e.g. 34" style="flex:1;margin:0">
+      <button class="btn btn-primary" onclick="saveSdkVersion()">Update</button>
+    </div>
     <div style="display:flex;gap:6px;margin-top:10px">
       <button class="btn btn-pink" style="flex:1;padding:11px" onclick="openCustomThemes()"><i class="fa-solid fa-palette"></i> Custom Themes</button>
       <button class="btn btn-purple" style="flex:1;padding:11px" onclick="openPlugins()"><i class="fa-solid fa-puzzle-piece"></i> Plugins</button>
@@ -2853,7 +3068,7 @@ header h2 i{color:#60a5fa}
       <div class="more-item" onclick="closeModal();openIconGen()"><i class="fa-solid fa-image"></i>Icon</div>
       <div class="more-item" onclick="closeModal();openEnvMgr()"><i class="fa-solid fa-key"></i>ENV</div>
       <div class="more-item" onclick="closeModal();openBulkRename()"><i class="fa-solid fa-i-cursor"></i>Bulk</div>
-      <div class="more-item" onclick="closeModal();openFirebase()"><i class="fa-solid fa-fire"></i>Firebase</div>
+      <div class="more-item" onclick="closeModal();openFirebaseWizard()"><i class="fa-solid fa-fire"></i>Firebase</div>
       <div class="more-item" onclick="closeModal();bumpVersion()"><i class="fa-solid fa-hashtag"></i>Bump Ver</div>
       <div class="more-item" onclick="closeModal();openKeystore()"><i class="fa-solid fa-lock"></i>Keystore</div>
       <div class="more-item" onclick="closeModal();signRelease()"><i class="fa-solid fa-certificate"></i>Sign Rel</div>
@@ -2864,6 +3079,7 @@ header h2 i{color:#60a5fa}
       <div class="more-item" onclick="closeModal();cleanBuild(true)"><i class="fa-solid fa-broom"></i>Clean</div>
       <div class="more-item" onclick="closeModal();showRecent()"><i class="fa-solid fa-clock-rotate-left"></i>Recent</div>
       <div class="more-item" onclick="closeModal();showShortcuts()"><i class="fa-solid fa-keyboard"></i>Keys</div>
+      <div class="more-item" onclick="closeModal();openSqliteViewer()"><i class="fa-solid fa-database"></i>SQLite</div>
       <div class="more-item" onclick="closeModal();location.href='/api/backup'"><i class="fa-solid fa-floppy-disk"></i>Backup</div>
       <div class="more-item" onclick="closeModal();openRestore()"><i class="fa-solid fa-download"></i>Restore</div>
     </div>
@@ -2929,29 +3145,42 @@ function switchPanel(id,el){
   else{var n=document.querySelector('[data-panel="'+id+'"]');if(n)n.classList.add("active");}
   var panel=document.getElementById("panel-"+id);
   if(panel) panel.classList.add("active");
+  
+  // 🔴 Desktop Mode for Log Section
+  var mainArea = document.getElementById("mainArea");
+  if(id === "logcat") {
+      mainArea.style.maxWidth = "100%";
+      mainArea.style.width = "100%";
+  } else {
+      mainArea.style.maxWidth = "";
+      mainArea.style.width = "";
+  }
+
   if(id==="preview")refreshPreview();
   if(id==="git")gitAction("status");
   if(id==="kanban")loadKanban();
   if(id==="notes")loadNotes();
   if(id==="analytics")loadAnalytics();
+  if(id==="packages")loadPackages();
 }
 function getMode(filename){
   var ext=filename.split(".").pop().toLowerCase();
   var map={py:"python",c:"text/x-csrc",cpp:"text/x-c++src",cc:"text/x-c++src",
     java:"text/x-java",kt:"text/x-kotlin",js:"javascript",xml:"xml",html:"htmlmixed",
-    css:"css",json:"application/json",md:"markdown",sh:"text/x-sh",gradle:"text/x-java"};
+    css:"css",json:"application/json",md:"markdown",sh:"text/x-sh",gradle:"text/x-java",sql:"sql"};
   return map[ext]||"null";
 }
 function showModal(html){document.getElementById("genericModalContent").innerHTML=html;document.getElementById("genericModal").classList.add("show");}
 function closeModal(){document.getElementById("genericModal").classList.remove("show");}
 function fileCategory(name){
   var ext=name.split(".").pop().toLowerCase();
-  if(["java","kt","py","js","ts","c","cpp","cc","h","go","rs","rb","php","pl","sh","gradle"].indexOf(ext)>=0)return "code";
+  if(["java","kt","py","js","ts","c","cpp","cc","h","go","rs","rb","php","pl","sh","gradle","sql"].indexOf(ext)>=0)return "code";
   if(["png","jpg","jpeg","gif","webp","svg","bmp"].indexOf(ext)>=0)return "image";
   if(["mp4","mov","avi","mkv","webm"].indexOf(ext)>=0)return "video";
   if(["mp3","wav","ogg","flac","m4a"].indexOf(ext)>=0)return "audio";
   if(["xml","json","html","css","md","txt","properties","yaml","yml"].indexOf(ext)>=0)return "doc";
   if(["zip","tar","gz","rar","7z","apk","jar"].indexOf(ext)>=0)return "zip";
+  if(["db","sqlite","sqlite3"].indexOf(ext)>=0)return "code";
   return "";
 }
 function fileIcon(name,isFolder){
@@ -2965,7 +3194,7 @@ function fileIcon(name,isFolder){
     png:"fa-image",jpg:"fa-image",jpeg:"fa-image",gif:"fa-image",svg:"fa-bezier-curve",
     mp4:"fa-video",mov:"fa-video",mp3:"fa-music",wav:"fa-music",
     zip:"fa-file-zipper",tar:"fa-file-zipper",apk:"fa-android",jar:"fa-mug-hot",
-    sql:"fa-database",db:"fa-database"};
+    sql:"fa-database",db:"fa-database",sqlite:"fa-database"};
   return map[ext]||"fa-file";
 }
 function highlight(name,q){
@@ -3119,6 +3348,149 @@ async function showRecent(){
     html+='<button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>';
     showModal(html);
   }catch(e){toast("Error","error");}
+}
+
+// ============ PACKAGES & DEPS ============
+async function loadPackages(){
+  var box = document.getElementById("pkgList");
+  if(!box) return;
+  box.innerHTML = '<div class="empty"><i class="fa-solid fa-spinner fa-spin"></i> Loading packages...</div>';
+  try{
+    var r = await fetch("/api/packages");
+    var d = await r.json();
+    if(!d.packages || !d.packages.length) {
+      box.innerHTML = '<div class="empty">No packages found.</div>';
+      return;
+    }
+    var html = "";
+    d.packages.forEach(function(p){
+      html += '<div style="display:flex;justify-content:space-between;padding:6px;border-bottom:1px solid #1f2937;">';
+      html += '<span style="color:#60a5fa;">' + esc(p.name) + '</span>';
+      html += '<span style="color:#94a3b8;margin-right:10px;">v' + esc(p.version) + '</span>';
+      html += '<button class="btn btn-success" style="padding:2px 8px;font-size:10px;" onclick="upgradePkg(\'' + esc(p.name) + '\')"><i class="fa-solid fa-arrow-up"></i></button>';
+      html += '</div>';
+    });
+    box.innerHTML = html;
+  }catch(e){ box.innerHTML = '<div class="empty" style="color:#f87171">Error loading packages</div>'; }
+}
+async function upgradePkg(pkgName){
+  if(!confirm("Upgrade " + pkgName + "?")) return;
+  toast("Upgrading " + pkgName + "... Please wait", "info");
+  try{
+    var r = await fetch("/api/packages/upgrade", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({package: pkgName})
+    });
+    var d = await r.json();
+    if(r.ok) { toast("Upgraded " + pkgName + "!"); loadPackages(); }
+    else toast(d.error || "Failed", "error");
+  }catch(e){ toast("Error", "error"); }
+}
+async function upgradeAll(){
+  if(!confirm("Upgrade all packages? This may take time.")) return;
+  toast("Upgrading all packages...", "info");
+  try{
+    var r = await fetch("/api/packages/upgrade", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({package: "--all"})
+    });
+    var d = await r.json();
+    if(r.ok) { toast("All upgraded!"); loadPackages(); }
+  }catch(e){ toast("Error", "error"); }
+}
+async function showProjectDeps(){
+  showModal('<h3><i class="fa-solid fa-cubes"></i> Project Dependencies</h3><div id="depsBox" style="max-height:300px;overflow-y:auto;background:#0b1220;padding:10px;border-radius:10px;font-family:monospace;font-size:12px;">Loading...</div><button class="btn btn-primary" style="width:100%;margin-top:10px;padding:12px" onclick="updateProjectDeps()">Auto Update Deps</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Close</button>');
+  try{
+    var r = await fetch("/api/project-deps/" + encodeURIComponent(PROJECT));
+    var d = await r.json();
+    var box = document.getElementById("depsBox");
+    if(!d.dependencies || !d.dependencies.length){
+      box.innerHTML = '<div class="empty">No dependencies found.</div>';
+      return;
+    }
+    var html = "";
+    d.dependencies.forEach(function(dep){
+      html += '<div style="padding:5px;border-bottom:1px solid #1f2937;color:#a78bfa;">• ' + esc(dep) + '</div>';
+    });
+    box.innerHTML = html;
+  }catch(e){ document.getElementById("depsBox").innerText = "Error"; }
+}
+async function updateProjectDeps(){
+  toast("Checking for updates...", "info");
+  try{
+    var r = await fetch("/api/project-deps/update/" + encodeURIComponent(PROJECT), {method:"POST"});
+    var d = await r.json();
+    if(r.ok) {
+      toast("Updated " + d.updated + " dependencies!");
+      showProjectDeps();
+    } else toast(d.error || "Failed", "error");
+  }catch(e){ toast("Error", "error"); }
+}
+async function saveSdkVersion(){
+  var sdk = document.getElementById("compileSdkInput").value.trim();
+  if(!sdk) return toast("Enter SDK version", "error");
+  try{
+    var r = await fetch("/api/sdk-update", {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({project: PROJECT, compileSdk: sdk})
+    });
+    if(r.ok) toast("SDK updated to " + sdk);
+    else toast("Failed", "error");
+  }catch(e){ toast("Error", "error"); }
+}
+
+// ============ APK ANALYZER & SQLITE ============
+async function analyzeApk(){
+  switchPanel('build');
+  toast("Analyzing APK...", "info");
+  try{
+    var r = await fetch("/api/apk-analyze/" + encodeURIComponent(PROJECT));
+    var d = await r.json();
+    if(!r.ok) return toast(d.error || "Analyze failed", "error");
+    showModal('<h3><i class="fa-solid fa-magnifying-glass-chart"></i> APK Analyzer</h3><pre style="background:#000;color:#4ade80;padding:10px;border-radius:10px;font-size:10px;max-height:400px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;">' + esc(d.info) + '</pre><button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>');
+  }catch(e){ toast("Error", "error"); }
+}
+function openSqliteViewer(){
+  showModal('<h3><i class="fa-solid fa-database"></i> SQLite Viewer</h3><input id="dbPathInput" placeholder="Path to .db file (e.g. app.db)"><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="loadDbTables()">Load Tables</button><div id="dbTableList" style="margin-top:10px;"></div><div id="dbQueryArea" style="display:none;"><textarea id="dbQueryInput" placeholder="SELECT * FROM table;" style="height:80px;margin-top:10px;"></textarea><button class="btn btn-success" style="width:100%;margin-top:6px;padding:12px" onclick="runDbQuery()">Run Query</button></div><div id="dbResultArea" style="margin-top:10px;overflow-x:auto;"></div><button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>');
+}
+async function loadDbTables(){
+  var path = document.getElementById("dbPathInput").value.trim();
+  if(!path) return toast("Enter path", "error");
+  try{
+    var r = await fetch("/api/db-tables/" + encodeURIComponent(PROJECT) + "?path=" + encodeURIComponent(path));
+    var d = await r.json();
+    if(!r.ok) return toast(d.error || "Failed", "error");
+    var html = '<div style="font-size:12px;color:#60a5fa;margin-bottom:5px">Tables:</div>';
+    d.tables.forEach(function(t){
+      html += '<span style="display:inline-block;background:#1f2937;padding:4px 10px;border-radius:10px;margin:2px;cursor:pointer;font-size:11px;" onclick="document.getElementById(\'dbQueryInput\').value=\'SELECT * FROM '+esc(t)+'\'">'+esc(t)+'</span>';
+    });
+    document.getElementById("dbTableList").innerHTML = html;
+    document.getElementById("dbQueryArea").style.display = "block";
+  }catch(e){ toast("Error", "error"); }
+}
+async function runDbQuery(){
+  var path = document.getElementById("dbPathInput").value.trim();
+  var query = document.getElementById("dbQueryInput").value.trim();
+  if(!query) return;
+  try{
+    var r = await fetch("/api/db-query/" + encodeURIComponent(PROJECT), {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({path: path, query: query})
+    });
+    var d = await r.json();
+    if(!r.ok) return toast(d.error || "Query failed", "error");
+    if(d.msg) {
+      document.getElementById("dbResultArea").innerHTML = '<div style="color:#4ade80">' + d.msg + '</div>';
+      return;
+    }
+    var html = '<table style="width:100%;border-collapse:collapse;font-size:11px;font-family:monospace;">';
+    html += '<tr>' + d.columns.map(function(c){return '<th style="border:1px solid #1f2937;padding:4px;background:#0b1220;color:#60a5fa">'+esc(c)+'</th>';}).join('') + '</tr>';
+    d.rows.forEach(function(row){
+      html += '<tr>' + row.map(function(cell){return '<td style="border:1px solid #1f2937;padding:4px;color:#e2e8f0">'+esc(String(cell))+'</td>';}).join('') + '</tr>';
+    });
+    html += '</table>';
+    document.getElementById("dbResultArea").innerHTML = html;
+  }catch(e){ toast("Error", "error"); }
 }
 
 // ============ EDITOR ============
@@ -3624,14 +3996,14 @@ function startElapsedTimer(){
   },500);
 }
 function processBuildLine(line){
-  var log=document.getElementById("buildLog");
   var cls="";
   if(line.indexOf("BUILD SUCCESSFUL")>=0)cls="color:#4ade80";
   else if(line.indexOf("BUILD FAILED")>=0||line.indexOf("error:")>=0)cls="color:#f87171";
   else if(line.indexOf("> Task")>=0)cls="color:#fbbf24";
   else if(line.indexOf("💡 Hint:")>=0)cls="color:#fbbf24;font-weight:600";
-  log.innerHTML+="\n<span style='"+cls+"'>"+esc(line)+"</span>";
-  log.scrollTop=log.scrollHeight;
+  
+  var htmlStr = "<div style='"+cls+"'>"+esc(line)+"</div>";
+
   var m=line.match(/^>\s+Task\s+(:[\w:]+)/);
   if(m){
     tasksSeen++;
@@ -3647,13 +4019,35 @@ function processBuildLine(line){
   }
   if(line.indexOf("BUILD FAILED")>=0)
     document.getElementById("currentTask").innerHTML='<i class="fa-solid fa-circle-xmark" style="color:#f87171"></i> Build failed';
+
+  return htmlStr;
 }
 async function pollBuild(){
   if(!buildId)return;
   try{
     var r=await fetch("/api/build-poll/"+buildId+"?since="+lastLineIdx);
     var d=await r.json();
-    if(d.lines&&d.lines.length){d.lines.forEach(processBuildLine);lastLineIdx=d.total;}
+    
+    if(d.lines&&d.lines.length){
+      var logBox=document.getElementById("buildLog");
+      var combinedHtml = "";
+      
+      d.lines.forEach(function(line){
+         combinedHtml += processBuildLine(line);
+      });
+      
+      logBox.insertAdjacentHTML("beforeend", combinedHtml);
+      logBox.scrollTop=logBox.scrollHeight;
+      
+      if (logBox.childElementCount > 500) {
+          while (logBox.childElementCount > 300) {
+              logBox.removeChild(logBox.firstChild);
+          }
+      }
+      
+      lastLineIdx=d.total;
+    }
+    
     if(d.status==="done"){
       clearInterval(buildPollTimer);buildPollTimer=null;
       if(elapsedTimer){clearInterval(elapsedTimer);elapsedTimer=null;}
@@ -3679,7 +4073,7 @@ async function pollBuild(){
 async function buildApk(){
   if(!confirm("Build APK?"))return;
   switchPanel("build");
-  document.getElementById("buildLog").innerHTML="$ Starting build...";
+  document.getElementById("buildLog").innerHTML="<div style='color:#4ade80'>$ Starting build...</div>";
   document.getElementById("buildProgressBar").style.width="0%";
   document.getElementById("buildProgressText").innerText="0%";
   document.getElementById("currentTask").innerHTML='<i class="fa-solid fa-spinner fa-spin"></i> Starting...';
@@ -4135,10 +4529,10 @@ async function doBulkRename(){
     else toast(d.error||"Fail","error");
   }catch(err){toast("Error","error");}
 }
-function openFirebase(){
-  showModal('<h3><i class="fa-solid fa-fire"></i> Firebase Inject</h3><p style="font-size:12px;color:#94a3b8">Paste google-services.json:</p><textarea id="fbJson" style="height:220px;font-family:monospace;font-size:11px" placeholder=\'{"project_info":{...}}\'></textarea><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="doFirebase()">🚀 Inject</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>');
+function openFirebaseWizard(){
+  showModal('<h3><i class="fa-solid fa-fire"></i> Firebase Setup Wizard</h3><p style="font-size:12px;color:#94a3b8">Paste google-services.json content below:</p><textarea id="fbJson" style="height:220px;font-family:monospace;font-size:11px" placeholder=\'{"project_info":{...}}\'></textarea><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="doFirebaseWizard()">🚀 Inject</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>');
 }
-async function doFirebase(){
+async function doFirebaseWizard(){
   var j=document.getElementById("fbJson").value;
   try{
     var r=await fetch("/api/firebase-inject",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT,json:j})});
@@ -4373,7 +4767,7 @@ var PALETTE_CMDS=[
   {name:"Icon Generator",icon:"fa-image",run:openIconGen},
   {name:"ENV Manager",icon:"fa-key",run:openEnvMgr},
   {name:"Bulk Rename",icon:"fa-i-cursor",run:openBulkRename},
-  {name:"Firebase Inject",icon:"fa-fire",run:openFirebase},
+  {name:"Firebase Setup",icon:"fa-fire",run:openFirebaseWizard},
   {name:"Version Bump",icon:"fa-hashtag",run:bumpVersion},
   {name:"Keystore Config",icon:"fa-lock",run:openKeystore},
   {name:"Sign Release",icon:"fa-certificate",run:signRelease},
@@ -4388,6 +4782,8 @@ var PALETTE_CMDS=[
   {name:"Settings",icon:"fa-gear",run:openSettings},
   {name:"Toggle HTML/Android Preview",icon:"fa-eye",run:togglePreviewMode},
   {name:"Notifications",icon:"fa-bell",run:showNotifications},
+  {name:"APK Analyzer",icon:"fa-magnifying-glass-chart",run:analyzeApk},
+  {name:"SQLite Viewer",icon:"fa-database",run:openSqliteViewer},
 ];
 var paletteFiltered=PALETTE_CMDS.slice(),paletteIdx=0;
 function openCommandPalette(){
@@ -4426,6 +4822,7 @@ async function openSettings(){
   document.getElementById("cmTheme").value=localStorage.getItem("cmTheme")||"dracula";
   document.getElementById("uiLang").value=localStorage.getItem("uiLang")||"en";
   document.getElementById("settingsModal").classList.add("show");
+  loadIdeSettings();
   try{
     var r=await fetch("/api/settings/"+encodeURIComponent(PROJECT));
     var d=await r.json();
@@ -4436,14 +4833,29 @@ function applyFontSize(v){localStorage.setItem("fontSize",v);if(cm)cm.getWrapper
 function changeTheme(t){localStorage.setItem("cmTheme",t);if(cm)cm.setOption("theme",t);}
 function setLang(l){
   localStorage.setItem("uiLang",l);
-  var map={en:{explorer:"Files",preview:"Preview",errors:"Errors",terminal:"Term",build:"Build",git:"Git",logcat:"Log",kanban:"Todo",notes:"Notes",analytics:"Stats"},
-           bn:{explorer:"ফাইল",preview:"প্রিভিউ",errors:"ভুল",terminal:"টার্ম",build:"বিল্ড",git:"গিট",logcat:"লগ",kanban:"টুডু",notes:"নোট",analytics:"স্ট্যাট"}};
+  var map={en:{explorer:"Files",preview:"Preview",errors:"Errors",terminal:"Term",build:"Build",packages:"Pkgs",git:"Git",logcat:"Log",kanban:"Todo",notes:"Notes",analytics:"Stats"},
+           bn:{explorer:"ফাইল",preview:"প্রিভিউ",errors:"ভুল",terminal:"টার্ম",build:"বিল্ড",packages:"প্যাকেজ",git:"গিট",logcat:"লগ",kanban:"টুডু",notes:"নোট",analytics:"স্ট্যাট"}};
   var m=map[l]||map.en;
   document.querySelectorAll(".nav-item").forEach(function(it){
     var p=it.dataset.panel;
     if(p&&m[p]){var sp=it.querySelector("span");if(sp)sp.textContent=m[p];}
   });
   toast("Language: "+l);
+}
+async function loadIdeSettings(){
+  try{
+    var r=await fetch("/api/ide-settings");
+    var d=await r.json();
+    if(document.getElementById("gradleVerInput"))document.getElementById("gradleVerInput").value=d.gradleVersion||"8.11.1";
+  }catch(e){}
+}
+async function saveIdeSettings(){
+  var v=document.getElementById("gradleVerInput").value.trim();
+  if(!v)return;
+  try{
+    var r=await fetch("/api/ide-settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({gradleVersion:v})});
+    if(r.ok){toast("Gradle version set to "+v);}
+  }catch(e){toast("Error","error");}
 }
 
 // ============ SHORTCUTS ============
@@ -4479,7 +4891,7 @@ setTimeout(function(){try{
 if __name__ == "__main__":
     print("")
     print("=================================================")
-    print("⚡ ZIHAD MOBILE IDE v12.0 — ULTIMATE EDITION")
+    print("⚡ ZIHAD MOBILE IDE v13.0 — ULTIMATE EDITION")
     print("=================================================")
     print("Projects :", PROJECTS_DIR)
     print("APKs     :", APKS_DIR)
@@ -4492,7 +4904,8 @@ if __name__ == "__main__":
     print("Notes, Bookmarks, Plugins, Themes, Aliases,")
     print("Macros, Analytics, Auto-Build, Notifications,")
     print("Dev Tools, Snippets, Command Palette, i18n,")
-    print("PWA, Live Preview, Real Termux PTY")
+    print("PWA, Live Preview, Real Termux PTY, Packages,")
+    print("Dependencies, SDK Manager, APK Analyzer, SQLite Viewer")
     print("=================================================")
     print("")
     app.run(host="127.0.0.1", port=PORT, debug=False, threaded=True)
