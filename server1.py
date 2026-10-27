@@ -1,10 +1,11 @@
 # ============================================================
-# ZIHAD MOBILE IDE v13.0 — ULTIMATE EDITION
+# ZIHAD MOBILE IDE v14.0 — ULTIMATE PRO EDITION
 # PART 1/3 : Imports + Config + Helpers + Templates + Home
 # ============================================================
 from flask import Flask, jsonify, request, send_file, Response
 from pathlib import Path
 import json, re, subprocess, shutil, os, threading, time, uuid, zipfile, io, sys, base64, hashlib, sqlite3
+import urllib.request
 from datetime import datetime
 from werkzeug.utils import secure_filename
 
@@ -27,9 +28,12 @@ SIGNED_DIR     = BASE_DIR / "signed"
 PLUGINS_DIR    = BASE_DIR / "plugins"
 KANBAN_DIR     = BASE_DIR / "kanban"
 NOTES_DIR      = BASE_DIR / "notes"
+BUILD_LOG_CACHE_DIR = BASE_DIR / "build_logs_cache"
+PROJECT_CACHE_DIR   = BASE_DIR / "project_cache"
 
 for d in [PROJECTS_DIR, APKS_DIR, HISTORY_DIR, BACKUP_DIR,
-          SIGNED_DIR, PLUGINS_DIR, KANBAN_DIR, NOTES_DIR]:
+          SIGNED_DIR, PLUGINS_DIR, KANBAN_DIR, NOTES_DIR,
+          BUILD_LOG_CACHE_DIR, PROJECT_CACHE_DIR]:
     d.mkdir(parents=True, exist_ok=True)
 
 SAVED_COMMANDS_FILE = BASE_DIR / "saved_commands.json"
@@ -47,6 +51,8 @@ SETTINGS_FILE       = BASE_DIR / "settings.json"
 APK_HISTORY_FILE    = BASE_DIR / "apk_history.json"
 SNIPPETS_FILE       = BASE_DIR / "snippets.json"
 IDE_SETTINGS_FILE   = BASE_DIR / "ide_settings.json"
+TIMEOUTS_FILE       = BASE_DIR / "timeouts.json"
+EDITOR_THEMES_FILE  = BASE_DIR / "editor_themes.json"
 
 PORT = 3097
 TERMUX_PREFIX = os.environ.get("PREFIX", "/data/data/com.termux/files/usr")
@@ -54,7 +60,6 @@ BUILDS = {}
 LOGCAT_PROCS = {}
 PTY_SESSIONS = {}
 AUTO_BUILD_LOCK = {}
-AUTO_BUILD_DEBOUNCE = 4
 
 # ---------------- LANGUAGES ----------------
 LANGUAGES = {
@@ -108,7 +113,224 @@ def suggest_fix(line):
             return v
     return None
 
-# ---------------- HELPERS ----------------
+# ============================================================
+#  TIMEOUT MANAGEMENT SYSTEM
+# ============================================================
+DEFAULT_TIMEOUTS = {
+    "wrapper_generation": 300,
+    "build_timeout": 1800,
+    "build_poll_interval": 700,
+    "run_command": 300,
+    "run_code": 120,
+    "check_file": 60,
+    "scan_errors": 30,
+    "adb_install": 90,
+    "git_push": 180,
+    "git_pull": 180,
+    "git_fetch": 180,
+    "pty_poll_interval": 300,
+    "logcat_poll_interval": 700,
+    "notif_poll_interval": 3000,
+    "system_info_poll": 15000,
+    "auto_save_delay": 2500,
+    "auto_build_debounce": 4,
+    "download_jar_timeout": 120,
+}
+
+TIMEOUT_LABELS = {
+    "wrapper_generation": ("Gradle Wrapper Generation", "Time to generate/download Gradle wrapper", 30, 600),
+    "build_timeout": ("APK Build Timeout", "Max time for full build", 300, 7200),
+    "build_poll_interval": ("Build Log Poll Interval", "UI refresh rate during build (ms)", 300, 3000),
+    "run_command": ("Terminal Command Timeout", "Max time for shell commands", 30, 3600),
+    "run_code": ("Run Code Timeout", "Max time for code execution", 30, 900),
+    "check_file": ("File Check Timeout", "Max time for single file check", 10, 300),
+    "scan_errors": ("Error Scan Timeout", "Max time per file during scan", 10, 180),
+    "adb_install": ("ADB Install Timeout", "Max time for adb install", 30, 600),
+    "git_push": ("Git Push Timeout", "Max time for git push", 30, 1800),
+    "git_pull": ("Git Pull Timeout", "Max time for git pull", 30, 1800),
+    "git_fetch": ("Git Fetch Timeout", "Max time for git fetch", 30, 1800),
+    "pty_poll_interval": ("PTY Poll Interval", "PTY refresh rate (ms)", 100, 2000),
+    "logcat_poll_interval": ("Logcat Poll Interval", "Logcat refresh (ms)", 300, 3000),
+    "notif_poll_interval": ("Notification Poll", "Notification refresh (ms)", 1000, 10000),
+    "system_info_poll": ("System Info Poll", "System monitor refresh (ms)", 3000, 60000),
+    "auto_save_delay": ("Auto Save Delay", "Delay before auto-save (ms)", 500, 10000),
+    "auto_build_debounce": ("Auto Build Debounce", "Delay between auto-builds (sec)", 1, 60),
+    "download_jar_timeout": ("JAR Download Timeout", "Max time to download wrapper JAR", 30, 300),
+}
+
+def get_timeouts():
+    saved = load_json(TIMEOUTS_FILE, {})
+    merged = dict(DEFAULT_TIMEOUTS)
+    if isinstance(saved, dict):
+        for k, v in saved.items():
+            if k in DEFAULT_TIMEOUTS and isinstance(v, (int, float)):
+                merged[k] = max(1, int(v))
+    return merged
+
+def get_timeout(key, fallback=None):
+    return get_timeouts().get(key, fallback or DEFAULT_TIMEOUTS.get(key, 60))
+
+def save_timeouts(data):
+    current = get_timeouts()
+    for k, v in data.items():
+        if k in DEFAULT_TIMEOUTS:
+            try:
+                current[k] = max(1, int(float(v)))
+            except:
+                pass
+    save_json(TIMEOUTS_FILE, current)
+    return current
+
+# ============================================================
+#  BUILD LOG CACHE (only last, truncated)
+# ============================================================
+LOG_MAX_LINES = 5000
+
+def cache_build_log(project_name, lines):
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", project_name)
+    cache_file = BUILD_LOG_CACHE_DIR / f"{safe}.log"
+    meta_file = BUILD_LOG_CACHE_DIR / f"{safe}.meta.json"
+    if len(lines) > LOG_MAX_LINES:
+        lines = lines[-LOG_MAX_LINES:]
+    try:
+        cache_file.write_text("\n".join(lines), encoding="utf-8")
+        save_json(meta_file, {
+            "project": project_name, "saved_at": time.time(),
+            "total_lines": len(lines), "truncated": len(lines) >= LOG_MAX_LINES
+        })
+        return True
+    except Exception as e:
+        print(f"Log cache error: {e}")
+        return False
+
+def get_cached_log(project_name):
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", project_name)
+    cache_file = BUILD_LOG_CACHE_DIR / f"{safe}.log"
+    meta_file = BUILD_LOG_CACHE_DIR / f"{safe}.meta.json"
+    if not cache_file.exists():
+        return {"lines": [], "meta": None}
+    try:
+        lines = cache_file.read_text(encoding="utf-8").split("\n")
+        return {"lines": lines, "meta": load_json(meta_file, None)}
+    except:
+        return {"lines": [], "meta": None}
+
+def clear_cached_log(project_name):
+    safe = re.sub(r"[^a-zA-Z0-9_-]", "_", project_name)
+    for ext in [".log", ".meta.json"]:
+        f = BUILD_LOG_CACHE_DIR / f"{safe}{ext}"
+        if f.exists():
+            try: f.unlink()
+            except: pass
+
+# ============================================================
+#  VERSION VALIDATION
+# ============================================================
+def validate_version_code(v):
+    try:
+        n = int(v)
+        return 1 <= n < 2147483647
+    except:
+        return False
+
+def validate_version_name(v):
+    if not v or not isinstance(v, str):
+        return False
+    return re.match(r"^\d+(\.\d+){1,3}$", v.strip()) is not None
+
+# ============================================================
+#  PROJECT DETAILS HELPER
+# ============================================================
+SKIP_DIRS_DETAIL = {"build", ".gradle", ".git", "node_modules", ".cxx", "transforms-3", ".idea"}
+
+def get_project_details(project):
+    details = {
+        "name": project.name, "path": str(project),
+        "dependencies": [], "total_files": 0, "total_folders": 0,
+        "total_size": 0, "total_size_human": "0 B",
+        "language_stats": {}, "icon": None,
+        "version": {"code": "?", "name": "?"},
+        "manifest_info": {"permissions": [], "activities": []},
+        "history": [], "third_party": [], "package": "?"
+    }
+    ext_counts, ext_sizes = {}, {}
+    try:
+        for p in project.rglob("*"):
+            parts = set(p.parts)
+            if parts & SKIP_DIRS_DETAIL:
+                continue
+            try:
+                if p.is_file():
+                    details["total_files"] += 1
+                    sz = p.stat().st_size
+                    details["total_size"] += sz
+                    ext = p.suffix.lower() or "_noext"
+                    ext_counts[ext] = ext_counts.get(ext, 0) + 1
+                    ext_sizes[ext] = ext_sizes.get(ext, 0) + sz
+                elif p.is_dir():
+                    details["total_folders"] += 1
+            except:
+                continue
+    except:
+        pass
+    
+    details["total_size_human"] = human_size(details["total_size"])
+    
+    lang_map = {
+        ".java": "Java", ".kt": "Kotlin", ".xml": "XML", ".gradle": "Gradle",
+        ".py": "Python", ".js": "JavaScript", ".ts": "TypeScript",
+        ".html": "HTML", ".css": "CSS", ".json": "JSON", ".md": "Markdown",
+        ".c": "C", ".cpp": "C++", ".h": "C Header", ".go": "Go", ".rs": "Rust",
+        ".rb": "Ruby", ".php": "PHP", ".sh": "Shell", ".sql": "SQL",
+        ".properties": "Properties", ".txt": "Text"
+    }
+    total_code = sum(ext_counts.get(ext, 0) for ext in lang_map.keys())
+    if total_code > 0:
+        for ext, lang in lang_map.items():
+            cnt = ext_counts.get(ext, 0)
+            if cnt > 0:
+                details["language_stats"][lang] = {
+                    "count": cnt,
+                    "percent": round(cnt / total_code * 100, 1),
+                    "size": human_size(ext_sizes.get(ext, 0))
+                }
+    
+    gradle_file = project / "app" / "build.gradle"
+    if gradle_file.exists():
+        try:
+            txt = gradle_file.read_text(encoding="utf-8", errors="replace")
+            matches = re.findall(r"(?:implementation|api|compileOnly|runtimeOnly)\s+['\"]([^'\"]+)['\"]", txt)
+            for m in matches:
+                details["dependencies"].append({"name": m, "size": "~"})
+            plugins = re.findall(r"id\s+['\"]([^'\"]+)['\"]\s+version\s+['\"]([^'\"]+)['\"]", txt)
+            for m in plugins:
+                details["third_party"].append({"type": "plugin", "name": m[0], "version": m[1]})
+            vc = re.search(r"versionCode\s+(\d+)", txt)
+            vn = re.search(r'versionName\s+"([^"]+)"', txt)
+            if vc: details["version"]["code"] = vc.group(1)
+            if vn: details["version"]["name"] = vn.group(1)
+            ns = re.search(r'namespace\s+["\']([^"\']+)["\']', txt)
+            if ns: details["package"] = ns.group(1)
+        except:
+            pass
+    
+    manifest_file = project / "app" / "src" / "main" / "AndroidManifest.xml"
+    if manifest_file.exists():
+        try:
+            txt = manifest_file.read_text(encoding="utf-8", errors="replace")
+            icon_m = re.search(r'android:icon="@([^"]+)"', txt)
+            if icon_m: details["icon"] = icon_m.group(1)
+            details["manifest_info"]["permissions"] = re.findall(r'<uses-permission android:name="([^"]+)"', txt)
+            details["manifest_info"]["activities"] = re.findall(r'<activity android:name="([^"]+)"', txt)
+        except:
+            pass
+    
+    details["history"] = load_json(BUILD_HISTORY, {}).get(project.name, [])[:10]
+    return details
+
+# ============================================================
+#  STANDARD HELPERS
+# ============================================================
 def load_json(p, default=None):
     try: return json.loads(Path(p).read_text(encoding="utf-8"))
     except: return default if default is not None else {}
@@ -159,8 +381,7 @@ def backup_file_version(project_name, file_path, content):
 
 def add_recent(project, path):
     data = load_json(RECENT_FILES_FILE, {"items": []})
-    items = [i for i in data.get("items", [])
-             if not (i["project"] == project and i["path"] == path)]
+    items = [i for i in data.get("items", []) if not (i["project"] == project and i["path"] == path)]
     items.insert(0, {"project": project, "path": path, "ts": time.time()})
     data["items"] = items[:40]
     save_json(RECENT_FILES_FILE, data)
@@ -182,15 +403,80 @@ def expand_alias(cmd):
 def _push_notif(project, title, body, kind="info"):
     notifs = load_json(NOTIF_FILE, {"items": []}).get("items", [])
     notifs.insert(0, {
-        "id": str(uuid.uuid4())[:8],
-        "project": project, "title": title, "body": body,
-        "kind": kind, "ts": time.time(), "read": False
+        "id": str(uuid.uuid4())[:8], "project": project, "title": title,
+        "body": body, "kind": kind, "ts": time.time(), "read": False
     })
-    notifs = notifs[:200]
-    save_json(NOTIF_FILE, {"items": notifs})
+    save_json(NOTIF_FILE, {"items": notifs[:200]})
 
 # ============================================================
-# PROJECT CREATION WITH ALL TEMPLATES
+#  AUTO-DOWNLOAD GRADLE WRAPPER (fixes timeout)
+# ============================================================
+def ensure_wrapper_ready(project, gradle_ver="8.11.1", log_callback=None):
+    """Ensure gradle-wrapper.jar + gradlew exist. Downloads directly if missing."""
+    wrapper_dir = project / "gradle" / "wrapper"
+    wrapper_dir.mkdir(parents=True, exist_ok=True)
+    wrapper_jar = wrapper_dir / "gradle-wrapper.jar"
+    gradlew = project / "gradlew"
+    
+    if wrapper_jar.exists() and wrapper_jar.stat().st_size > 10000 and gradlew.exists():
+        if log_callback: log_callback(f"✓ Wrapper ready (v{gradle_ver})")
+        return True
+    
+    if log_callback: log_callback(f"📥 Downloading Gradle wrapper JAR (v{gradle_ver})...")
+    try:
+        url = f"https://raw.githubusercontent.com/gradle/gradle/v{gradle_ver}.0/gradle/wrapper/gradle-wrapper.jar"
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=get_timeout("download_jar_timeout")) as r:
+            wrapper_jar.write_bytes(r.read())
+        if log_callback: log_callback("✓ Wrapper JAR downloaded")
+    except Exception as e:
+        if log_callback: log_callback(f"⚠️ JAR download failed: {e}")
+        # Fallback to gradle wrapper command
+        try:
+            if log_callback: log_callback("⚙️ Trying gradle wrapper command...")
+            subprocess.run(
+                f"gradle wrapper --gradle-version {gradle_ver}",
+                shell=True, cwd=str(project), capture_output=True,
+                timeout=get_timeout("wrapper_generation")
+            )
+            if log_callback: log_callback("✓ Wrapper generated via command")
+        except subprocess.TimeoutExpired:
+            if log_callback: log_callback("❌ Wrapper generation timed out")
+            return False
+        except Exception as e:
+            if log_callback: log_callback(f"❌ Wrapper failed: {e}")
+            return False
+    
+    # Download gradlew scripts if missing
+    for fname in ["gradlew", "gradlew.bat"]:
+        fp = project / fname
+        if not fp.exists():
+            try:
+                url = f"https://raw.githubusercontent.com/gradle/gradle/v{gradle_ver}.0/{fname}"
+                req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+                with urllib.request.urlopen(req, timeout=get_timeout("download_jar_timeout")) as r:
+                    fp.write_bytes(r.read())
+                if fname == "gradlew":
+                    fp.chmod(0o755)
+            except:
+                pass
+    
+    # Ensure gradle-wrapper.properties has correct URL
+    props = wrapper_dir / "gradle-wrapper.properties"
+    props_content = f"""distributionBase=GRADLE_USER_HOME
+distributionPath=wrapper/dists
+distributionUrl=https\\://services.gradle.org/distributions/gradle-{gradle_ver}-bin.zip
+networkTimeout=120000
+validateDistributionUrl=true
+zipStoreBase=GRADLE_USER_HOME
+zipStorePath=wrapper/dists
+"""
+    props.write_text(props_content, encoding="utf-8")
+    
+    return wrapper_jar.exists() and wrapper_jar.stat().st_size > 10000
+
+# ============================================================
+#  PROJECT CREATION WITH ALL TEMPLATES
 # ============================================================
 def create_android_project(name, package, language, template="empty"):
     project = PROJECTS_DIR / name
@@ -295,22 +581,7 @@ public class HomeActivity extends Activity {{
         tv.setGravity(Gravity.CENTER); setContentView(tv);
     }}
 }}'''
-        home_kt = f'''package {package}
-import android.app.Activity
-import android.os.Bundle
-import android.view.Gravity
-import android.widget.TextView
-class HomeActivity : Activity() {{
-    override fun onCreate(s: Bundle?) {{ super.onCreate(s)
-        val tv = TextView(this).apply {{
-            text = "Home"; textSize = 24f; setTextColor(0xFFFFFFFF.toInt())
-            setBackgroundColor(0xFF0F172A.toInt()); gravity = Gravity.CENTER
-        }}
-        setContentView(tv)
-    }}
-}}'''
         write_file(java_dir / "HomeActivity.java", home_java)
-        write_file(kotlin_dir / "HomeActivity.kt", home_kt)
         return java, layout
 
     def bottom_nav_tpl():
@@ -392,6 +663,7 @@ class MainActivity : Activity() {{
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <uses-permission android:name="android.permission.INTERNET"/>
     <application android:theme="@style/AppTheme" android:label="@string/app_name"
+        android:icon="@mipmap/ic_launcher"
         android:allowBackup="true" android:supportsRtl="true">
         <activity android:name="{package}.MainActivity" android:exported="true">
             <intent-filter>
@@ -444,16 +716,23 @@ include(":app")
     id 'com.android.application' version '8.7.3' apply false
 }
 '''
+    
+    # Get SDK version from IDE settings
+    ide_settings = load_json(IDE_SETTINGS_FILE, {"gradleVersion": "8.11.1", "compileSdk": "34"})
+    compile_sdk = ide_settings.get("compileSdk", "34")
+    target_sdk = ide_settings.get("targetSdk", compile_sdk)
+    min_sdk = ide_settings.get("minSdk", "23")
+    
     app_gradle = f'''plugins {{
     id "com.android.application"
 }}
 android {{
     namespace "{package}"
-    compileSdk 34
+    compileSdk {compile_sdk}
     defaultConfig {{
         applicationId "{package}"
-        minSdk 23
-        targetSdk 34
+        minSdk {min_sdk}
+        targetSdk {target_sdk}
         versionCode 1
         versionName "1.0"
     }}
@@ -467,11 +746,12 @@ android {{
         sourceCompatibility JavaVersion.VERSION_17
         targetCompatibility JavaVersion.VERSION_17
     }}
-    dependencies {{
-        implementation 'androidx.appcompat:appcompat:1.6.1'
-        implementation 'com.google.android.material:material:1.11.0'
-        implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
-    }}
+}}
+
+dependencies {{
+    implementation 'androidx.appcompat:appcompat:1.6.1'
+    implementation 'com.google.android.material:material:1.11.0'
+    implementation 'androidx.constraintlayout:constraintlayout:2.1.4'
 }}
 '''
     gradle_props = '''org.gradle.jvmargs=-Xmx2048m -XX:MaxMetaspaceSize=512m
@@ -507,34 +787,19 @@ org.gradle.parallel=true
     write_file(project / "hello.py", f'print("Hello from {name}")\n')
     write_file(project / ".gitignore", "build/\n.gradle/\nlocal.properties\n*.iml\n.idea/\n")
     
-    # 🔴 Force update wrapper based on global settings before build
-    ide_settings = load_json(IDE_SETTINGS_FILE, {"gradleVersion": "8.11.1"})
+    # Setup wrapper (direct download, no timeout risk)
     gradle_ver = ide_settings.get("gradleVersion", "8.11.1")
+    ensure_wrapper_ready(project, gradle_ver)
     
-    wrapper_dir = project / "gradle" / "wrapper"
-    wrapper_dir.mkdir(parents=True, exist_ok=True)
-    wrapper_props = f"""distributionBase=GRADLE_USER_HOME
-distributionPath=wrapper/dists
-distributionUrl=https\\://services.gradle.org/distributions/gradle-{gradle_ver}-bin.zip
-zipStoreBase=GRADLE_USER_HOME
-zipStorePath=wrapper/dists
-"""
-    write_file(wrapper_dir / "gradle-wrapper.properties", wrapper_props)
-    
-    try:
-        subprocess.run(f"gradle wrapper --gradle-version {gradle_ver}", shell=True, cwd=str(project), capture_output=True, timeout=60)
-    except Exception as e:
-        print("Failed to generate wrapper:", e)
-
     return project
 
 # ============================================================
-# HOME PAGE
+#  HOME PAGE (Enhanced)
 # ============================================================
 HOME_HTML = r'''<!DOCTYPE html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
-<title>Zihad Mobile IDE v13</title>
+<title>Zihad Mobile IDE v14</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 <style>
 :root{--bg:#070b14;--card:rgba(17,24,39,.85);--border:rgba(55,65,81,.6);--primary:#3b82f6;--text:#f1f5f9;--muted:#94a3b8;--radius:18px}
@@ -574,12 +839,22 @@ body.light .card{background:#fff;color:#0f172a}
 body.light input,body.light select{background:#f8fafc;color:#0f172a}
 body.light header{background:#fff;color:#0f172a}
 body.light .project,body.light .apk-item,body.light .template-card{background:#f8fafc;color:#0f172a}
+.settings-list{display:flex;flex-direction:column;gap:10px}
+.setting-item{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--border);font-size:13px}
+.setting-item:last-child{border-bottom:0}
+.setting-item label{color:var(--text);font-weight:500}
+.setting-item small{display:block;color:var(--muted);font-size:11px;margin-top:2px}
+.setting-item input[type="number"],.setting-item input[type="text"],.setting-item select{width:110px;padding:8px 10px;margin:0;font-size:12px}
+.tabs{display:flex;gap:6px;margin-bottom:14px;border-bottom:1px solid var(--border);overflow-x:auto}
+.tab{padding:10px 16px;font-size:13px;font-weight:600;cursor:pointer;color:var(--muted);border-bottom:2px solid transparent;white-space:nowrap}
+.tab.active{color:#60a5fa;border-bottom-color:#60a5fa}
 </style></head>
 <body>
 <header>
-  <h1><i class="fa-solid fa-bolt"></i> Zihad IDE v13</h1>
+  <h1><i class="fa-solid fa-bolt"></i> Zihad IDE v14</h1>
   <div style="display:flex;gap:2px;flex-wrap:wrap">
     <button class="btn-ghost" onclick="toggleTheme()" id="themeBtn"><i class="fa-solid fa-moon"></i></button>
+    <button class="btn-ghost" onclick="openSettings()" title="Settings"><i class="fa-solid fa-gear"></i></button>
     <button class="btn-ghost" onclick="location.href='/api/backup'"><i class="fa-solid fa-floppy-disk"></i></button>
     <button class="btn-ghost" style="position:relative;overflow:hidden"><i class="fa-solid fa-download"></i><input type="file" style="position:absolute;inset:0;opacity:0;cursor:pointer;width:100%" onchange="restoreBackup(this)"></button>
     <button class="btn-ghost" onclick="showApks()"><i class="fa-solid fa-box-archive"></i></button>
@@ -590,6 +865,7 @@ body.light .project,body.light .apk-item,body.light .template-card{background:#f
   <div class="card">
     <h2><span class="status-dot"></span>System Status</h2>
     <p id="status" style="color:var(--muted);font-size:13px">Checking...</p>
+    <div id="sysStats" style="margin-top:12px;display:grid;grid-template-columns:1fr 1fr;gap:8px"></div>
   </div>
   <div class="card hidden" id="createBox">
     <h2><i class="fa-solid fa-mobile-screen"></i> New Android Project</h2>
@@ -622,6 +898,41 @@ body.light .project,body.light .apk-item,body.light .template-card{background:#f
   </div>
 </div>
 <button class="fab" onclick="showCreate()"><i class="fa-solid fa-plus"></i></button>
+
+<!-- Settings Modal -->
+<div id="settingsModal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:999;overflow-y:auto;padding:20px">
+  <div style="max-width:600px;margin:0 auto;background:#111827;border-radius:20px;padding:20px;border:1px solid #374151">
+    <h2 style="margin-bottom:14px"><i class="fa-solid fa-gear"></i> IDE Settings</h2>
+    <div class="tabs">
+      <div class="tab active" onclick="switchSettingsTab('general',this)">General</div>
+      <div class="tab" onclick="switchSettingsTab('build',this)">Build</div>
+      <div class="tab" onclick="switchSettingsTab('timeouts',this)">Timeouts</div>
+    </div>
+    
+    <div id="tab-general" class="settings-content">
+      <div class="setting-item"><div><label>Compile SDK</label><small>Android API level</small></div><input type="number" id="set_compileSdk" min="21" max="35" value="34"></div>
+      <div class="setting-item"><div><label>Target SDK</label><small>Target API level</small></div><input type="number" id="set_targetSdk" min="21" max="35" value="34"></div>
+      <div class="setting-item"><div><label>Min SDK</label><small>Minimum API</small></div><input type="number" id="set_minSdk" min="21" max="30" value="23"></div>
+      <div class="setting-item"><div><label>Gradle Version</label><small>e.g. 8.11.1</small></div><input type="text" id="set_gradleVersion" value="8.11.1"></div>
+    </div>
+    
+    <div id="tab-build" class="settings-content" style="display:none">
+      <div class="setting-item"><div><label>Auto-Build on Save</label><small>Trigger build when files change</small></div><input type="checkbox" id="set_autoBuild"></div>
+      <div class="setting-item"><div><label>Build Debounce (sec)</label><small>Delay between auto-builds</small></div><input type="number" id="set_autoBuildDebounce" min="1" max="60" value="4"></div>
+    </div>
+    
+    <div id="tab-timeouts" class="settings-content" style="display:none">
+      <p style="font-size:12px;color:#94a3b8;margin-bottom:12px">সব timeout এখান থেকে কন্ট্রোল করা যাবে। সব project এ apply হবে।</p>
+      <div id="timeoutsList"></div>
+    </div>
+    
+    <div style="display:flex;gap:8px;margin-top:20px">
+      <button class="btn-success" style="flex:1" onclick="saveSettings()"><i class="fa-solid fa-check"></i> Save All</button>
+      <button class="btn-ghost" onclick="closeSettings()">Cancel</button>
+    </div>
+  </div>
+</div>
+
 <div class="toast-container" id="toasts"></div>
 <script>
 var selectedTemplate="empty";
@@ -635,21 +946,29 @@ function showApks(){document.getElementById("apksBox").classList.remove("hidden"
 function hideApks(){document.getElementById("apksBox").classList.add("hidden")}
 function toast(msg,type){type=type||"success";var c=document.getElementById("toasts");var t=document.createElement("div");t.className="toast "+type;t.innerHTML=(type==="error"?'<i class="fa-solid fa-circle-xmark"></i>':'<i class="fa-solid fa-circle-check"></i>')+msg;c.appendChild(t);setTimeout(function(){t.remove()},3000)}
 function esc(t){var d=document.createElement("div");d.innerText=t;return d.innerHTML}
-async function status(){try{var r=await fetch("/api/status");var d=await r.json();document.getElementById("status").innerText="Port "+d.port+"  •  "+d.projects+" projects  •  "+d.language_count+" languages  •  v"+d.version}catch(e){document.getElementById("status").innerText="Offline"}}
+async function status(){try{var r=await fetch("/api/status");var d=await r.json();document.getElementById("status").innerText="Port "+d.port+" • "+d.projects+" projects • "+d.language_count+" languages • v"+d.version;var si=await fetch("/api/system-info");var sd=await si.json();document.getElementById("sysStats").innerHTML='<div style="background:rgba(8,15,28,.6);padding:10px;border-radius:10px"><small style="color:#94a3b8;font-size:10px">DISK</small><div style="font-size:14px;font-weight:700;color:#60a5fa">'+(sd.disk_percent||0)+'%</div></div><div style="background:rgba(8,15,28,.6);padding:10px;border-radius:10px"><small style="color:#94a3b8;font-size:10px">UPTIME</small><div style="font-size:14px;font-weight:700;color:#4ade80">'+(sd.uptime||"?")+'</div></div>'}catch(e){document.getElementById("status").innerText="Offline"}}
 async function loadProjects(){try{var r=await fetch("/api/projects");var d=await r.json();var box=document.getElementById("projects");if(!d.projects.length){box.innerHTML='<p style="color:#94a3b8;text-align:center;padding:20px">No projects yet</p>';return}box.innerHTML="";d.projects.forEach(function(p){var div=document.createElement("div");div.className="project";div.innerHTML='<div class="project-info"><b><i class="fa-solid fa-mobile-screen-button"></i> '+esc(p.name)+'</b><span class="badge">'+esc(p.language||"?")+'</span><br><small style="color:#94a3b8">'+esc(p.package||"")+'</small></div><div><button class="btn-primary" onclick="location.href=\'/project/'+encodeURIComponent(p.name)+'\'"><i class="fa-solid fa-folder-open"></i> Open</button><button class="btn-danger" onclick="deleteProject(\''+esc(p.name)+'\')"><i class="fa-solid fa-trash"></i></button></div>';box.appendChild(div)})}catch(e){document.getElementById("projects").innerText="Error"}}
 async function createProject(){var n=document.getElementById("appName").value.trim();var p=document.getElementById("packageName").value.trim();var l=document.getElementById("language").value;if(!n||!p){msg("Name & Package required",1);return}try{var r=await fetch("/api/projects",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:n,package:p,language:l,template:selectedTemplate})});var d=await r.json();if(!r.ok){msg(d.error||"Failed",1);return}msg("Created!",0);toast("Project created");document.getElementById("appName").value="";document.getElementById("packageName").value="";hideCreate();loadProjects();status()}catch(e){msg("Error",1)}}
 async function deleteProject(name){if(!confirm("Delete "+name+"?"))return;try{var r=await fetch("/api/projects/"+encodeURIComponent(name),{method:"DELETE"});if(r.ok){toast("Deleted");loadProjects();status()}else toast("Failed","error")}catch(e){toast("Error","error")}}
 async function loadApks(){try{var r=await fetch("/api/apks");var d=await r.json();var box=document.getElementById("apksList");if(!d.apks||!d.apks.length){box.innerHTML='<p style="color:#94a3b8;text-align:center">No APKs</p>';return}box.innerHTML="";d.apks.forEach(function(a){var div=document.createElement("div");div.className="apk-item";div.innerHTML='<div><b><i class="fa-solid fa-box-archive"></i> '+esc(a.name)+'</b><br><small style="color:#94a3b8">'+esc(a.size)+' • '+esc(a.mtime)+'</small></div><div><button class="btn-success" onclick="location.href=\'/api/download-saved-apk/'+encodeURIComponent(a.name)+'\'"><i class="fa-solid fa-download"></i></button><button class="btn-danger" onclick="deleteApk(\''+esc(a.name)+'\')"><i class="fa-solid fa-trash"></i></button></div>';box.appendChild(div)})}catch(e){document.getElementById("apksList").innerText="Error"}}
 async function deleteApk(name){if(!confirm("Delete?"))return;try{var r=await fetch("/api/apks/"+encodeURIComponent(name),{method:"DELETE"});if(r.ok){toast("Deleted");loadApks()}else toast("Failed","error")}catch(e){toast("Error","error")}}
 function msg(t,e){var m=document.getElementById("message");m.style.display="block";m.innerText=t;m.style.background=e?"rgba(127,29,29,.55)":"rgba(20,83,45,.55)"}
-async function restoreBackup(input){if(!input.files[0])return;if(!confirm("Restore backup? Existing projects may be overwritten."))return;var fd=new FormData();fd.append("file",input.files[0]);try{var r=await fetch("/api/restore",{method:"POST",body:fd});var d=await r.json();if(r.ok){toast("Restored!");loadProjects();status()}else toast(d.error||"Failed","error")}catch(e){toast("Error","error")}input.value=""}
+async function restoreBackup(input){if(!input.files[0])return;if(!confirm("Restore backup?"))return;var fd=new FormData();fd.append("file",input.files[0]);try{var r=await fetch("/api/restore",{method:"POST",body:fd});var d=await r.json();if(r.ok){toast("Restored!");loadProjects();status()}else toast(d.error||"Failed","error")}catch(e){toast("Error","error")}input.value=""}
+
+// Settings
+var TIMEOUT_LABELS={};
+async function openSettings(){document.getElementById("settingsModal").style.display="block";try{var r=await fetch("/api/ide-settings");var d=await r.json();document.getElementById("set_compileSdk").value=d.compileSdk||34;document.getElementById("set_targetSdk").value=d.targetSdk||34;document.getElementById("set_minSdk").value=d.minSdk||23;document.getElementById("set_gradleVersion").value=d.gradleVersion||"8.11.1";var t=await fetch("/api/timeouts");var td=await t.json();TIMEOUT_LABELS=td.labels||{};var values=td.timeouts||{};var list=document.getElementById("timeoutsList");list.innerHTML="";Object.keys(TIMEOUT_LABELS).forEach(function(k){var lbl=TIMEOUT_LABELS[k];var val=values[k]||60;list.innerHTML+='<div class="setting-item"><div><label>'+lbl[0]+'</label><small>'+lbl[1]+' ('+lbl[2]+'-'+lbl[3]+')</small></div><input type="number" id="to_'+k+'" min="'+lbl[2]+'" max="'+lbl[3]+'" value="'+val+'"></div>'})}catch(e){}}
+function closeSettings(){document.getElementById("settingsModal").style.display="none"}
+function switchSettingsTab(id,el){document.querySelectorAll(".tab").forEach(function(t){t.classList.remove("active")});el.classList.add("active");document.querySelectorAll(".settings-content").forEach(function(c){c.style.display="none"});document.getElementById("tab-"+id).style.display="block"}
+async function saveSettings(){var data={compileSdk:document.getElementById("set_compileSdk").value,targetSdk:document.getElementById("set_targetSdk").value,minSdk:document.getElementById("set_minSdk").value,gradleVersion:document.getElementById("set_gradleVersion").value};var timeouts={};Object.keys(TIMEOUT_LABELS).forEach(function(k){var el=document.getElementById("to_"+k);if(el)timeouts[k]=parseInt(el.value)||60});try{await fetch("/api/ide-settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});var r=await fetch("/api/timeouts",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(timeouts)});if(r.ok){toast("Settings saved!");closeSettings()}else toast("Failed","error")}catch(e){toast("Error","error")}}
+
 status();loadProjects();
 </script>
 </body></html>
 '''
 
 # ============================================================
-# END OF PART 1 — Paste PART 2 BELOW THIS LINE
+# END OF PART 1
 # ============================================================
 # ============================================================
 # PART 2/3 : ALL FLASK ROUTES
@@ -665,7 +984,86 @@ def api_status():
     projects = [p for p in PROJECTS_DIR.iterdir() if p.is_dir()]
     langs = set(v["name"] for v in LANGUAGES.values())
     return jsonify({"server": "online", "port": PORT, "projects": len(projects),
-                    "language_count": len(langs), "version": "13.0"})
+                    "language_count": len(langs), "version": "14.0"})
+
+# ---------------- TIMEOUTS API ----------------
+@app.route("/api/timeouts", methods=["GET", "POST"])
+def api_timeouts():
+    if request.method == "GET":
+        return jsonify({
+            "timeouts": get_timeouts(),
+            "labels": TIMEOUT_LABELS,
+            "defaults": DEFAULT_TIMEOUTS
+        })
+    data = request.get_json(silent=True) or {}
+    saved = save_timeouts(data)
+    return jsonify({"success": True, "timeouts": saved})
+
+@app.route("/api/timeouts/reset", methods=["POST"])
+def api_timeouts_reset():
+    save_json(TIMEOUTS_FILE, DEFAULT_TIMEOUTS)
+    return jsonify({"success": True, "timeouts": DEFAULT_TIMEOUTS})
+
+# ---------------- IDE SETTINGS ----------------
+@app.route("/api/ide-settings", methods=["GET", "POST"])
+def ide_settings():
+    default_settings = {
+        "gradleVersion": "8.11.1",
+        "compileSdk": "34",
+        "targetSdk": "34",
+        "minSdk": "23",
+        "autoBuild": False
+    }
+    settings = load_json(IDE_SETTINGS_FILE, default_settings)
+    if request.method == "GET":
+        for k, v in default_settings.items():
+            if k not in settings:
+                settings[k] = v
+        return jsonify(settings)
+    data = request.get_json(silent=True) or {}
+    
+    # Validation
+    if "compileSdk" in data:
+        try:
+            sdk = int(data["compileSdk"])
+            if sdk < 21 or sdk > 35:
+                return jsonify({"error": "compileSdk must be 21-35"}), 400
+            data["compileSdk"] = str(sdk)
+        except:
+            return jsonify({"error": "Invalid compileSdk"}), 400
+    
+    if "targetSdk" in data:
+        try:
+            sdk = int(data["targetSdk"])
+            if sdk < 21 or sdk > 35:
+                return jsonify({"error": "targetSdk must be 21-35"}), 400
+            data["targetSdk"] = str(sdk)
+        except:
+            return jsonify({"error": "Invalid targetSdk"}), 400
+    
+    if "minSdk" in data:
+        try:
+            sdk = int(data["minSdk"])
+            if sdk < 21 or sdk > 30:
+                return jsonify({"error": "minSdk must be 21-30"}), 400
+            data["minSdk"] = str(sdk)
+        except:
+            return jsonify({"error": "Invalid minSdk"}), 400
+    
+    if "gradleVersion" in data:
+        ver = str(data["gradleVersion"]).strip()
+        if not re.match(r"^\d+\.\d+(\.\d+)?$", ver):
+            return jsonify({"error": "Invalid Gradle version (e.g. 8.11.1)"}), 400
+        data["gradleVersion"] = ver
+    
+    for k, v in data.items():
+        if k in ["compileSdk", "targetSdk", "minSdk", "gradleVersion"]:
+            settings[k] = v
+        elif k == "autoBuild":
+            settings[k] = bool(v)
+    
+    save_json(IDE_SETTINGS_FILE, settings)
+    return jsonify({"success": True, "settings": settings})
 
 # ---------------- PROJECTS ----------------
 @app.route("/api/projects", methods=["GET"])
@@ -716,6 +1114,41 @@ def open_project(name):
     if project is None or not project.exists():
         return "Project not found", 404
     return IDE_HTML.replace("__NAME__", project.name)
+
+# ---------------- PROJECT DETAILS (NEW) ----------------
+@app.route("/api/project-details/<path:name>")
+def api_project_details(name):
+    project = safe_project(name)
+    if project is None or not project.exists():
+        return jsonify({"error": "Invalid"}), 400
+    try:
+        details = get_project_details(project)
+        return jsonify(details)
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+@app.route("/api/project-icon/<path:name>")
+def api_project_icon(name):
+    """Serve the project's app icon (mipmap)."""
+    project = safe_project(name)
+    if project is None or not project.exists():
+        return "Not found", 404
+    res_dir = project / "app" / "src" / "main" / "res"
+    if not res_dir.exists():
+        return "No res", 404
+    # Try mipmap folders (highest density first)
+    for folder in ["mipmap-xxxhdpi", "mipmap-xxhdpi", "mipmap-xhdpi",
+                   "mipmap-hdpi", "mipmap-mdpi", "mipmap-anydpi-v26"]:
+        mp = res_dir / folder
+        if mp.exists():
+            for ext in ["png", "webp", "xml", "jpg"]:
+                f = mp / f"ic_launcher.{ext}"
+                if f.exists():
+                    try:
+                        return send_file(str(f), mimetype=f"image/{ext if ext != 'xml' else 'svg+xml'}")
+                    except:
+                        continue
+    return "No icon", 404
 
 # ---------------- FILES ----------------
 @app.route("/api/project-files/<path:name>")
@@ -991,6 +1424,144 @@ def extract_zip(name):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
+# ---------------- HTML VIEW (NEW) ----------------
+import urllib.parse as urllib_parse
+
+@app.route("/api/project-file/<path:name>")
+def project_file_serve(name):
+    """Serve any project file with proper MIME type (used by HTML viewer)."""
+    project = safe_project(name)
+    if project is None or not project.exists():
+        return "Not found", 404
+    sub = request.args.get("path", "")
+    target = safe_subpath(project, sub)
+    if target is None or not target.is_file():
+        return "Not found", 404
+    ext = target.suffix.lower()
+    mime_map = {
+        ".html": "text/html", ".htm": "text/html",
+        ".css": "text/css", ".js": "application/javascript",
+        ".json": "application/json", ".xml": "application/xml",
+        ".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+        ".gif": "image/gif", ".svg": "image/svg+xml", ".webp": "image/webp",
+        ".woff": "font/woff", ".woff2": "font/woff2", ".ttf": "font/ttf",
+        ".mp4": "video/mp4", ".mp3": "audio/mpeg", ".wav": "audio/wav"
+    }
+    mime = mime_map.get(ext, "application/octet-stream")
+    try:
+        return send_file(str(target), mimetype=mime)
+    except Exception as e:
+        return str(e), 500
+
+@app.route("/api/html-view/<path:name>")
+def html_view(name):
+    """Serve HTML with all relative CSS/JS/img paths resolved to project-file route."""
+    project = safe_project(name)
+    if project is None or not project.exists():
+        return "Project not found", 404
+    sub = request.args.get("path", "")
+    target = safe_subpath(project, sub)
+    if target is None or not target.is_file():
+        return "File not found", 404
+    try:
+        content = target.read_text(encoding="utf-8", errors="replace")
+    except:
+        return "Cannot read file", 500
+    
+    # Determine base directory of the HTML file
+    html_dir = str(Path(sub).parent).replace("\\", "/")
+    if html_dir == ".":
+        html_dir = ""
+    
+    def resolve_path(url):
+        """Convert relative path to project-file route."""
+        if not url or url.startswith(("http://", "https://", "//", "data:", "#", "javascript:", "mailto:")):
+            return url
+        # Strip query/hash for path resolution but keep for output
+        url_parts = url.split("#")[0].split("?")[0]
+        suffix = url[len(url_parts):]
+        
+        if url_parts.startswith("/"):
+            # Absolute from project root
+            final = url_parts.lstrip("/")
+        else:
+            # Relative to HTML file
+            final = (html_dir + "/" + url_parts).strip("/") if html_dir else url_parts
+        
+        # Normalize ../
+        parts = []
+        for p in final.split("/"):
+            if p == "..":
+                if parts: parts.pop()
+            elif p and p != ".":
+                parts.append(p)
+        final = "/".join(parts)
+        
+        return f"/api/project-file/{urllib_parse.quote(project.name)}?path={urllib_parse.quote(final)}{suffix}"
+    
+    def resolve_link(url):
+        """For <a> links - use html-view if .html, else project-file."""
+        if not url or url.startswith(("http://", "https://", "//", "mailto:", "tel:", "#")):
+            return url
+        resolved = resolve_path(url)
+        if ".html" in resolved.lower() or ".htm" in resolved.lower():
+            # Extract path arg
+            if "?path=" in resolved:
+                path_arg = resolved.split("?path=")[1].split("&")[0].split("#")[0]
+                return f"/api/html-view/{urllib_parse.quote(project.name)}?path={path_arg}"
+        return resolved
+    
+    # Rewrite <link href="...">
+    content = re.sub(
+        r'(<link[^>]*?href\s*=\s*["\'])([^"\']+)(["\'])',
+        lambda m: m.group(1) + resolve_path(m.group(2)) + m.group(3),
+        content, flags=re.IGNORECASE
+    )
+    # Rewrite <script src="...">
+    content = re.sub(
+        r'(<script[^>]*?src\s*=\s*["\'])([^"\']+)(["\'])',
+        lambda m: m.group(1) + resolve_path(m.group(2)) + m.group(3),
+        content, flags=re.IGNORECASE
+    )
+    # Rewrite <img src="...">
+    content = re.sub(
+        r'(<img[^>]*?src\s*=\s*["\'])([^"\']+)(["\'])',
+        lambda m: m.group(1) + resolve_path(m.group(2)) + m.group(3),
+        content, flags=re.IGNORECASE
+    )
+    # Rewrite <a href="...">
+    content = re.sub(
+        r'(<a[^>]*?href\s*=\s*["\'])([^"\']+)(["\'])',
+        lambda m: m.group(1) + resolve_link(m.group(2)) + m.group(3),
+        content, flags=re.IGNORECASE
+    )
+    # Rewrite <source src="..."> inside <video>/<audio>
+    content = re.sub(
+        r'(<(?:source|video|audio|track)[^>]*?(?:src|href)\s*=\s*["\'])([^"\']+)(["\'])',
+        lambda m: m.group(1) + resolve_path(m.group(2)) + m.group(3),
+        content, flags=re.IGNORECASE
+    )
+    
+    return Response(content, mimetype="text/html; charset=utf-8")
+
+@app.route("/api/html-files/<path:name>")
+def html_files(name):
+    """List all .html files in the project (main folder only)."""
+    project = safe_project(name)
+    if project is None or not project.exists():
+        return jsonify({"error": "Invalid"}), 400
+    files = []
+    for p in project.rglob("*.html"):
+        parts = str(p).split(os.sep)
+        if any(x in SKIP_DIRS_DETAIL for x in parts): continue
+        try:
+            rel = str(p.relative_to(project))
+            files.append({"name": p.name, "path": rel})
+        except: continue
+    files.sort(key=lambda x: x["path"])
+    return jsonify({"files": files})
+
+# ---------------- FIREBASE ----------------
 @app.route("/api/firebase-inject", methods=["POST"])
 def firebase_inject():
     data = request.get_json(silent=True) or {}
@@ -1018,7 +1589,7 @@ def firebase_inject():
             root_gradle.write_text(txt, encoding="utf-8")
     return jsonify({"success": True})
 
-# ---------------- NEW: PACKAGES, DEPS & SDK ----------------
+# ---------------- PACKAGES ----------------
 @app.route("/api/packages", methods=["GET"])
 def list_packages():
     try:
@@ -1040,7 +1611,8 @@ def upgrade_package():
     if not pkg: return jsonify({"error": "Package name required"}), 400
     try:
         cmd = f"pkg upgrade -y {pkg}" if pkg != "--all" else "pkg upgrade -y"
-        r = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=300)
+        r = subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                          timeout=get_timeout("run_command"))
         return jsonify({"success": True, "output": r.stdout})
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -1054,12 +1626,24 @@ def project_deps(name):
     if gradle_file.exists():
         txt = gradle_file.read_text(encoding="utf-8")
         matches = re.findall(r"(?:implementation|api|compileOnly)\s+['\"]([^'\"]+)['\"]", txt)
-        for m in matches: deps.append(m)
+        for m in matches:
+            # Try to find size in gradle cache
+            size = "?"
+            try:
+                parts = m.split(":")
+                if len(parts) >= 3:
+                    group, artifact, ver = parts[0], parts[1], parts[2]
+                    cache_path = Path.home() / ".gradle" / "caches" / "modules-2" / "files-2.1" / group / artifact / ver
+                    if cache_path.exists():
+                        total = sum(f.stat().st_size for f in cache_path.rglob("*") if f.is_file())
+                        size = human_size(total)
+            except: pass
+            deps.append({"name": m, "size": size})
     root_gradle = project / "build.gradle"
     if root_gradle.exists():
         txt = root_gradle.read_text(encoding="utf-8")
         matches = re.findall(r"id\s+['\"]([^'\"]+)['\"]\s+version\s+['\"]([^'\"]+)['\"]", txt)
-        for m in matches: deps.append(f"Plugin: {m[0]} v{m[1]}")
+        for m in matches: deps.append({"name": f"Plugin: {m[0]}", "version": m[1], "size": "?"})
     return jsonify({"dependencies": deps})
 
 @app.route("/api/project-deps/update/<path:name>", methods=["POST"])
@@ -1069,8 +1653,6 @@ def update_project_deps(name):
     gradle_file = project / "app" / "build.gradle"
     if not gradle_file.exists(): return jsonify({"error": "No app/build.gradle"}), 404
     txt = gradle_file.read_text(encoding="utf-8")
-    
-    # Auto update known dependencies to newer versions
     updates = {
         "androidx.appcompat:appcompat": "1.7.0",
         "com.google.android.material:material": "1.12.0",
@@ -1082,7 +1664,6 @@ def update_project_deps(name):
         if re.search(pattern, txt):
             txt = re.sub(pattern, f"'{lib}:{ver}'", txt)
             count += 1
-            
     if count > 0:
         gradle_file.write_text(txt, encoding="utf-8")
         return jsonify({"success": True, "updated": count})
@@ -1095,14 +1676,19 @@ def sdk_update():
     if not project: return jsonify({"error": "Invalid"}), 400
     gradle_file = project / "app" / "build.gradle"
     if not gradle_file.exists(): return jsonify({"error": "No build.gradle"}), 404
+    try:
+        sdk = int(data.get("compileSdk", "34"))
+        if sdk < 21 or sdk > 35:
+            return jsonify({"error": "SDK must be 21-35"}), 400
+    except:
+        return jsonify({"error": "Invalid SDK"}), 400
     txt = gradle_file.read_text(encoding="utf-8")
-    sdk = str(data.get("compileSdk", "34"))
     txt = re.sub(r"compileSdk\s+\d+", f"compileSdk {sdk}", txt)
     txt = re.sub(r"targetSdk\s+\d+", f"targetSdk {sdk}", txt)
     gradle_file.write_text(txt, encoding="utf-8")
-    return jsonify({"success": True})
+    return jsonify({"success": True, "compileSdk": sdk})
 
-# ---------------- NEW: APK ANALYZER & SQLITE ----------------
+# ---------------- APK ANALYZER & SQLITE ----------------
 @app.route("/api/apk-analyze/<path:name>")
 def apk_analyze(name):
     project = safe_project(name)
@@ -1188,6 +1774,27 @@ def download_saved_apk(name):
         return send_file(str(p), as_attachment=True, download_name=name)
     return "Not found", 404
 
+# ---------------- APK INSTALL (NEW - click to install) ----------------
+@app.route("/api/apk-install/<path:name>")
+def apk_install(name):
+    """Serve APK with intent to install. Android Chrome will prompt to install."""
+    project = safe_project(name)
+    if project is None:
+        # Maybe it's a saved APK filename
+        p = APKS_DIR / name
+        if p.exists():
+            return send_file(str(p),
+                mimetype="application/vnd.android.package-archive",
+                as_attachment=True, download_name=p.name)
+        return "Not found", 404
+    apks = list(project.glob("app/build/outputs/apk/**/*.apk"))
+    if not apks:
+        return "No APK. Build first.", 404
+    apk = apks[0]
+    return send_file(str(apk),
+        mimetype="application/vnd.android.package-archive",
+        as_attachment=True, download_name=apk.name)
+
 # ---------------- CHECK / SCAN ----------------
 def read_file_line(path, line_num):
     try:
@@ -1235,12 +1842,15 @@ def check_file(name):
     cmd = lang["check"].replace("{file}", str(target))
     try:
         result = subprocess.run(cmd, shell=True, cwd=str(target.parent),
-                                capture_output=True, text=True, timeout=60)
+                                capture_output=True, text=True,
+                                timeout=get_timeout("check_file"))
         output = (result.stdout or "") + "\n" + (result.stderr or "")
         if result.returncode == 0:
             return jsonify({"errors": [], "language": lang["name"]})
         return jsonify({"errors": parse_errors(lang["name"], output, str(target)),
                         "language": lang["name"]})
+    except subprocess.TimeoutExpired:
+        return jsonify({"errors": [], "error": "Check timeout"})
     except Exception as e:
         return jsonify({"errors": [], "error": str(e)})
 
@@ -1250,6 +1860,7 @@ def scan_errors(name):
     if project is None or not project.exists():
         return jsonify({"error": "Invalid"}), 400
     results, scanned = [], 0
+    scan_timeout = get_timeout("scan_errors")
     for path in sorted(project.rglob("*")):
         if not path.is_file(): continue
         parts = str(path).split(os.sep)
@@ -1265,7 +1876,7 @@ def scan_errors(name):
         cmd = lang["check"].replace("{file}", str(path))
         try:
             r = subprocess.run(cmd, shell=True, cwd=str(path.parent),
-                               capture_output=True, text=True, timeout=30)
+                               capture_output=True, text=True, timeout=scan_timeout)
             if r.returncode != 0:
                 out = (r.stdout or "") + "\n" + (r.stderr or "")
                 errs = parse_errors(lang["name"], out, str(path))
@@ -1289,10 +1900,11 @@ def run_command():
         if b in cmd: return jsonify({"error": "Blocked"}), 403
     try:
         r = subprocess.run(cmd, shell=True, cwd=str(project),
-                           capture_output=True, text=True, timeout=300)
+                           capture_output=True, text=True,
+                           timeout=get_timeout("run_command"))
         return jsonify({"stdout": r.stdout, "stderr": r.stderr, "returncode": r.returncode})
     except subprocess.TimeoutExpired:
-        return jsonify({"error": "Timeout (300s)"}), 500
+        return jsonify({"error": f"Timeout ({get_timeout('run_command')}s)"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1312,9 +1924,12 @@ def run_code():
     cmd = lang["run"].replace("{file}", str(target))
     try:
         r = subprocess.run(cmd, shell=True, cwd=str(target.parent),
-                           capture_output=True, text=True, timeout=120)
+                           capture_output=True, text=True,
+                           timeout=get_timeout("run_code"))
         return jsonify({"language": lang["name"], "command": cmd,
                         "stdout": r.stdout, "stderr": r.stderr, "returncode": r.returncode})
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": f"Timeout ({get_timeout('run_code')}s)"}), 500
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
@@ -1409,7 +2024,7 @@ def proc_kill():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------------- REAL PTY ----------------
+# ---------------- PTY ----------------
 @app.route("/api/pty/start", methods=["POST"])
 def pty_start():
     if not PTY_AVAILABLE:
@@ -1473,27 +2088,53 @@ def pty_stop(sid):
         except: pass
     return jsonify({"success": True})
 
-# ---------------- BUILD ----------------
+# ---------------- BUILD (with proper timeouts + log caching) ----------------
 def build_worker(build_id, project, env):
     B = BUILDS[build_id]
+    started_at = time.time()
+    B["started"] = started_at
+    build_timeout = get_timeout("build_timeout")
+    
     try:
-        # Force update wrapper based on global settings before build
         ide_settings = load_json(IDE_SETTINGS_FILE, {"gradleVersion": "8.11.1"})
         gradle_ver = ide_settings.get("gradleVersion", "8.11.1")
-        subprocess.run(f"gradle wrapper --gradle-version {gradle_ver}", shell=True, cwd=str(project), capture_output=True, timeout=60)
-
+        
+        # Ensure wrapper ready (auto-download, no timeout)
+        def log(msg):
+            if len(B["output"]) < LOG_MAX_LINES:
+                B["output"].append(msg)
+        ensure_wrapper_ready(project, gradle_ver, log_callback=log)
+        
         cmd = "./gradlew assembleDebug --no-daemon --console=plain --parallel"
         
-        B["started"] = B.get("started", time.time())
-        proc = subprocess.Popen(cmd, shell=True, cwd=str(project), env=env,
-                                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, bufsize=1)
+        proc = subprocess.Popen(
+            cmd, shell=True, cwd=str(project), env=env,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            text=True, bufsize=1
+        )
+        
+        lines_since_check = 0
         for line in iter(proc.stdout.readline, ""):
             line = line.rstrip()
+            # Cap in-memory output
+            if len(B["output"]) >= LOG_MAX_LINES:
+                B["output"] = B["output"][-LOG_MAX_LINES + 1000:]
+                B["truncated"] = True
             B["output"].append(line)
             hint = suggest_fix(line)
             if hint:
                 B["output"].append(f"💡 Hint: {hint}")
+            
+            # Timeout check every 20 lines
+            lines_since_check += 1
+            if lines_since_check >= 20:
+                lines_since_check = 0
+                if time.time() - started_at > build_timeout:
+                    try: proc.kill()
+                    except: pass
+                    B["output"].append(f"❌ Build timeout ({build_timeout}s) exceeded")
+                    break
+        
         proc.wait()
         B["returncode"] = proc.returncode
         apks = list(project.glob("app/build/outputs/apk/**/*.apk"))
@@ -1502,6 +2143,12 @@ def build_worker(build_id, project, env):
         B["success"] = (proc.returncode == 0 and B["apk_path"] is not None)
         B["finished"] = time.time()
         B["duration"] = B["finished"] - B["started"]
+        
+        # Cache log for later viewing
+        try:
+            cache_build_log(project.name, B["output"])
+        except: pass
+        
         if B["success"] and B["apk_path"]:
             try:
                 src = Path(B["apk_path"])
@@ -1510,13 +2157,20 @@ def build_worker(build_id, project, env):
                 B["apk_saved"] = str(dst)
                 B["apk_size"] = dst.stat().st_size
                 _push_notif(project.name, "✅ Build successful",
-                            f"APK ready ({human_size(B['apk_size'])})", "success")
+                            f"APK ready ({human_size(B['apk_size'])}) • Duration: {int(B['duration'])}s",
+                            "success")
                 _record_build(project.name, True, B["duration"], B["apk_size"], 0)
             except: pass
         else:
-            err_count = sum(1 for l in B["output"] if "error:" in l.lower())
+            # Collect errors
+            errors = []
+            for l in B["output"]:
+                if "error:" in l.lower() or "FAILED" in l:
+                    errors.append(l.strip()[:200])
+            err_count = len(errors)
+            error_text = "; ".join(errors[:3]) if errors else "Check log"
             _push_notif(project.name, "❌ Build failed",
-                        f"Check log ({err_count} errors)", "error")
+                        f"{err_count} error(s) • {int(B['duration'])}s • {error_text}", "error")
             _record_build(project.name, False, B["duration"], 0, err_count)
             _record_error_patterns(project.name, B["output"])
     except Exception as e:
@@ -1524,7 +2178,11 @@ def build_worker(build_id, project, env):
         B["status"] = "done"
         B["success"] = False
         B["returncode"] = -1
-        _push_notif(project.name, "❌ Build crashed", str(e), "error")
+        B["finished"] = time.time()
+        B["duration"] = time.time() - started_at
+        try: cache_build_log(project.name, B["output"])
+        except: pass
+        _push_notif(project.name, "❌ Build crashed", str(e)[:200], "error")
 
 def _record_build(project, success, duration, apk_size, error_count):
     hist = load_json(BUILD_HISTORY, {})
@@ -1563,7 +2221,8 @@ def build_start():
     env["PATH"] = str(sdk / "platform-tools") + ":" + TERMUX_PREFIX + "/bin:" + env.get("PATH", "")
     build_id = str(uuid.uuid4())
     BUILDS[build_id] = {"output": [], "status": "running", "apk_path": None,
-                        "returncode": None, "success": None, "started": time.time()}
+                        "returncode": None, "success": None,
+                        "started": time.time(), "truncated": False}
     t = threading.Thread(target=build_worker, args=(build_id, project, env), daemon=True)
     t.start()
     return jsonify({"build_id": build_id, "status": "started"})
@@ -1577,7 +2236,47 @@ def build_poll(build_id):
         "lines": B["output"][since:], "total": len(B["output"]),
         "status": B["status"], "success": B.get("success"),
         "apk_path": B.get("apk_path"), "returncode": B.get("returncode"),
-        "duration": B.get("duration"), "apk_size": B.get("apk_size")
+        "duration": B.get("duration"), "apk_size": B.get("apk_size"),
+        "truncated": B.get("truncated", False)
+    })
+
+# ---------------- BUILD LOG CACHE (NEW) ----------------
+@app.route("/api/build-log-cache/<path:name>")
+def build_log_cache(name):
+    """Get cached log for a project (only last build)."""
+    project = safe_project(name)
+    if project is None or not project.exists():
+        return jsonify({"error": "Invalid"}), 400
+    cached = get_cached_log(name)
+    return jsonify({
+        "lines": cached["lines"],
+        "meta": cached["meta"]
+    })
+
+@app.route("/api/build-log-cache/<path:name>", methods=["DELETE"])
+def clear_build_log_cache(name):
+    project = safe_project(name)
+    if project is None or not project.exists():
+        return jsonify({"error": "Invalid"}), 400
+    clear_cached_log(name)
+    return jsonify({"success": True})
+
+@app.route("/api/build-error-summary/<path:name>")
+def build_error_summary(name):
+    """Get error summary from cached log for notifications."""
+    project = safe_project(name)
+    if project is None or not project.exists():
+        return jsonify({"error": "Invalid"}), 400
+    cached = get_cached_log(name)
+    lines = cached["lines"]
+    errors = []
+    for l in lines:
+        if re.search(r"error:", l, re.IGNORECASE) or "FAILED" in l or "Execution failed" in l:
+            errors.append(l.strip()[:250])
+    return jsonify({
+        "errors": errors[:20],
+        "total": len(errors),
+        "meta": cached["meta"]
     })
 
 @app.route("/api/build-history/<path:name>")
@@ -1588,7 +2287,9 @@ def build_history(name):
 @app.route("/api/apk-size-graph/<path:name>")
 def apk_size_graph(name):
     hist = load_json(BUILD_HISTORY, {}).get(name, [])
-    points = [{"ts": h["ts"], "size": h["apk_size"]} for h in hist if h.get("apk_size")]
+    points = [{"ts": h["ts"], "size": h.get("apk_size", 0),
+               "success": h.get("success", False),
+               "duration": h.get("duration", 0)} for h in hist]
     return jsonify({"points": points})
 
 @app.route("/api/error-frequency/<path:name>")
@@ -1600,10 +2301,149 @@ def error_frequency(name):
 def build_chart(name):
     hist = load_json(BUILD_HISTORY, {}).get(name, [])[:20]
     return jsonify({"chart": [
-        {"ts": h["ts"], "duration": h["duration"], "success": h["success"]}
+        {"ts": h["ts"], "duration": h["duration"], "success": h["success"],
+         "apk_size": h.get("apk_size", 0), "errors": h.get("errors", 0)}
         for h in hist
     ]})
 
+# ---------------- STATS DETAILS (NEW for clickable charts) ----------------
+@app.route("/api/stats-details/<path:name>")
+def stats_details(name):
+    """Detailed view for a specific chart type."""
+    project = safe_project(name)
+    if project is None or not project.exists():
+        return jsonify({"error": "Invalid"}), 400
+    stat_type = request.args.get("type", "build_time")
+    hist = load_json(BUILD_HISTORY, {}).get(name, [])
+    freq = load_json(ERROR_FREQ_FILE, {}).get(name, {})
+    
+    if stat_type == "build_time":
+        rows = []
+        for h in hist[:50]:
+            rows.append({
+                "date": datetime.fromtimestamp(h["ts"]).strftime("%Y-%m-%d %H:%M"),
+                "duration": f"{h['duration']:.1f}s",
+                "success": "✅" if h.get("success") else "❌",
+                "errors": h.get("errors", 0),
+                "apk_size": human_size(h.get("apk_size", 0)) if h.get("apk_size") else "-"
+            })
+        return jsonify({"title": "Build History", "rows": rows,
+                        "columns": ["date", "duration", "success", "errors", "apk_size"]})
+    
+    if stat_type == "apk_size":
+        rows = []
+        for h in hist:
+            if h.get("apk_size"):
+                rows.append({
+                    "date": datetime.fromtimestamp(h["ts"]).strftime("%Y-%m-%d %H:%M"),
+                    "size": human_size(h["apk_size"]),
+                    "raw_bytes": h["apk_size"],
+                    "success": "✅" if h.get("success") else "❌"
+                })
+        return jsonify({"title": "APK Size History", "rows": rows,
+                        "columns": ["date", "size", "success"]})
+    
+    if stat_type == "error_freq":
+        rows = []
+        for k, v in sorted(freq.items(), key=lambda x: -x[1])[:30]:
+            rows.append({"error": k, "count": v,
+                         "severity": "high" if v > 5 else "medium" if v > 2 else "low"})
+        return jsonify({"title": "Error Frequency", "rows": rows,
+                        "columns": ["error", "count", "severity"]})
+    
+    if stat_type == "language":
+        details = get_project_details(project)
+        rows = []
+        for lang, stats in details.get("language_stats", {}).items():
+            rows.append({"language": lang, "files": stats["count"],
+                         "percent": f"{stats['percent']}%", "size": stats["size"]})
+        return jsonify({"title": "Language Breakdown", "rows": rows,
+                        "columns": ["language", "files", "percent", "size"]})
+    
+    return jsonify({"error": "Unknown stat type"}), 400
+
+# ---------------- VERSION SET (NEW with validation) ----------------
+@app.route("/api/version-set/<path:name>", methods=["POST"])
+def version_set(name):
+    project = safe_project(name)
+    if project is None or not project.exists():
+        return jsonify({"error": "Invalid"}), 400
+    data = request.get_json(silent=True) or {}
+    gradle_file = project / "app" / "build.gradle"
+    if not gradle_file.exists():
+        return jsonify({"error": "app/build.gradle not found"}), 404
+    
+    new_code = data.get("versionCode")
+    new_name = data.get("versionName")
+    
+    if new_code is None and new_name is None:
+        return jsonify({"error": "Provide versionCode or versionName"}), 400
+    
+    if new_code is not None:
+        if not validate_version_code(new_code):
+            return jsonify({"error": "versionCode must be integer 1-2147483646"}), 400
+        new_code = str(int(new_code))
+    
+    if new_name is not None:
+        if not validate_version_name(new_name):
+            return jsonify({"error": "versionName must be like 1.0 or 1.2.3"}), 400
+        new_name = new_name.strip()
+    
+    txt = gradle_file.read_text(encoding="utf-8")
+    
+    if new_code:
+        if re.search(r"versionCode\s+\d+", txt):
+            txt = re.sub(r"versionCode\s+\d+", f"versionCode {new_code}", txt)
+        else:
+            txt = re.sub(r"(versionName\s+\"[^\"]+\")", f"versionCode {new_code}\n        \\1", txt, count=1)
+    
+    if new_name:
+        if re.search(r'versionName\s+"[^"]+"', txt):
+            txt = re.sub(r'versionName\s+"[^"]+"', f'versionName "{new_name}"', txt)
+        else:
+            txt = re.sub(r"(versionCode\s+\d+)", f"\\1\n        versionName \"{new_name}\"", txt, count=1)
+    
+    gradle_file.write_text(txt, encoding="utf-8")
+    
+    # Update project.json
+    info_file = project / "project.json"
+    if info_file.exists():
+        try:
+            info = json.loads(info_file.read_text(encoding="utf-8"))
+            if new_code: info["versionCode"] = int(new_code)
+            if new_name: info["versionName"] = new_name
+            info_file.write_text(json.dumps(info, indent=4), encoding="utf-8")
+        except: pass
+    
+    return jsonify({"success": True, "versionCode": new_code, "versionName": new_name})
+
+@app.route("/api/version-bump/<path:name>", methods=["POST"])
+def version_bump(name):
+    project = safe_project(name)
+    if project is None or not project.exists():
+        return jsonify({"error": "Invalid"}), 400
+    data = request.get_json(silent=True) or {}
+    bump_code = bool(data.get("versionCode", True))
+    bump_name = bool(data.get("versionName", False))
+    gradle_file = project / "app" / "build.gradle"
+    if not gradle_file.exists():
+        return jsonify({"error": "app/build.gradle not found"}), 404
+    txt = gradle_file.read_text(encoding="utf-8")
+    m_code = re.search(r"versionCode\s+(\d+)", txt)
+    m_name = re.search(r'versionName\s+"([^"]+)"', txt)
+    if bump_code and m_code:
+        new_code = int(m_code.group(1)) + 1
+        txt = txt.replace(m_code.group(0), f"versionCode {new_code}")
+    if bump_name and m_name:
+        parts = m_name.group(1).split(".")
+        try: parts[-1] = str(int(parts[-1]) + 1)
+        except: parts.append("1")
+        new_name = ".".join(parts)
+        txt = txt.replace(m_name.group(0), f'versionName "{new_name}"')
+    gradle_file.write_text(txt, encoding="utf-8")
+    return jsonify({"success": True})
+
+# ---------------- DOWNLOAD APK ----------------
 @app.route("/api/download-apk/<path:name>")
 def download_apk(name):
     project = safe_project(name)
@@ -1623,7 +2463,8 @@ def adb_install():
         return jsonify({"error": "No APK. Build first."}), 404
     try:
         r = subprocess.run(["adb", "install", "-r", str(apks[0])],
-                           capture_output=True, text=True, timeout=90)
+                           capture_output=True, text=True,
+                           timeout=get_timeout("adb_install"))
         if r.returncode == 0:
             return jsonify({"success": True})
         return jsonify({"error": r.stderr or r.stdout or "Failed"}), 500
@@ -1659,8 +2500,9 @@ def cache_clean():
 def trigger_auto_build(project_name):
     proj_settings = load_json(SETTINGS_FILE, {}).get(project_name, {})
     if not proj_settings.get("autoBuild"): return
+    debounce = get_timeout("auto_build_debounce")
     last = AUTO_BUILD_LOCK.get(project_name, 0)
-    if time.time() - last < AUTO_BUILD_DEBOUNCE: return
+    if time.time() - last < debounce: return
     AUTO_BUILD_LOCK[project_name] = time.time()
     project = safe_project(project_name)
     if not project: return
@@ -1674,10 +2516,9 @@ def trigger_auto_build(project_name):
     BUILDS[build_id] = {
         "output": [], "status": "running", "apk_path": None,
         "returncode": None, "success": None, "auto": True,
-        "project": project_name, "started": time.time()
+        "project": project_name, "started": time.time(), "truncated": False
     }
-    _push_notif(project_name, "🔨 Auto-build started",
-                "Watching for changes...", "info")
+    _push_notif(project_name, "🔨 Auto-build started", "Watching for changes...", "info")
     threading.Thread(target=build_worker, args=(build_id, project, env), daemon=True).start()
     return build_id
 
@@ -1698,17 +2539,42 @@ def settings_mgr(name):
     save_json(SETTINGS_FILE, all_s)
     return jsonify({"success": True, "settings": cur})
 
-@app.route("/api/ide-settings", methods=["GET", "POST"])
-def ide_settings():
-    settings = load_json(IDE_SETTINGS_FILE, {"gradleVersion": "8.11.1"})
-    if request.method == "GET":
-        return jsonify(settings)
-    data = request.get_json(silent=True) or {}
-    settings.update(data)
-    save_json(IDE_SETTINGS_FILE, settings)
-    return jsonify({"success": True, "settings": settings})
+# ---------------- EDITOR THEMES (NEW) ----------------
+DEFAULT_EDITOR_THEMES = [
+    {"id": "dracula", "name": "Dracula", "builtin": True, "css": None},
+    {"id": "material-darker", "name": "Material Darker", "builtin": True, "css": None},
+    {"id": "monokai", "name": "Monokai", "builtin": True, "css": None},
+]
 
-# ---------------- NOTIFICATIONS ----------------
+@app.route("/api/editor-themes", methods=["GET", "POST"])
+def editor_themes_mgr():
+    themes = load_json(EDITOR_THEMES_FILE, {"items": []}).get("items", [])
+    if request.method == "GET":
+        all_themes = DEFAULT_EDITOR_THEMES + themes
+        return jsonify({"themes": all_themes})
+    data = request.get_json(silent=True) or {}
+    theme = {
+        "id": str(uuid.uuid4())[:8],
+        "name": data.get("name", "My Theme"),
+        "author": data.get("author", "unknown"),
+        "description": data.get("description", ""),
+        "colors": data.get("colors", {}),
+        "css": data.get("css", ""),
+        "builtin": False,
+        "created": time.time()
+    }
+    themes.append(theme)
+    save_json(EDITOR_THEMES_FILE, {"items": themes})
+    return jsonify({"success": True, "theme": theme})
+
+@app.route("/api/editor-themes/<tid>", methods=["DELETE"])
+def delete_editor_theme(tid):
+    themes = load_json(EDITOR_THEMES_FILE, {"items": []}).get("items", [])
+    themes = [t for t in themes if t["id"] != tid]
+    save_json(EDITOR_THEMES_FILE, {"items": themes})
+    return jsonify({"success": True})
+
+# ---------------- NOTIFICATIONS (with detailed errors) ----------------
 @app.route("/api/notifications")
 def notif_list():
     since = float(request.args.get("since", 0))
@@ -1735,15 +2601,36 @@ def notif_clear():
     save_json(NOTIF_FILE, {"items": []})
     return jsonify({"success": True})
 
-@app.route("/api/notify", methods=["POST"])
-def notif_push():
-    data = request.get_json(silent=True) or {}
-    _push_notif(data.get("project", ""), data.get("title", "Notice"),
-                data.get("body", ""), data.get("kind", "info"))
-    return jsonify({"success": True})
+@app.route("/api/notifications/details")
+def notif_details():
+    """Get grouped errors for a specific notification."""
+    project = request.args.get("project", "")
+    if not project:
+        return jsonify({"error": "Project required"}), 400
+    cached = get_cached_log(project)
+    errors = []
+    for l in cached["lines"]:
+        if re.search(r"error:", l, re.IGNORECASE) or "FAILED" in l:
+            errors.append(l.strip()[:300])
+    # Group by similarity
+    grouped = {}
+    for e in errors:
+        key = e[:80]
+        if key not in grouped:
+            grouped[key] = {"text": e, "count": 0}
+        grouped[key]["count"] += 1
+    result = sorted(grouped.values(), key=lambda x: -x["count"])
+    return jsonify({
+        "project": project,
+        "total_errors": len(errors),
+        "grouped": result[:30],
+        "meta": cached["meta"]
+    })
 
 # ---------------- GIT ----------------
-def git_run(project, args, timeout=60):
+def git_run(project, args, timeout=None):
+    if timeout is None:
+        timeout = get_timeout("git_push")
     try:
         r = subprocess.run(["git"] + args, cwd=str(project),
                            capture_output=True, text=True, timeout=timeout)
@@ -1751,6 +2638,8 @@ def git_run(project, args, timeout=60):
                 "err": r.stderr, "code": r.returncode}
     except FileNotFoundError:
         return {"ok": False, "out": "", "err": "git not installed. Run: pkg install git", "code": -1}
+    except subprocess.TimeoutExpired:
+        return {"ok": False, "out": "", "err": f"Git timeout ({timeout}s)", "code": -1}
     except Exception as e:
         return {"ok": False, "out": "", "err": str(e), "code": -1}
 
@@ -1845,13 +2734,13 @@ def git_remote(name):
         r = git_run(project, ["remote", "add", "origin", url])
         return jsonify({"success": r["ok"], "err": r["err"]})
     if action == "push":
-        r = git_run(project, ["push", "-u", "origin", "HEAD"], timeout=180)
+        r = git_run(project, ["push", "-u", "origin", "HEAD"], timeout=get_timeout("git_push"))
         return jsonify({"success": r["ok"], "out": r["out"], "err": r["err"]})
     if action == "pull":
-        r = git_run(project, ["pull"], timeout=180)
+        r = git_run(project, ["pull"], timeout=get_timeout("git_pull"))
         return jsonify({"success": r["ok"], "out": r["out"], "err": r["err"]})
     if action == "fetch":
-        r = git_run(project, ["fetch"], timeout=180)
+        r = git_run(project, ["fetch"], timeout=get_timeout("git_fetch"))
         return jsonify({"success": r["ok"], "out": r["out"], "err": r["err"]})
     return jsonify({"error": "Unknown"}), 400
 
@@ -1985,32 +2874,6 @@ def theme_builder(name):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-@app.route("/api/version-bump/<path:name>", methods=["POST"])
-def version_bump(name):
-    project = safe_project(name)
-    if project is None or not project.exists():
-        return jsonify({"error": "Invalid"}), 400
-    data = request.get_json(silent=True) or {}
-    bump_code = bool(data.get("versionCode", True))
-    bump_name = bool(data.get("versionName", False))
-    gradle_file = project / "app" / "build.gradle"
-    if not gradle_file.exists():
-        return jsonify({"error": "app/build.gradle not found"}), 404
-    txt = gradle_file.read_text(encoding="utf-8")
-    m_code = re.search(r"versionCode\s+(\d+)", txt)
-    m_name = re.search(r'versionName\s+"([^"]+)"', txt)
-    if bump_code and m_code:
-        new_code = int(m_code.group(1)) + 1
-        txt = txt.replace(m_code.group(0), f"versionCode {new_code}")
-    if bump_name and m_name:
-        parts = m_name.group(1).split(".")
-        try: parts[-1] = str(int(parts[-1]) + 1)
-        except: parts.append("1")
-        new_name = ".".join(parts)
-        txt = txt.replace(m_name.group(0), f'versionName "{new_name}"')
-    gradle_file.write_text(txt, encoding="utf-8")
-    return jsonify({"success": True})
-
 @app.route("/api/manifest/<path:name>", methods=["GET", "POST"])
 def manifest_editor(name):
     project = safe_project(name)
@@ -2038,7 +2901,7 @@ def manifest_editor(name):
     except Exception as e:
         return jsonify({"error": "Invalid XML: " + str(e)}), 400
 
-# ---------------- KEYSTORE ----------------
+# ---------------- KEYSTORE / SIGNING ----------------
 @app.route("/api/keystore", methods=["GET", "POST"])
 def keystore_mgr():
     if request.method == "GET":
@@ -2084,18 +2947,20 @@ def sign_release(name):
     
     ide_settings = load_json(IDE_SETTINGS_FILE, {"gradleVersion": "8.11.1"})
     gradle_ver = ide_settings.get("gradleVersion", "8.11.1")
-    subprocess.run(f"gradle wrapper --gradle-version {gradle_ver}", shell=True, cwd=str(project), capture_output=True, timeout=60)
-
+    ensure_wrapper_ready(project, gradle_ver)
+    
     try:
         r = subprocess.run("./gradlew assembleRelease --no-daemon --console=plain",
                            shell=True, cwd=str(project), env=env,
-                           capture_output=True, text=True, timeout=900)
+                           capture_output=True, text=True,
+                           timeout=get_timeout("build_timeout"))
         apks = list(project.glob("app/build/outputs/apk/release/*.apk"))
         if r.returncode == 0 and apks:
             dest = SIGNED_DIR / f"{project.name}-release-{int(time.time())}.apk"
             shutil.copy2(apks[0], dest)
             return jsonify({"success": True, "signed_path": str(dest),
-                            "download": f"/api/download-signed/{dest.name}"})
+                            "download": f"/api/download-signed/{dest.name}",
+                            "install": f"/api/apk-install/{dest.name}"})
         return jsonify({"error": "Build failed", "out": r.stdout[-3000:],
                         "err": r.stderr[-1000:]}), 500
     except Exception as e:
@@ -2124,7 +2989,7 @@ def env_mgr(name):
     write_file(project / ".env", env_txt + "\n")
     return jsonify({"success": True})
 
-# ---------------- HISTORY ----------------
+# ---------------- FILE HISTORY ----------------
 @app.route("/api/history/<path:name>")
 def history_list(name):
     path = request.args.get("path", "")
@@ -2157,7 +3022,7 @@ def history_restore():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------------- RECENT ----------------
+# ---------------- RECENT FILES ----------------
 @app.route("/api/recent")
 def recent_list():
     data = load_json(RECENT_FILES_FILE, {"items": []})
@@ -2229,7 +3094,7 @@ def plugin_mgr(name):
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------------- CUSTOM THEMES ----------------
+# ---------------- CUSTOM UI THEMES ----------------
 @app.route("/api/themes", methods=["GET", "POST"])
 def custom_themes():
     themes = load_json(THEMES_FILE, {"items": []}).get("items", [])
@@ -2311,7 +3176,8 @@ def run_macro(mid):
             if stype == "cmd":
                 cmd = expand_alias(step.get("value", ""))
                 r = subprocess.run(cmd, shell=True, cwd=str(project),
-                                   capture_output=True, text=True, timeout=120)
+                                   capture_output=True, text=True,
+                                   timeout=get_timeout("run_command"))
                 results.append({"step": step, "out": r.stdout, "err": r.stderr, "code": r.returncode})
             elif stype == "build":
                 results.append({"step": step, "out": "build triggered"})
@@ -2328,8 +3194,7 @@ def kanban_mgr(name):
     safe = re.sub(r"[^a-zA-Z0-9_-]", "_", name)
     f = KANBAN_DIR / f"{safe}.json"
     if request.method == "GET":
-        data = load_json(f, {"columns": {"todo": [], "doing": [], "done": []}})
-        return jsonify(data)
+        return jsonify(load_json(f, {"columns": {"todo": [], "doing": [], "done": []}}))
     data = request.get_json(silent=True) or {}
     save_json(f, data)
     return jsonify({"success": True})
@@ -2390,10 +3255,7 @@ def notes_mgr(name):
     if request.method == "GET":
         return jsonify(load_json(f, {"content": "", "updated": 0}))
     data = request.get_json(silent=True) or {}
-    save_json(f, {
-        "content": data.get("content", ""),
-        "updated": time.time()
-    })
+    save_json(f, {"content": data.get("content", ""), "updated": time.time()})
     return jsonify({"success": True})
 
 # ---------------- BOOKMARKS ----------------
@@ -2515,7 +3377,6 @@ def restore_backup():
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
-# ---------------- EXPORT ----------------
 @app.route("/api/export-zip/<path:name>")
 def export_zip(name):
     project = safe_project(name)
@@ -2528,8 +3389,18 @@ def export_zip(name):
                 if any(p in ("build", ".gradle", ".git") for p in parts): continue
                 zf.write(f, f.relative_to(project))
     mem.seek(0)
-    return send_file(mem, as_attachment=True, download_name=name + ".zip",
-                     mimetype="application/zip")
+    return send_file(mem, as_attachment=True, download_name=name + ".zip", mimetype="application/zip")
+
+@app.route("/api/download-file/<path:name>")
+def download_single_file(name):
+    project = safe_project(name)
+    if project is None or not project.exists():
+        return jsonify({"error": "Invalid"}), 400
+    sub = request.args.get("path", "")
+    target = safe_subpath(project, sub)
+    if target is None or not target.is_file():
+        return jsonify({"error": "Not found"}), 404
+    return send_file(str(target), as_attachment=True, download_name=target.name)
 
 # ---------------- PWA ----------------
 @app.route("/manifest.json")
@@ -2545,7 +3416,7 @@ def pwa_manifest():
 @app.route("/sw.js")
 def service_worker():
     sw = """
-const CACHE='zihad-ide-v13';
+const CACHE='zihad-ide-v14';
 self.addEventListener('install',e=>self.skipWaiting());
 self.addEventListener('activate',e=>e.waitUntil(clients.claim()));
 self.addEventListener('fetch',e=>{
@@ -2569,7 +3440,7 @@ IDE_HTML = r'''<!DOCTYPE html>
 <meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no">
 <meta name="theme-color" content="#3b82f6">
 <link rel="manifest" href="/manifest.json">
-<title>__NAME__ - Zihad IDE v13</title>
+<title>__NAME__ - Zihad IDE v14</title>
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/codemirror.min.css">
 <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/codemirror/5.65.16/theme/dracula.min.css">
@@ -2587,7 +3458,6 @@ header h2{font-size:12px;font-weight:600;white-space:nowrap;overflow:hidden;text
 header h2 i{color:#60a5fa}
 .btn{border:0;border-radius:9px;padding:6px 9px;font-weight:600;font-size:11px;color:#fff;cursor:pointer;background:#374151;display:inline-flex;align-items:center;justify-content:center;gap:4px;transition:transform .15s}
 .btn:active{transform:scale(.94)}
-.btn i{pointer-events:none}
 .btn-primary{background:linear-gradient(135deg,#3b82f6,#2563eb)}
 .btn-success{background:linear-gradient(135deg,#22c55e,#16a34a)}
 .btn-danger{background:linear-gradient(135deg,#ef4444,#dc2626)}
@@ -2606,7 +3476,7 @@ header h2 i{color:#60a5fa}
 .nav-item.active{color:#60a5fa}
 .nav-item.active::before{content:"";position:absolute;top:0;left:22%;right:22%;height:3px;background:linear-gradient(90deg,transparent,#3b82f6,transparent);border-radius:3px}
 .nav-item i{font-size:18px}
-.main-area{height:calc(100vh - var(--header-h) - var(--bottom-h));overflow:hidden;transition:max-width 0.3s ease,width 0.3s ease}
+.main-area{height:calc(100vh - var(--header-h) - var(--bottom-h));overflow:hidden}
 .panel{display:none;height:100%;overflow-y:auto;padding:10px;padding-bottom:140px;-webkit-overflow-scrolling:touch}
 .panel.active{display:block}
 .breadcrumb{background:rgba(8,15,28,.7);padding:8px 11px;border-radius:10px;margin-bottom:8px;font-size:12px;word-break:break-all}
@@ -2675,17 +3545,14 @@ header h2 i{color:#60a5fa}
 @keyframes slideUp{from{transform:translateY(20px);opacity:0}}
 .toast.success{border-color:rgba(34,197,94,.45)}
 .toast.error{border-color:rgba(239,68,68,.45)}
-.toast.info{border-color:rgba(59,130,246,.45)}
-.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.7);z-index:200;display:none;align-items:flex-end;justify-content:center;backdrop-filter:blur(4px)}
+.modal-overlay{position:fixed;inset:0;background:rgba(0,0,0,.75);z-index:200;display:none;align-items:flex-end;justify-content:center;backdrop-filter:blur(4px)}
 .modal-overlay.show{display:flex}
 .modal{background:#111827;border-radius:20px 20px 0 0;padding:20px;width:100%;max-width:560px;max-height:88vh;overflow-y:auto;animation:slideUp .25s;border:1px solid var(--border);border-bottom:0}
 .modal h3{font-size:15px;margin-bottom:10px;color:#60a5fa;display:flex;align-items:center;gap:7px}
 .modal input,.modal textarea,.modal select{width:100%;padding:10px 12px;margin:5px 0;border-radius:10px;border:1px solid #374151;background:#0b1220;color:#fff;font-size:13px;outline:none}
 .modal textarea{font-family:monospace;min-height:110px;resize:vertical}
 .empty{color:var(--muted);text-align:center;padding:25px;font-style:italic}
-.preview-frame{background:#0f172a;border-radius:24px;border:6px solid #1e293b;width:min(320px,90vw);margin:0 auto;overflow:hidden;min-height:480px;position:relative;transition:width .2s}
-.preview-frame.tablet{width:min(520px,95vw);min-height:380px}
-.preview-frame.desktop{width:min(90vw,900px);min-height:400px}
+.preview-frame{background:#0f172a;border-radius:24px;border:6px solid #1e293b;width:min(320px,90vw);margin:0 auto;overflow:hidden;min-height:480px;position:relative}
 .preview-content{padding:14px;min-height:440px;color:#fff}
 .device-frames{display:flex;gap:5px;margin-bottom:10px;justify-content:center;flex-wrap:wrap}
 .device-frames button{background:#1f2937;color:#94a3b8;padding:6px 11px;font-size:11px}
@@ -2696,7 +3563,6 @@ header h2 i{color:#60a5fa}
 .cmd-palette ul{list-style:none;max-height:340px;overflow-y:auto}
 .cmd-palette li{padding:11px 16px;cursor:pointer;font-size:13px;color:#cbd5e1;border-bottom:1px solid #111827;display:flex;align-items:center;gap:8px}
 .cmd-palette li:hover,.cmd-palette li.active{background:#1f2937;color:#60a5fa}
-.cmd-palette li i{width:18px;color:#8b5cf6}
 .more-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(100px,1fr));gap:8px;margin:8px 0}
 .more-item{background:linear-gradient(135deg,#1e293b,#0f172a);border:1px solid #334155;border-radius:11px;padding:12px 8px;text-align:center;cursor:pointer;font-size:11px;color:#cbd5e1;transition:.15s;font-weight:600}
 .more-item:active{transform:scale(.95)}
@@ -2704,13 +3570,12 @@ header h2 i{color:#60a5fa}
 .more-item i{font-size:22px;display:block;margin-bottom:5px;color:#8b5cf6}
 .devtool-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(110px,1fr));gap:8px;margin:8px 0}
 .devtool-item{background:linear-gradient(135deg,#1e293b,#0f172a);border:1px solid #334155;border-radius:12px;padding:12px 10px;text-align:center;cursor:pointer;font-size:11px;color:#cbd5e1;transition:.15s;font-weight:600}
-.devtool-item:hover{background:linear-gradient(135deg,#334155,#1e293b);color:#60a5fa;transform:translateY(-2px)}
+.devtool-item:hover{background:linear-gradient(135deg,#334155,#1e293b);color:#60a5fa}
 .devtool-item i{font-size:22px;display:block;margin-bottom:5px;color:#8b5cf6}
 .logcat-line{font-family:monospace;font-size:11px;padding:2px 4px;border-bottom:1px solid #0f172a;word-break:break-all}
 .logcat-line.err{color:#f87171}
 .logcat-line.warn{color:#fbbf24}
 .logcat-line.info{color:#60a5fa}
-.git-item{background:#0b1220;border:1px solid #1f2937;border-radius:8px;padding:8px 10px;margin:3px 0;font-family:monospace;font-size:11px}
 .kanban-board{display:grid;grid-template-columns:1fr;gap:10px}
 @media(min-width:600px){.kanban-board{grid-template-columns:repeat(3,1fr)}}
 .kanban-col{background:#0b1220;border:1px solid #1f2937;border-radius:12px;padding:10px;min-height:150px}
@@ -2719,47 +3584,55 @@ header h2 i{color:#60a5fa}
 .kanban-card.p-high{border-left-color:#ef4444}
 .kanban-card.p-low{border-left-color:#22c55e}
 .kanban-card .del{position:absolute;top:5px;right:5px;color:#ef4444;opacity:.6;font-size:11px}
-.notif-item{background:#0b1220;border:1px solid #1f2937;border-radius:10px;padding:10px;margin-bottom:6px;border-left:3px solid #3b82f6;font-size:12px}
+.notif-item{background:#0b1220;border:1px solid #1f2937;border-radius:10px;padding:10px;margin-bottom:6px;border-left:3px solid #3b82f6;font-size:12px;cursor:pointer}
 .notif-item.success{border-left-color:#22c55e}
 .notif-item.error{border-left-color:#ef4444}
+.notif-item:active{background:#111827}
 .notif-item .time{font-size:10px;color:#64748b;margin-top:3px}
 .notif-item .ttl{color:#e2e8f0;font-weight:600;margin-bottom:2px}
 .notif-item .bdy{color:#94a3b8;font-size:11px}
-.chart-bar{background:#1f2937;border-radius:3px;overflow:hidden}
-.chart-wrap{display:flex;gap:3px;align-items:flex-end;height:100px;padding:6px;background:#0b1220;border-radius:10px;border:1px solid #1f2937}
+.chart-wrap{display:flex;gap:3px;align-items:flex-end;height:100px;padding:6px;background:#0b1220;border-radius:10px;border:1px solid #1f2937;cursor:pointer;transition:transform .15s}
+.chart-wrap:hover{transform:scale(1.01);border-color:#3b82f6}
 .chart-col{flex:1;background:linear-gradient(180deg,#3b82f6,#8b5cf6);border-radius:3px 3px 0 0;min-height:4px;transition:height .3s;position:relative}
 .chart-col.ok{background:linear-gradient(180deg,#22c55e,#16a34a)}
 .chart-col.fail{background:linear-gradient(180deg,#ef4444,#dc2626)}
 .plugin-item{background:#0b1220;border:1px solid #1f2937;border-radius:10px;padding:10px;margin-bottom:6px}
 .plugin-item h5{font-size:12px;color:#60a5fa;margin-bottom:3px}
-.plugin-item p{font-size:11px;color:#94a3b8;margin-bottom:6px}
 .fab-2026{position:fixed;bottom:calc(var(--bottom-h) + 16px);right:16px;width:52px;height:52px;border-radius:50%;background:linear-gradient(135deg,#6366f1,#8b5cf6);box-shadow:0 8px 30px rgba(139,92,246,.6);display:flex;align-items:center;justify-content:center;color:#fff;font-size:20px;z-index:45;border:0;cursor:pointer;transition:transform .2s}
 .fab-2026:active{transform:scale(.9) rotate(90deg)}
-@media(min-width:720px){
-  .main-area{max-width:1100px;margin:0 auto}
-  .file-item{padding:13px}
-  .terminal-presets{grid-template-columns:repeat(auto-fill,minmax(170px,1fr));max-height:280px}
-  .pty-term{height:calc(100vh - 300px)}
-  header h2{font-size:14px}
-}
-@media(max-width:380px){
-  .btn{padding:5px 7px;font-size:10px}
-  header h2{font-size:11px}
-  .bottom-nav .nav-item{font-size:8px}
-}
+.tabs{display:flex;gap:0;margin-bottom:14px;border-bottom:1px solid var(--border);overflow-x:auto}
+.tab{padding:10px 14px;font-size:12px;font-weight:600;cursor:pointer;color:var(--muted);border-bottom:2px solid transparent;white-space:nowrap}
+.tab.active{color:#60a5fa;border-bottom-color:#60a5fa}
+.setting-item{display:flex;justify-content:space-between;align-items:center;padding:10px 0;border-bottom:1px solid var(--border);font-size:13px;gap:10px}
+.setting-item:last-child{border-bottom:0}
+.setting-item label{color:var(--text);font-weight:500;flex:1}
+.setting-item small{display:block;color:var(--muted);font-size:10px;margin-top:2px;font-weight:400}
+.setting-item input[type="number"],.setting-item input[type="text"],.setting-item select{width:110px;padding:7px 9px;margin:0;font-size:12px;flex-shrink:0}
+.setting-item input[type="checkbox"]{width:auto;padding:0;margin:0}
+.lang-bar{height:24px;border-radius:12px;overflow:hidden;display:flex;margin:8px 0;background:#0b1220;border:1px solid var(--border)}
+.lang-bar>div{height:100%;transition:width .3s;display:flex;align-items:center;justify-content:center;font-size:9px;font-weight:700;color:#fff;text-shadow:0 1px 2px rgba(0,0,0,.5);min-width:2px}
+.details-table{width:100%;border-collapse:collapse;font-size:11px;margin-top:6px}
+.details-table th{background:#0b1220;color:#60a5fa;padding:6px;text-align:left;border:1px solid #1f2937;font-weight:600}
+.details-table td{padding:6px;border:1px solid #1f2937;color:#e2e8f0;word-break:break-word}
+.html-file-item{background:#0b1220;border:1px solid #1f2937;border-radius:10px;padding:12px;margin:5px 0;cursor:pointer;display:flex;align-items:center;gap:8px}
+.html-file-item:active{background:#1f2937}
+.html-file-item .icon-wrap{background:linear-gradient(135deg,#ec4899,#db2777);width:32px;height:32px;border-radius:8px;display:flex;align-items:center;justify-content:center;color:#fff;flex-shrink:0}
+.icon-preview{width:80px;height:80px;border-radius:16px;background:#0b1220;border:1px solid var(--border);display:flex;align-items:center;justify-content:center;overflow:hidden;flex-shrink:0}
+.icon-preview img{width:100%;height:100%;object-fit:contain}
+@media(max-width:380px){.btn{padding:5px 7px;font-size:10px}header h2{font-size:11px}.bottom-nav .nav-item{font-size:8px}}
 </style>
 </head>
 <body>
 <header>
   <h2><i class="fa-solid fa-bolt"></i> __NAME__</h2>
   <div style="display:flex;gap:3px;flex-wrap:wrap">
-    <button class="btn btn-orange" onclick="scanAllErrors()" id="scanBtn" title="Scan"><i class="fa-solid fa-magnifying-glass"></i></button>
+    <button class="btn btn-orange" onclick="scanAllErrors()" id="scanBtn" title="Scan Errors"><i class="fa-solid fa-magnifying-glass"></i></button>
     <button class="btn btn-purple" onclick="runCurrent()" id="runBtn" style="display:none" title="Run"><i class="fa-solid fa-play"></i></button>
     <button class="btn btn-primary" onclick="buildApk()" title="Build"><i class="fa-solid fa-hammer"></i></button>
     <button class="btn notif-dot" id="notifBtn" data-count="0" onclick="showNotifications()" title="Notifications"><i class="fa-solid fa-bell"></i></button>
-    <button class="btn" onclick="exportZip()" title="Export"><i class="fa-solid fa-file-zipper"></i></button>
-    <button class="btn" onclick="showMoreMenu()" title="More"><i class="fa-solid fa-ellipsis"></i></button>
-    <button class="btn" onclick="openCommandPalette()" title="Cmd"><i class="fa-solid fa-bolt"></i></button>
+    <button class="btn" onclick="exportZip()" title="Export ZIP"><i class="fa-solid fa-file-zipper"></i></button>
+    <button class="btn" onclick="showMoreMenu()" title="More Tools"><i class="fa-solid fa-ellipsis"></i></button>
+    <button class="btn" onclick="openCommandPalette()" title="Cmd Palette"><i class="fa-solid fa-bolt"></i></button>
     <button class="btn" onclick="openSettings()" title="Settings"><i class="fa-solid fa-gear"></i></button>
     <button class="btn" onclick="location.href='/'" title="Home"><i class="fa-solid fa-house"></i></button>
   </div>
@@ -2771,8 +3644,8 @@ header h2 i{color:#60a5fa}
     <div class="toolbar">
       <button class="btn btn-success" onclick="newFile()"><i class="fa-solid fa-file-circle-plus"></i> File</button>
       <button class="btn btn-orange" onclick="newFolder()"><i class="fa-solid fa-folder-plus"></i> Folder</button>
-      <button class="btn upload-btn" style="position:relative;overflow:hidden"><i class="fa-solid fa-upload"></i> Upload<input type="file" style="position:absolute;inset:0;opacity:0;cursor:pointer;width:100%" onchange="doUpload(this)"></button>
-      <button class="btn upload-btn" style="position:relative;overflow:hidden"><i class="fa-solid fa-file-zipper"></i> Zip<input type="file" accept=".zip" style="position:absolute;inset:0;opacity:0;cursor:pointer;width:100%" onchange="doExtract(this)"></button>
+      <button class="btn" style="position:relative;overflow:hidden"><i class="fa-solid fa-upload"></i> Upload<input type="file" style="position:absolute;inset:0;opacity:0;cursor:pointer;width:100%" onchange="doUpload(this)"></button>
+      <button class="btn" style="position:relative;overflow:hidden"><i class="fa-solid fa-file-zipper"></i> Zip<input type="file" accept=".zip" style="position:absolute;inset:0;opacity:0;cursor:pointer;width:100%" onchange="doExtract(this)"></button>
       <button class="btn" onclick="loadFiles(currentPath)"><i class="fa-solid fa-rotate"></i></button>
       <button class="btn" onclick="showRecent()"><i class="fa-solid fa-clock-rotate-left"></i></button>
     </div>
@@ -2793,11 +3666,10 @@ header h2 i{color:#60a5fa}
 
   <!-- PREVIEW -->
   <div class="panel" id="panel-preview">
-    <div class="info-bar"><i class="fa-solid fa-eye"></i> Live Layout / HTML Preview</div>
+    <div class="info-bar"><i class="fa-solid fa-eye"></i> Live Preview (Android Layout / HTML)</div>
     <div class="device-frames">
-      <button class="active" onclick="setDevice('phone',this)"><i class="fa-solid fa-mobile"></i></button>
-      <button onclick="setDevice('tablet',this)"><i class="fa-solid fa-tablet"></i></button>
-      <button onclick="setDevice('desktop',this)"><i class="fa-solid fa-desktop"></i></button>
+      <button class="active" onclick="setDevice('phone',this)"><i class="fa-solid fa-mobile"></i> Phone</button>
+      <button onclick="setDevice('tablet',this)"><i class="fa-solid fa-tablet"></i> Tablet</button>
       <button onclick="refreshPreview()"><i class="fa-solid fa-rotate"></i></button>
       <button onclick="togglePreviewMode()" id="prevModeBtn">HTML</button>
     </div>
@@ -2808,9 +3680,24 @@ header h2 i{color:#60a5fa}
     </div>
   </div>
 
+  <!-- HTML VIEWER (NEW) -->
+  <div class="panel" id="panel-htmlview">
+    <div class="info-bar"><i class="fa-solid fa-code"></i> HTML Viewer — সব HTML ফাইল</div>
+    <button class="btn btn-primary" style="width:100%;margin-bottom:8px;padding:10px" onclick="loadHtmlFiles()"><i class="fa-solid fa-rotate"></i> Refresh File List</button>
+    <div id="htmlFileList"><div class="empty">Loading...</div></div>
+    <div id="htmlViewerFrame" style="display:none;margin-top:10px">
+      <div style="display:flex;gap:5px;margin-bottom:8px">
+        <button class="btn" onclick="closeHtmlViewer()"><i class="fa-solid fa-arrow-left"></i> Back</button>
+        <input id="htmlViewPath" readonly style="flex:1;padding:8px;background:#0b1220;color:#94a3b8;border:1px solid #1f2937;border-radius:8px;font-size:11px">
+        <button class="btn btn-success" onclick="reloadHtmlView()"><i class="fa-solid fa-rotate"></i></button>
+      </div>
+      <iframe id="htmlIframe" style="width:100%;height:calc(100vh - 300px);border:1px solid #1f2937;border-radius:12px;background:#fff"></iframe>
+    </div>
+  </div>
+
   <!-- ERRORS -->
   <div class="panel" id="panel-errors">
-    <div class="info-bar" id="errInfo"><i class="fa-solid fa-bug"></i> Press scan to check</div>
+    <div class="info-bar" id="errInfo"><i class="fa-solid fa-bug"></i> Press scan to check errors</div>
     <div id="err-list"></div>
   </div>
 
@@ -2869,15 +3756,19 @@ header h2 i{color:#60a5fa}
         </label>
       </div>
       <div id="apk-box" style="display:none;margin-top:10px">
-        <button class="btn btn-success" id="apkDownloadBtn" style="width:100%;padding:12px;margin-bottom:6px"><i class="fa-solid fa-download"></i> Download APK</button>
+        <button class="btn btn-success" id="apkInstallBtn" style="width:100%;padding:12px;margin-bottom:6px"><i class="fa-solid fa-download"></i> Install APK</button>
+        <button class="btn btn-primary" id="apkDownloadBtn" style="width:100%;padding:11px;margin-bottom:6px"><i class="fa-solid fa-file-arrow-down"></i> Download APK</button>
         <div style="display:flex;gap:5px">
-          <button class="btn btn-primary" style="flex:1;padding:11px" onclick="adbInstall()"><i class="fa-solid fa-mobile-button"></i> ADB Install</button>
+          <button class="btn btn-purple" style="flex:1;padding:11px" onclick="adbInstall()"><i class="fa-solid fa-mobile-button"></i> ADB</button>
           <button class="btn btn-danger" style="flex:1;padding:11px" onclick="cleanBuild()"><i class="fa-solid fa-broom"></i> Clean</button>
+          <button class="btn btn-orange" style="flex:1;padding:11px" onclick="analyzeApk()"><i class="fa-solid fa-magnifying-glass-chart"></i></button>
         </div>
-        <button class="btn btn-orange" style="width:100%;padding:11px;margin-top:6px" onclick="analyzeApk()"><i class="fa-solid fa-magnifying-glass-chart"></i> Analyze APK</button>
       </div>
     </div>
-    <div class="info-bar"><i class="fa-solid fa-list-check"></i> Live Build Log</div>
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
+      <div class="info-bar" style="margin:0;flex:1"><i class="fa-solid fa-list-check"></i> Live Build Log</div>
+      <button class="btn btn-purple" style="margin-left:6px;padding:6px 10px;font-size:11px" onclick="showCachedLog()"><i class="fa-solid fa-history"></i> Cache</button>
+    </div>
     <div class="output-box" id="buildLog">$ Waiting...</div>
   </div>
 
@@ -2916,7 +3807,7 @@ header h2 i{color:#60a5fa}
   <!-- LOGCAT -->
   <div class="panel" id="panel-logcat">
     <div class="toolbar">
-      <button class="btn btn-success" onclick="logcatStart()" id="lcStartBtn"><i class="fa-solid fa-play"></i> Start</button>
+      <button class="btn btn-success" onclick="logcatStart()"><i class="fa-solid fa-play"></i> Start</button>
       <button class="btn btn-danger" onclick="logcatStop()"><i class="fa-solid fa-stop"></i></button>
       <button class="btn" onclick="logcatClear()"><i class="fa-solid fa-trash"></i></button>
       <select id="lcFilter" onchange="renderLogcat()" style="padding:7px 9px;border-radius:8px;border:1px solid var(--border);background:#0b1220;color:#fff;font-size:12px;flex:1">
@@ -2951,20 +3842,32 @@ header h2 i{color:#60a5fa}
     <button class="btn btn-primary" style="width:100%;margin-top:8px;padding:11px" onclick="saveNotes()"><i class="fa-solid fa-floppy-disk"></i> Save Notes</button>
   </div>
 
-  <!-- ANALYTICS -->
+  <!-- ANALYTICS (5 charts) -->
   <div class="panel" id="panel-analytics">
-    <div class="info-bar"><i class="fa-solid fa-chart-line"></i> Build Analytics</div>
-    <div style="margin-bottom:14px">
+    <div class="info-bar"><i class="fa-solid fa-chart-line"></i> Build Analytics (tap a chart for details)</div>
+    <div style="margin-bottom:14px" onclick="showStatsDetails('build_time')">
       <h4 style="font-size:12px;color:#60a5fa;margin-bottom:6px"><i class="fa-solid fa-clock"></i> Build Time (last 20)</h4>
       <div class="chart-wrap" id="buildTimeChart"></div>
     </div>
-    <div style="margin-bottom:14px">
+    <div style="margin-bottom:14px" onclick="showStatsDetails('apk_size')">
       <h4 style="font-size:12px;color:#60a5fa;margin-bottom:6px"><i class="fa-solid fa-box-archive"></i> APK Size (KB)</h4>
       <div class="chart-wrap" id="apkSizeChart"></div>
     </div>
-    <div style="margin-bottom:14px">
+    <div style="margin-bottom:14px" onclick="showStatsDetails('error_freq')">
       <h4 style="font-size:12px;color:#60a5fa;margin-bottom:6px"><i class="fa-solid fa-triangle-exclamation"></i> Top Errors</h4>
       <div id="errFreqList" style="background:#0b1220;border:1px solid #1f2937;border-radius:10px;padding:10px;max-height:300px;overflow-y:auto"></div>
+    </div>
+    <div style="margin-bottom:14px" onclick="showStatsDetails('language')">
+      <h4 style="font-size:12px;color:#60a5fa;margin-bottom:6px"><i class="fa-solid fa-code"></i> Language Breakdown</h4>
+      <div id="langBreakdown" style="background:#0b1220;border:1px solid #1f2937;border-radius:10px;padding:10px">
+        <div class="empty">Loading...</div>
+      </div>
+    </div>
+    <div style="margin-bottom:14px" onclick="showStatsDetails('success_rate')">
+      <h4 style="font-size:12px;color:#60a5fa;margin-bottom:6px"><i class="fa-solid fa-percent"></i> Build Success Rate</h4>
+      <div id="successRateBox" style="background:#0b1220;border:1px solid #1f2937;border-radius:10px;padding:14px;text-align:center">
+        <div class="empty">Loading...</div>
+      </div>
     </div>
   </div>
 </div>
@@ -2972,6 +3875,7 @@ header h2 i{color:#60a5fa}
 <nav class="bottom-nav">
   <div class="nav-item active" data-panel="explorer" onclick="switchPanel('explorer',this)"><i class="fa-solid fa-folder-tree"></i><span>Files</span></div>
   <div class="nav-item" data-panel="preview" onclick="switchPanel('preview',this)"><i class="fa-solid fa-mobile-screen"></i><span>Preview</span></div>
+  <div class="nav-item" data-panel="htmlview" onclick="switchPanel('htmlview',this)"><i class="fa-solid fa-code"></i><span>HTML</span></div>
   <div class="nav-item" data-panel="errors" onclick="switchPanel('errors',this)"><i class="fa-solid fa-bug"></i><span>Errors</span></div>
   <div class="nav-item" data-panel="terminal" onclick="switchPanel('terminal',this)"><i class="fa-solid fa-terminal"></i><span>Term</span></div>
   <div class="nav-item" data-panel="build" onclick="switchPanel('build',this)"><i class="fa-solid fa-hammer"></i><span>Build</span></div>
@@ -3021,67 +3925,68 @@ header h2 i{color:#60a5fa}
 <div class="modal-overlay" id="settingsModal" onclick="if(event.target===this)this.classList.remove('show')">
   <div class="modal">
     <h3><i class="fa-solid fa-gear"></i> Settings</h3>
-    <label style="font-size:12px">Font Size</label>
-    <input type="range" id="fontSize" min="11" max="20" value="13" oninput="applyFontSize(this.value);localStorage.setItem('fontSize',this.value)">
-    <label style="font-size:12px">Auto Save</label>
-    <select id="autoSave" onchange="localStorage.setItem('autoSave',this.value)">
-      <option value="off">Off</option><option value="on">On</option>
-    </select>
-    <label style="font-size:12px">Editor Theme</label>
-    <select id="cmTheme" onchange="changeTheme(this.value)">
-      <option value="dracula">Dracula</option>
-      <option value="material-darker">Material Darker</option>
-      <option value="monokai">Monokai</option>
-    </select>
-    <label style="font-size:12px">UI Language</label>
-    <select id="uiLang" onchange="setLang(this.value)">
-      <option value="en">English</option>
-      <option value="bn">বাংলা</option>
-    </select>
-    <label style="font-size:12px">Global Gradle Version</label>
-    <div style="display:flex;gap:6px;margin:5px 0">
-      <input type="text" id="gradleVerInput" placeholder="e.g. 8.11.1" style="flex:1;margin:0">
-      <button class="btn btn-success" onclick="saveIdeSettings()">Save</button>
+    <div class="tabs">
+      <div class="tab active" onclick="switchSettingsTab('general',this)">General</div>
+      <div class="tab" onclick="switchSettingsTab('build',this)">Build</div>
+      <div class="tab" onclick="switchSettingsTab('timeouts',this)">Timeouts</div>
+      <div class="tab" onclick="switchSettingsTab('editor',this)">Editor</div>
     </div>
-    <label style="font-size:12px">Compile SDK Version</label>
-    <div style="display:flex;gap:6px;margin:5px 0">
-      <input type="number" id="compileSdkInput" placeholder="e.g. 34" style="flex:1;margin:0">
-      <button class="btn btn-primary" onclick="saveSdkVersion()">Update</button>
+    <div id="tab-general" class="settings-content">
+      <div class="setting-item"><div><label>Compile SDK</label><small>Android API (21-35)</small></div><input type="number" id="set_compileSdk" min="21" max="35"></div>
+      <div class="setting-item"><div><label>Target SDK</label><small>Android API (21-35)</small></div><input type="number" id="set_targetSdk" min="21" max="35"></div>
+      <div class="setting-item"><div><label>Min SDK</label><small>Android API (21-30)</small></div><input type="number" id="set_minSdk" min="21" max="30"></div>
+      <div class="setting-item"><div><label>Gradle Version</label><small>e.g. 8.11.1</small></div><input type="text" id="set_gradleVersion"></div>
+      <div class="setting-item"><div><label>Auto-Save</label><small>Save editor changes</small></div><select id="set_autoSave"><option value="off">Off</option><option value="on">On</option></select></div>
     </div>
-    <div style="display:flex;gap:6px;margin-top:10px">
-      <button class="btn btn-pink" style="flex:1;padding:11px" onclick="openCustomThemes()"><i class="fa-solid fa-palette"></i> Custom Themes</button>
-      <button class="btn btn-purple" style="flex:1;padding:11px" onclick="openPlugins()"><i class="fa-solid fa-puzzle-piece"></i> Plugins</button>
+    <div id="tab-build" class="settings-content" style="display:none">
+      <div class="setting-item"><div><label>Auto-Build on Save</label><small>Trigger build when files change</small></div><input type="checkbox" id="set_autoBuild"></div>
+      <div class="setting-item"><div><label>Font Size</label><small>Editor font</small></div><input type="range" id="set_fontSize" min="11" max="20" style="width:110px"></div>
     </div>
-    <button class="btn btn-primary" style="width:100%;margin-top:10px;padding:12px" onclick="document.getElementById('settingsModal').classList.remove('show')">Done</button>
+    <div id="tab-timeouts" class="settings-content" style="display:none">
+      <p style="font-size:11px;color:#94a3b8;margin-bottom:10px">সব timeout এখান থেকে কন্ট্রোল — সব project এ apply হবে।</p>
+      <div id="timeoutsList"></div>
+      <button class="btn btn-orange" style="width:100%;margin-top:10px;padding:10px;font-size:11px" onclick="resetTimeouts()">🔄 Reset to Defaults</button>
+    </div>
+    <div id="tab-editor" class="settings-content" style="display:none">
+      <div class="setting-item"><div><label>CM Theme</label><small>Editor theme</small></div><select id="set_cmTheme"><option value="dracula">Dracula</option><option value="material-darker">Material Darker</option><option value="monokai">Monokai</option></select></div>
+      <div class="setting-item"><div><label>UI Language</label></div><select id="set_uiLang"><option value="en">English</option><option value="bn">বাংলা</option></select></div>
+      <button class="btn btn-pink" style="width:100%;margin-top:10px;padding:11px" onclick="openAddEditorTheme()"><i class="fa-solid fa-plus"></i> Add Custom Theme</button>
+      <div id="customThemesList" style="margin-top:10px"></div>
+    </div>
+    <div style="display:flex;gap:8px;margin-top:16px">
+      <button class="btn btn-success" style="flex:1;padding:12px" onclick="saveAllSettings()"><i class="fa-solid fa-check"></i> Save All</button>
+      <button class="btn" onclick="document.getElementById('settingsModal').classList.remove('show')">Cancel</button>
+    </div>
   </div>
 </div>
 
-<!-- MORE MODAL -->
+<!-- MORE TOOLS -->
 <div class="modal-overlay" id="moreModal" onclick="if(event.target===this)this.classList.remove('show')">
   <div class="modal">
     <h3><i class="fa-solid fa-ellipsis"></i> More Tools</h3>
     <div class="more-grid">
-      <div class="more-item" onclick="closeModal();openPkgRename()"><i class="fa-solid fa-box"></i>Rename Pkg</div>
-      <div class="more-item" onclick="closeModal();openStrings()"><i class="fa-solid fa-language"></i>Strings</div>
-      <div class="more-item" onclick="closeModal();openThemeBuilder()"><i class="fa-solid fa-brush"></i>Theme</div>
-      <div class="more-item" onclick="closeModal();openManifest()"><i class="fa-solid fa-file-code"></i>Manifest</div>
-      <div class="more-item" onclick="closeModal();openIconGen()"><i class="fa-solid fa-image"></i>Icon</div>
-      <div class="more-item" onclick="closeModal();openEnvMgr()"><i class="fa-solid fa-key"></i>ENV</div>
-      <div class="more-item" onclick="closeModal();openBulkRename()"><i class="fa-solid fa-i-cursor"></i>Bulk</div>
-      <div class="more-item" onclick="closeModal();openFirebaseWizard()"><i class="fa-solid fa-fire"></i>Firebase</div>
-      <div class="more-item" onclick="closeModal();bumpVersion()"><i class="fa-solid fa-hashtag"></i>Bump Ver</div>
-      <div class="more-item" onclick="closeModal();openKeystore()"><i class="fa-solid fa-lock"></i>Keystore</div>
-      <div class="more-item" onclick="closeModal();signRelease()"><i class="fa-solid fa-certificate"></i>Sign Rel</div>
-      <div class="more-item" onclick="closeModal();openDevTools()"><i class="fa-solid fa-toolbox"></i>DevTools</div>
-      <div class="more-item" onclick="closeModal();openSnippets()"><i class="fa-solid fa-scissors"></i>Snippets</div>
-      <div class="more-item" onclick="closeModal();openMacros()"><i class="fa-solid fa-record-vinyl"></i>Macros</div>
-      <div class="more-item" onclick="closeModal();showBookmarks()"><i class="fa-regular fa-bookmark"></i>Marks</div>
-      <div class="more-item" onclick="closeModal();cleanBuild(true)"><i class="fa-solid fa-broom"></i>Clean</div>
-      <div class="more-item" onclick="closeModal();showRecent()"><i class="fa-solid fa-clock-rotate-left"></i>Recent</div>
-      <div class="more-item" onclick="closeModal();showShortcuts()"><i class="fa-solid fa-keyboard"></i>Keys</div>
-      <div class="more-item" onclick="closeModal();openSqliteViewer()"><i class="fa-solid fa-database"></i>SQLite</div>
-      <div class="more-item" onclick="closeModal();location.href='/api/backup'"><i class="fa-solid fa-floppy-disk"></i>Backup</div>
-      <div class="more-item" onclick="closeModal();openRestore()"><i class="fa-solid fa-download"></i>Restore</div>
+      <div class="more-item" onclick="closeAllModals();showProjectDetails()"><i class="fa-solid fa-circle-info"></i>Project Details</div>
+      <div class="more-item" onclick="closeAllModals();openPkgRename()"><i class="fa-solid fa-box"></i>Rename Pkg</div>
+      <div class="more-item" onclick="closeAllModals();openStrings()"><i class="fa-solid fa-language"></i>Strings</div>
+      <div class="more-item" onclick="closeAllModals();openThemeBuilder()"><i class="fa-solid fa-brush"></i>Theme</div>
+      <div class="more-item" onclick="closeAllModals();openManifest()"><i class="fa-solid fa-file-code"></i>Manifest</div>
+      <div class="more-item" onclick="closeAllModals();openIconGen()"><i class="fa-solid fa-image"></i>Icon</div>
+      <div class="more-item" onclick="closeAllModals();openVersionSet()"><i class="fa-solid fa-hashtag"></i>Version</div>
+      <div class="more-item" onclick="closeAllModals();openEnvMgr()"><i class="fa-solid fa-key"></i>ENV</div>
+      <div class="more-item" onclick="closeAllModals();openBulkRename()"><i class="fa-solid fa-i-cursor"></i>Bulk</div>
+      <div class="more-item" onclick="closeAllModals();openFirebaseWizard()"><i class="fa-solid fa-fire"></i>Firebase</div>
+      <div class="more-item" onclick="closeAllModals();openKeystore()"><i class="fa-solid fa-lock"></i>Keystore</div>
+      <div class="more-item" onclick="closeAllModals();signRelease()"><i class="fa-solid fa-certificate"></i>Sign</div>
+      <div class="more-item" onclick="closeAllModals();openDevTools()"><i class="fa-solid fa-toolbox"></i>DevTools</div>
+      <div class="more-item" onclick="closeAllModals();openSnippets()"><i class="fa-solid fa-scissors"></i>Snippets</div>
+      <div class="more-item" onclick="closeAllModals();openMacros()"><i class="fa-solid fa-record-vinyl"></i>Macros</div>
+      <div class="more-item" onclick="closeAllModals();showBookmarks()"><i class="fa-regular fa-bookmark"></i>Marks</div>
+      <div class="more-item" onclick="closeAllModals();cleanBuild(true)"><i class="fa-solid fa-broom"></i>Deep Clean</div>
+      <div class="more-item" onclick="closeAllModals();showRecent()"><i class="fa-solid fa-clock-rotate-left"></i>Recent</div>
+      <div class="more-item" onclick="closeAllModals();showShortcuts()"><i class="fa-solid fa-keyboard"></i>Keys</div>
+      <div class="more-item" onclick="closeAllModals();openSqliteViewer()"><i class="fa-solid fa-database"></i>SQLite</div>
+      <div class="more-item" onclick="closeAllModals();location.href='/api/backup'"><i class="fa-solid fa-floppy-disk"></i>Backup</div>
+      <div class="more-item" onclick="closeAllModals();openRestore()"><i class="fa-solid fa-download"></i>Restore</div>
     </div>
     <button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="document.getElementById('moreModal').classList.remove('show')">Close</button>
   </div>
@@ -3133,78 +4038,36 @@ var logcatSid=null,logcatTimer=null,logcatLines=[],logcatLastIdx=0;
 var ptySid=null,ptyLastIdx=0,ptyTimer=null;
 var PRESETS=[];
 var notifLastSeen=0,notifPollTimer=null;
-var autoBuildPollTimer=null;
+var TIMEOUT_LABELS={},TIMEOUT_VALUES={},TIMEOUT_DEFAULTS={};
+var IDE_SETTINGS_CACHE={};
+var POLL_INTERVALS={poll:700,logcat:700,pty:300,sys:15000,notif:3000};
 
-// ============ UTILS ============
-function toast(msg,type){type=type||"success";var c=document.getElementById("toasts");var t=document.createElement("div");t.className="toast "+type;var icon=type==="error"?'<i class="fa-solid fa-circle-xmark"></i>':type==="info"?'<i class="fa-solid fa-circle-info"></i>':'<i class="fa-solid fa-circle-check"></i>';t.innerHTML=icon+"<span>"+msg+"</span>";c.appendChild(t);setTimeout(function(){t.remove()},3000);}
-function esc(t){var d=document.createElement("div");d.innerText=t;return d.innerHTML;}
+function toast(msg,type){type=type||"success";var c=document.getElementById("toasts");var t=document.createElement("div");t.className="toast "+type;var icon=type==="error"?'<i class="fa-solid fa-circle-xmark"></i>':type==="info"?'<i class="fa-solid fa-circle-info"></i>':'<i class="fa-solid fa-circle-check"></i>';t.innerHTML=icon+"<span>"+msg+"</span>";c.appendChild(t);setTimeout(function(){t.remove()},3000)}
+function esc(t){var d=document.createElement("div");d.innerText=t;return d.innerHTML}
+function closeAllModals(){document.querySelectorAll(".modal-overlay").forEach(function(m){m.classList.remove("show")});document.getElementById("cmdPalette").classList.remove("show")}
 function switchPanel(id,el){
-  document.querySelectorAll(".nav-item").forEach(function(n){n.classList.remove("active");});
-  document.querySelectorAll(".panel").forEach(function(p){p.classList.remove("active");});
-  if(el) el.classList.add("active");
-  else{var n=document.querySelector('[data-panel="'+id+'"]');if(n)n.classList.add("active");}
-  var panel=document.getElementById("panel-"+id);
-  if(panel) panel.classList.add("active");
-  
-  // 🔴 Desktop Mode for Log Section
-  var mainArea = document.getElementById("mainArea");
-  if(id === "logcat") {
-      mainArea.style.maxWidth = "100%";
-      mainArea.style.width = "100%";
-  } else {
-      mainArea.style.maxWidth = "";
-      mainArea.style.width = "";
-  }
-
+  document.querySelectorAll(".nav-item").forEach(function(n){n.classList.remove("active")});
+  document.querySelectorAll(".panel").forEach(function(p){p.classList.remove("active")});
+  if(el)el.classList.add("active");else{var n=document.querySelector('[data-panel="'+id+'"]');if(n)n.classList.add("active")}
+  var panel=document.getElementById("panel-"+id);if(panel)panel.classList.add("active");
+  var mainArea=document.getElementById("mainArea");
+  if(id==="logcat"){mainArea.style.maxWidth="100%";mainArea.style.width="100%"}else{mainArea.style.maxWidth="";mainArea.style.width=""}
   if(id==="preview")refreshPreview();
+  if(id==="htmlview")loadHtmlFiles();
   if(id==="git")gitAction("status");
   if(id==="kanban")loadKanban();
   if(id==="notes")loadNotes();
   if(id==="analytics")loadAnalytics();
   if(id==="packages")loadPackages();
 }
-function getMode(filename){
-  var ext=filename.split(".").pop().toLowerCase();
-  var map={py:"python",c:"text/x-csrc",cpp:"text/x-c++src",cc:"text/x-c++src",
-    java:"text/x-java",kt:"text/x-kotlin",js:"javascript",xml:"xml",html:"htmlmixed",
-    css:"css",json:"application/json",md:"markdown",sh:"text/x-sh",gradle:"text/x-java",sql:"sql"};
-  return map[ext]||"null";
-}
-function showModal(html){document.getElementById("genericModalContent").innerHTML=html;document.getElementById("genericModal").classList.add("show");}
-function closeModal(){document.getElementById("genericModal").classList.remove("show");}
-function fileCategory(name){
-  var ext=name.split(".").pop().toLowerCase();
-  if(["java","kt","py","js","ts","c","cpp","cc","h","go","rs","rb","php","pl","sh","gradle","sql"].indexOf(ext)>=0)return "code";
-  if(["png","jpg","jpeg","gif","webp","svg","bmp"].indexOf(ext)>=0)return "image";
-  if(["mp4","mov","avi","mkv","webm"].indexOf(ext)>=0)return "video";
-  if(["mp3","wav","ogg","flac","m4a"].indexOf(ext)>=0)return "audio";
-  if(["xml","json","html","css","md","txt","properties","yaml","yml"].indexOf(ext)>=0)return "doc";
-  if(["zip","tar","gz","rar","7z","apk","jar"].indexOf(ext)>=0)return "zip";
-  if(["db","sqlite","sqlite3"].indexOf(ext)>=0)return "code";
-  return "";
-}
-function fileIcon(name,isFolder){
-  if(isFolder) return "fa-folder";
-  var ext=name.split(".").pop().toLowerCase();
-  var map={java:"fa-java",kt:"fa-k",py:"fa-python",js:"fa-node-js",ts:"fa-code",
-    c:"fa-code",cpp:"fa-code",h:"fa-code",go:"fa-code",rs:"fa-cog",rb:"fa-gem",
-    php:"fa-php",sh:"fa-terminal",gradle:"fa-cubes",
-    xml:"fa-file-code",json:"fa-file-code",html:"fa-html5",css:"fa-css3-alt",
-    md:"fa-markdown",txt:"fa-file-lines",properties:"fa-sliders",
-    png:"fa-image",jpg:"fa-image",jpeg:"fa-image",gif:"fa-image",svg:"fa-bezier-curve",
-    mp4:"fa-video",mov:"fa-video",mp3:"fa-music",wav:"fa-music",
-    zip:"fa-file-zipper",tar:"fa-file-zipper",apk:"fa-android",jar:"fa-mug-hot",
-    sql:"fa-database",db:"fa-database",sqlite:"fa-database"};
-  return map[ext]||"fa-file";
-}
-function highlight(name,q){
-  if(!q)return esc(name);
-  var idx=name.toLowerCase().indexOf(q.toLowerCase());
-  if(idx<0)return esc(name);
-  return esc(name.slice(0,idx))+"<mark>"+esc(name.slice(idx,idx+q.length))+"</mark>"+esc(name.slice(idx+q.length));
-}
+function getMode(filename){var ext=filename.split(".").pop().toLowerCase();var map={py:"python",c:"text/x-csrc",cpp:"text/x-c++src",cc:"text/x-c++src",java:"text/x-java",kt:"text/x-kotlin",js:"javascript",xml:"xml",html:"htmlmixed",css:"css",json:"application/json",md:"markdown",sh:"text/x-sh",gradle:"text/x-java",sql:"sql"};return map[ext]||"null"}
+function showModal(html){document.getElementById("genericModalContent").innerHTML=html;document.getElementById("genericModal").classList.add("show")}
+function closeModal(){document.getElementById("genericModal").classList.remove("show")}
+function fileCategory(name){var ext=name.split(".").pop().toLowerCase();if(["java","kt","py","js","ts","c","cpp","cc","h","go","rs","rb","php","pl","sh","gradle","sql"].indexOf(ext)>=0)return "code";if(["png","jpg","jpeg","gif","webp","svg","bmp"].indexOf(ext)>=0)return "image";if(["mp4","mov","avi","mkv","webm"].indexOf(ext)>=0)return "video";if(["mp3","wav","ogg","flac","m4a"].indexOf(ext)>=0)return "audio";if(["xml","json","html","css","md","txt","properties","yaml","yml"].indexOf(ext)>=0)return "doc";if(["zip","tar","gz","rar","7z","apk","jar"].indexOf(ext)>=0)return "zip";if(["db","sqlite","sqlite3"].indexOf(ext)>=0)return "code";return ""}
+function fileIcon(name,isFolder){if(isFolder)return "fa-folder";var ext=name.split(".").pop().toLowerCase();var map={java:"fa-java",kt:"fa-k",py:"fa-python",js:"fa-node-js",ts:"fa-code",c:"fa-code",cpp:"fa-code",h:"fa-code",go:"fa-code",rs:"fa-cog",rb:"fa-gem",php:"fa-php",sh:"fa-terminal",gradle:"fa-cubes",xml:"fa-file-code",json:"fa-file-code",html:"fa-html5",css:"fa-css3-alt",md:"fa-markdown",txt:"fa-file-lines",properties:"fa-sliders",png:"fa-image",jpg:"fa-image",jpeg:"fa-image",gif:"fa-image",svg:"fa-bezier-curve",mp4:"fa-video",mov:"fa-video",mp3:"fa-music",wav:"fa-music",zip:"fa-file-zipper",tar:"fa-file-zipper",apk:"fa-android",jar:"fa-mug-hot",sql:"fa-database",db:"fa-database",sqlite:"fa-database"};return map[ext]||"fa-file"}
+function highlight(name,q){if(!q)return esc(name);var idx=name.toLowerCase().indexOf(q.toLowerCase());if(idx<0)return esc(name);return esc(name.slice(0,idx))+"<mark>"+esc(name.slice(idx,idx+q.length))+"</mark>"+esc(name.slice(idx+q.length))}
+function formatTime(sec){sec=Math.floor(sec);if(sec<60)return sec+"s";return Math.floor(sec/60)+"m "+(sec%60)+"s"}
 
-// ============ FILES ============
 async function loadFiles(path){
   currentPath=path||"";
   var box=document.getElementById("file-list");
@@ -3214,853 +4077,297 @@ async function loadFiles(path){
     var sort=(document.getElementById("sortBy")&&document.getElementById("sortBy").value)||"name";
     var r=await fetch("/api/project-files/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(currentPath)+"&sort="+sort);
     var d=await r.json();
-    if(!r.ok){box.innerHTML='<div class="empty" style="color:#f87171">'+(d.error||r.status)+'</div>';return;}
+    if(!r.ok){box.innerHTML='<div class="empty" style="color:#f87171">'+(d.error||r.status)+'</div>';return}
     var parts=currentPath?currentPath.split("/"):[];
     var bcHtml='<span onclick="loadFiles(\'\')"><i class="fa-solid fa-folder"></i> '+esc(PROJECT)+'</span>';
     var acc="";
-    parts.forEach(function(p){acc+=(acc?"/":"")+p;bcHtml+=' / <span onclick="loadFiles(\''+acc+'\')">'+esc(p)+'</span>';});
+    parts.forEach(function(p){acc+=(acc?"/":"")+p;bcHtml+=' / <span onclick="loadFiles(\''+acc+'\')">'+esc(p)+'</span>'});
     bc.innerHTML=bcHtml;
     allFilesCache=d.files||[];
-    if(!allFilesCache.length){box.innerHTML='<div class="empty"><i class="fa-solid fa-folder-open"></i> Empty folder</div>';return;}
+    if(!allFilesCache.length){box.innerHTML='<div class="empty"><i class="fa-solid fa-folder-open"></i> Empty folder</div>';return}
     await renderFileList(allFilesCache);
-  }catch(e){box.innerHTML='<div class="empty" style="color:#f87171">'+e.message+'</div>';}
+  }catch(e){box.innerHTML='<div class="empty" style="color:#f87171">'+e.message+'</div>'}
 }
 async function renderFileList(files){
-  var box=document.getElementById("file-list");
-  box.innerHTML="";
-  try{
-    var r=await fetch("/api/all-folder-sizes/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(currentPath));
-    if(r.ok){var d=await r.json();folderSizes=d.sizes||{};}
-  }catch(e){}
-  if(currentPath){
-    var parts=currentPath.split("/");var up=parts.slice(0,-1).join("/");
-    var d=document.createElement("div");d.className="file-item folder";
-    d.innerHTML='<div class="icon-wrap"><i class="fa-solid fa-arrow-up"></i></div><span class="name">.. up</span>';
-    d.onclick=function(){loadFiles(up);};box.appendChild(d);
-  }
+  var box=document.getElementById("file-list");box.innerHTML="";
+  try{var r=await fetch("/api/all-folder-sizes/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(currentPath));if(r.ok){var d=await r.json();folderSizes=d.sizes||{}}}catch(e){}
+  if(currentPath){var parts=currentPath.split("/");var up=parts.slice(0,-1).join("/");var d=document.createElement("div");d.className="file-item folder";d.innerHTML='<div class="icon-wrap"><i class="fa-solid fa-arrow-up"></i></div><span class="name">.. up</span>';d.onclick=function(){loadFiles(up)};box.appendChild(d)}
   var q=(document.getElementById("searchInput")&&document.getElementById("searchInput").value)||"";
   files.forEach(function(f){
     var div=document.createElement("div");
     var cat=f.type==="file"?fileCategory(f.name):"";
     div.className="file-item "+(f.type==="directory"?"folder":"file "+cat);
     var icon=fileIcon(f.name,f.type==="directory");
-    var sizeText="";
-    if(f.type==="directory")sizeText=folderSizes[f.name]||"...";
-    else sizeText=f.size_h||"";
-    div.innerHTML='<div class="icon-wrap"><i class="fa-solid '+icon+'"></i></div>'+
-      '<span class="name">'+highlight(f.name,q)+'</span>'+
-      '<span class="size-badge">'+esc(sizeText)+'</span>'+
-      '<span class="meta">'+esc(f.mtime?f.mtime.slice(5,16):"")+'</span>';
-    div.onclick=function(){if(f.type==="directory")loadFiles(f.path);else openFile(f.path);};
-    div.oncontextmenu=function(e){e.preventDefault();showItemMenu(f);};
+    var sizeText=f.type==="directory"?(folderSizes[f.name]||"..."):(f.size_h||"");
+    div.innerHTML='<div class="icon-wrap"><i class="fa-solid '+icon+'"></i></div><span class="name">'+highlight(f.name,q)+'</span><span class="size-badge">'+esc(sizeText)+'</span><span class="meta">'+esc(f.mtime?f.mtime.slice(5,16):"")+'</span>';
+    div.onclick=function(){if(f.type==="directory")loadFiles(f.path);else openFile(f.path)};
+    div.oncontextmenu=function(e){e.preventDefault();showItemMenu(f)};
     var pressTimer;
-    div.addEventListener("touchstart",function(){pressTimer=setTimeout(function(){showItemMenu(f);},600);});
-    div.addEventListener("touchend",function(){clearTimeout(pressTimer);});
-    div.addEventListener("touchmove",function(){clearTimeout(pressTimer);});
+    div.addEventListener("touchstart",function(){pressTimer=setTimeout(function(){showItemMenu(f)},600)});
+    div.addEventListener("touchend",function(){clearTimeout(pressTimer)});
+    div.addEventListener("touchmove",function(){clearTimeout(pressTimer)});
     box.appendChild(div);
   });
 }
-function filterFiles(q){
-  q=(q||"").trim();
-  if(!q){renderFileList(allFilesCache);return;}
-  if(q.length>=2){
-    fetch("/api/search/"+encodeURIComponent(PROJECT)+"?q="+encodeURIComponent(q))
-      .then(function(r){return r.json();}).then(function(d){
-        var box=document.getElementById("file-list");box.innerHTML="";
-        if(!d.results||!d.results.length){box.innerHTML='<div class="empty"><i class="fa-solid fa-magnifying-glass"></i><br>No results</div>';return;}
-        d.results.forEach(function(f){
-          var div=document.createElement("div");
-          var cat=fileCategory(f.name);
-          div.className="file-item file "+cat;
-          div.innerHTML='<div class="icon-wrap"><i class="fa-solid '+fileIcon(f.name,false)+'"></i></div><span class="name">'+highlight(f.path,q)+'</span>';
-          div.onclick=function(){openFile(f.path);};box.appendChild(div);
-        });
-      });
-  }else{
-    var filtered=allFilesCache.filter(function(f){return f.name.toLowerCase().indexOf(q.toLowerCase())!==-1;});
-    renderFileList(filtered);
-  }
-}
-function clearSearch(){document.getElementById("searchInput").value="";renderFileList(allFilesCache);}
-function showItemMenu(f){
-  var c=prompt("Action for: "+f.name+"\n1=Open  2=Rename  3=Delete  4=Copy  5=Check  6=Bookmark");
-  if(c==="1"){if(f.type==="directory")loadFiles(f.path);else openFile(f.path);}
-  else if(c==="2"){var nn=prompt("New name:",f.name);if(nn&&nn!==f.name)fileOp("rename",f.path,nn);}
-  else if(c==="3"){if(confirm("Delete "+f.name+"?"))fileOp("delete",f.path);}
-  else if(c==="4"){var nn=prompt("Copy as:",f.name+"_copy");if(nn)fileOp("copy",f.path,nn);}
-  else if(c==="5"&&f.type==="file")checkFileErrors(f.path,true);
-  else if(c==="6"){fetch("/api/bookmarks/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:f.path,line:1,label:f.name})}).then(function(){toast("Bookmarked");});}
-}
-async function newFile(){
-  var n=prompt("New file name:");if(!n)return;
-  var fp=currentPath?currentPath+"/"+n:n;
-  var c=prompt("Initial content (optional):","")||"";
-  await fileOp("create-file",fp,null,c);
-}
-async function newFolder(){
-  var n=prompt("New folder name:");if(!n)return;
-  var fp=currentPath?currentPath+"/"+n:n;
-  await fileOp("create-folder",fp);
-}
-async function fileOp(action,path,newName,content){
+function filterFiles(q){q=(q||"").trim();if(!q){renderFileList(allFilesCache);return}if(q.length>=2){fetch("/api/search/"+encodeURIComponent(PROJECT)+"?q="+encodeURIComponent(q)).then(function(r){return r.json()}).then(function(d){var box=document.getElementById("file-list");box.innerHTML="";if(!d.results||!d.results.length){box.innerHTML='<div class="empty"><i class="fa-solid fa-magnifying-glass"></i><br>No results</div>';return}d.results.forEach(function(f){var div=document.createElement("div");div.className="file-item file "+fileCategory(f.name);div.innerHTML='<div class="icon-wrap"><i class="fa-solid '+fileIcon(f.name,false)+'"></i></div><span class="name">'+highlight(f.path,q)+'</span>';div.onclick=function(){openFile(f.path)};box.appendChild(div)})})}else{var filtered=allFilesCache.filter(function(f){return f.name.toLowerCase().indexOf(q.toLowerCase())!==-1});renderFileList(filtered)}}
+function clearSearch(){document.getElementById("searchInput").value="";renderFileList(allFilesCache)}
+function showItemMenu(f){var c=prompt("Action for: "+f.name+"\n1=Open  2=Rename  3=Delete  4=Copy  5=Check  6=Bookmark");if(c==="1"){if(f.type==="directory")loadFiles(f.path);else openFile(f.path)}else if(c==="2"){var nn=prompt("New name:",f.name);if(nn&&nn!==f.name)fileOp("rename",f.path,nn)}else if(c==="3"){if(confirm("Delete "+f.name+"?"))fileOp("delete",f.path)}else if(c==="4"){var nn=prompt("Copy as:",f.name+"_copy");if(nn)fileOp("copy",f.path,nn)}else if(c==="5"&&f.type==="file")checkFileErrors(f.path,true);else if(c==="6"){fetch("/api/bookmarks/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:f.path,line:1,label:f.name})}).then(function(){toast("Bookmarked")})}}
+async function newFile(){var n=prompt("New file name:");if(!n)return;var fp=currentPath?currentPath+"/"+n:n;var c=prompt("Initial content (optional):","")||"";await fileOp("create-file",fp,null,c)}
+async function newFolder(){var n=prompt("New folder name:");if(!n)return;var fp=currentPath?currentPath+"/"+n:n;await fileOp("create-folder",fp)}
+async function fileOp(action,path,newName,content){try{var body={project:PROJECT,action:action,path:path};if(newName)body.newName=newName;if(content!==undefined)body.content=content;var r=await fetch("/api/file-operation",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});var d=await r.json();if(!r.ok){toast(d.error||"Error","error");return}loadFiles(currentPath);toast("Done")}catch(e){toast("Error: "+e,"error")}}
+async function doUpload(input){if(!input.files||!input.files[0])return;var fd=new FormData();fd.append("file",input.files[0]);fd.append("path",currentPath);try{var r=await fetch("/api/upload/"+encodeURIComponent(PROJECT),{method:"POST",body:fd});var d=await r.json();if(r.ok){toast("Uploaded");loadFiles(currentPath)}else toast(d.error||"Fail","error")}catch(e){toast("Error","error")}input.value=""}
+async function doExtract(input){if(!input.files||!input.files[0])return;var fd=new FormData();fd.append("file",input.files[0]);fd.append("path",currentPath);try{var r=await fetch("/api/extract/"+encodeURIComponent(PROJECT),{method:"POST",body:fd});var d=await r.json();if(r.ok){toast("Extracted");loadFiles(currentPath)}else toast(d.error||"Fail","error")}catch(e){toast("Error","error")}input.value=""}
+async function showRecent(){try{var r=await fetch("/api/recent");var d=await r.json();var html='<h3><i class="fa-solid fa-clock-rotate-left"></i> Recent Files</h3>';if(!d.items||!d.items.length)html+='<div class="empty">No recent files</div>';else{html+='<div style="max-height:400px;overflow-y:auto">';d.items.forEach(function(it){html+='<div class="file-item file" onclick="closeModal();location.href=\'/project/'+encodeURIComponent(it.project)+'\'"><div class="icon-wrap"><i class="fa-solid fa-file"></i></div><span class="name">'+esc(it.project)+' / '+esc(it.path)+'<br><small style="color:#94a3b8">'+esc(it.mtime)+'</small></span></div>'});html+='</div>'}html+='<button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>';showModal(html)}catch(e){toast("Error","error")}}
+
+// HTML VIEWER
+async function loadHtmlFiles(){
+  var box=document.getElementById("htmlFileList");
+  var frame=document.getElementById("htmlViewerFrame");
+  frame.style.display="none";
+  box.style.display="block";
+  box.innerHTML='<div class="empty"><i class="fa-solid fa-spinner fa-spin"></i> Loading...</div>';
   try{
-    var body={project:PROJECT,action:action,path:path};
-    if(newName)body.newName=newName;
-    if(content!==undefined)body.content=content;
-    var r=await fetch("/api/file-operation",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(body)});
+    var r=await fetch("/api/html-files/"+encodeURIComponent(PROJECT));
     var d=await r.json();
-    if(!r.ok){toast(d.error||"Error","error");return;}
-    loadFiles(currentPath);toast("Done");
-  }catch(e){toast("Error: "+e,"error");}
+    if(!r.ok){box.innerHTML='<div class="empty" style="color:#f87171">'+(d.error||"Error")+'</div>';return}
+    if(!d.files||!d.files.length){box.innerHTML='<div class="empty"><i class="fa-solid fa-file-code"></i><br>No HTML files found</div>';return}
+    var html="";
+    d.files.forEach(function(f){
+      html+='<div class="html-file-item" onclick="viewHtml(\''+esc(f.path).replace(/'/g,"\\'")+'\')"><div class="icon-wrap"><i class="fa-brands fa-html5"></i></div><span class="name" style="flex:1">'+esc(f.path)+'</span><i class="fa-solid fa-chevron-right" style="color:#64748b"></i></div>';
+    });
+    box.innerHTML=html;
+  }catch(e){box.innerHTML='<div class="empty" style="color:#f87171">Error: '+e+'</div>'}
 }
-async function doUpload(input){
-  if(!input.files||!input.files[0])return;
-  var fd=new FormData();fd.append("file",input.files[0]);fd.append("path",currentPath);
+function viewHtml(path){
+  document.getElementById("htmlFileList").style.display="none";
+  document.getElementById("htmlViewerFrame").style.display="block";
+  document.getElementById("htmlViewPath").value=path;
+  document.getElementById("htmlIframe").src="/api/html-view/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(path);
+}
+function closeHtmlViewer(){
+  document.getElementById("htmlFileList").style.display="block";
+  document.getElementById("htmlViewerFrame").style.display="none";
+  document.getElementById("htmlIframe").src="about:blank";
+}
+function reloadHtmlView(){var p=document.getElementById("htmlViewPath").value;if(p)viewHtml(p)}
+
+// PACKAGES
+async function loadPackages(){
+  var box=document.getElementById("pkgList");if(!box)return;
+  box.innerHTML='<div class="empty"><i class="fa-solid fa-spinner fa-spin"></i> Loading...</div>';
   try{
-    var r=await fetch("/api/upload/"+encodeURIComponent(PROJECT),{method:"POST",body:fd});
+    var r=await fetch("/api/packages");var d=await r.json();
+    if(!d.packages||!d.packages.length){box.innerHTML='<div class="empty">No packages</div>';return}
+    var html="";
+    d.packages.forEach(function(p){
+      html+='<div style="display:flex;justify-content:space-between;padding:6px;border-bottom:1px solid #1f2937;align-items:center"><span style="color:#60a5fa">'+esc(p.name)+'</span><span style="color:#94a3b8;font-size:10px;margin-right:8px">v'+esc(p.version)+'</span><button class="btn btn-success" style="padding:2px 8px;font-size:10px" onclick="upgradePkg(\''+esc(p.name)+'\')"><i class="fa-solid fa-arrow-up"></i></button></div>';
+    });
+    box.innerHTML=html;
+  }catch(e){box.innerHTML='<div class="empty" style="color:#f87171">Error</div>'}
+}
+async function upgradePkg(pkgName){if(!confirm("Upgrade "+pkgName+"?"))return;toast("Upgrading "+pkgName+"...","info");try{var r=await fetch("/api/packages/upgrade",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({package:pkgName})});if(r.ok){toast("Upgraded!");loadPackages()}else toast("Failed","error")}catch(e){toast("Error","error")}}
+async function upgradeAll(){if(!confirm("Upgrade all packages?"))return;toast("Upgrading all...","info");try{var r=await fetch("/api/packages/upgrade",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({package:"--all"})});if(r.ok){toast("All upgraded!");loadPackages()}}catch(e){toast("Error","error")}}
+async function showProjectDeps(){
+  showModal('<h3><i class="fa-solid fa-cubes"></i> Dependencies</h3><div id="depsBox" style="max-height:300px;overflow-y:auto;background:#0b1220;padding:10px;border-radius:10px;font-family:monospace;font-size:12px">Loading...</div><button class="btn btn-primary" style="width:100%;margin-top:10px;padding:12px" onclick="updateProjectDeps()">Auto Update</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Close</button>');
+  try{var r=await fetch("/api/project-deps/"+encodeURIComponent(PROJECT));var d=await r.json();var box=document.getElementById("depsBox");if(!d.dependencies||!d.dependencies.length){box.innerHTML='<div class="empty">No deps</div>';return}var html="";d.dependencies.forEach(function(dep){var name=dep.name||dep;var size=dep.size||"?";html+='<div style="padding:5px;border-bottom:1px solid #1f2937;color:#a78bfa;display:flex;justify-content:space-between"><span>• '+esc(name)+'</span><span style="color:#94a3b8;font-size:10px">'+esc(size)+'</span></div>'});box.innerHTML=html}catch(e){document.getElementById("depsBox").innerText="Error"}
+}
+async function updateProjectDeps(){toast("Checking...","info");try{var r=await fetch("/api/project-deps/update/"+encodeURIComponent(PROJECT),{method:"POST"});var d=await r.json();if(r.ok){toast("Updated "+d.updated);showProjectDeps()}else toast(d.error||"Fail","error")}catch(e){toast("Error","error")}}
+
+// PROJECT DETAILS (NEW)
+async function showProjectDetails(){
+  showModal('<h3><i class="fa-solid fa-circle-info"></i> Project Details</h3><div id="pdBox" style="max-height:70vh;overflow-y:auto">Loading...</div><button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>');
+  try{
+    var r=await fetch("/api/project-details/"+encodeURIComponent(PROJECT));
     var d=await r.json();
-    if(r.ok){toast("Uploaded");loadFiles(currentPath);}else toast(d.error||"Fail","error");
-  }catch(e){toast("Error","error");}
-  input.value="";
-}
-async function doExtract(input){
-  if(!input.files||!input.files[0])return;
-  var fd=new FormData();fd.append("file",input.files[0]);fd.append("path",currentPath);
-  try{
-    var r=await fetch("/api/extract/"+encodeURIComponent(PROJECT),{method:"POST",body:fd});
-    var d=await r.json();
-    if(r.ok){toast("Extracted");loadFiles(currentPath);}else toast(d.error||"Fail","error");
-  }catch(e){toast("Error","error");}
-  input.value="";
-}
-async function showRecent(){
-  try{
-    var r=await fetch("/api/recent");var d=await r.json();
-    var html='<h3><i class="fa-solid fa-clock-rotate-left"></i> Recent Files</h3>';
-    if(!d.items||!d.items.length)html+='<div class="empty">No recent files</div>';
-    else{
-      html+='<div style="max-height:400px;overflow-y:auto">';
-      d.items.forEach(function(it){
-        html+='<div class="file-item file" onclick="closeModal();location.href=\'/project/'+encodeURIComponent(it.project)+'\'"><div class="icon-wrap"><i class="fa-solid fa-file"></i></div><span class="name">'+esc(it.project)+' / '+esc(it.path)+'<br><small style="color:#94a3b8">'+esc(it.mtime)+'</small></span></div>';
-      });
+    if(!r.ok){document.getElementById("pdBox").innerHTML='<div style="color:#f87171">Error: '+(d.error||"")+'</div>';return}
+    var html="";
+    // Icon + name
+    html+='<div style="display:flex;gap:14px;align-items:center;margin-bottom:14px;padding-bottom:14px;border-bottom:1px solid #1f2937">';
+    html+='<div class="icon-preview"><img src="/api/project-icon/'+encodeURIComponent(PROJECT)+'?t='+Date.now()+'" onerror="this.parentNode.innerHTML=\'<i class=&quot;fa-solid fa-mobile-screen&quot; style=&quot;font-size:32px;color:#3b82f6&quot;></i>\'"></div>';
+    html+='<div style="flex:1"><div style="font-size:16px;font-weight:700;color:#60a5fa">'+esc(d.name)+'</div><div style="font-size:11px;color:#94a3b8;margin-top:4px">'+esc(d.package||"?")+'</div><div style="font-size:10px;color:#64748b;margin-top:2px">Version '+esc(d.version.code)+' ('+esc(d.version.name)+')</div></div>';
+    html+='</div>';
+    // Stats grid
+    html+='<div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px">';
+    html+='<div style="background:#0b1220;padding:10px;border-radius:10px;border:1px solid #1f2937"><div style="font-size:10px;color:#94a3b8">FILES</div><div style="font-size:20px;font-weight:700;color:#60a5fa">'+d.total_files+'</div></div>';
+    html+='<div style="background:#0b1220;padding:10px;border-radius:10px;border:1px solid #1f2937"><div style="font-size:10px;color:#94a3b8">FOLDERS</div><div style="font-size:20px;font-weight:700;color:#22c55e">'+d.total_folders+'</div></div>';
+    html+='<div style="background:#0b1220;padding:10px;border-radius:10px;border:1px solid #1f2937"><div style="font-size:10px;color:#94a3b8">SIZE</div><div style="font-size:16px;font-weight:700;color:#f59e0b">'+esc(d.total_size_human)+'</div></div>';
+    html+='<div style="background:#0b1220;padding:10px;border-radius:10px;border:1px solid #1f2937"><div style="font-size:10px;color:#94a3b8">DEPS</div><div style="font-size:20px;font-weight:700;color:#8b5cf6">'+(d.dependencies||[]).length+'</div></div>';
+    html+='</div>';
+    // Language breakdown
+    if(d.language_stats&&Object.keys(d.language_stats).length){
+      html+='<h4 style="font-size:12px;color:#60a5fa;margin:10px 0 6px"><i class="fa-solid fa-code"></i> Languages</h4>';
+      var colors=["#3b82f6","#22c55e","#f59e0b","#ef4444","#8b5cf6","#ec4899","#06b6d4","#84cc16"];
+      var bar="",i=0;
+      var sortedLangs=Object.entries(d.language_stats).sort(function(a,b){return b[1].percent-a[1].percent});
+      sortedLangs.forEach(function(e){var c=colors[i%colors.length];bar+='<div style="width:'+e[1].percent+'%;background:'+c+'">'+e[1].percent+'%</div>';i++});
+      html+='<div class="lang-bar">'+bar+'</div>';
+      html+='<div style="display:flex;flex-wrap:wrap;gap:6px;margin:8px 0;font-size:10px">';
+      i=0;
+      sortedLangs.forEach(function(e){var c=colors[i%colors.length];html+='<span style="display:flex;align-items:center;gap:4px"><span style="width:10px;height:10px;border-radius:2px;background:'+c+'"></span>'+esc(e[0])+' '+e[1].percent+'%</span>';i++});
       html+='</div>';
     }
-    html+='<button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>';
-    showModal(html);
-  }catch(e){toast("Error","error");}
+    // Dependencies
+    if(d.dependencies&&d.dependencies.length){
+      html+='<h4 style="font-size:12px;color:#60a5fa;margin:14px 0 6px"><i class="fa-solid fa-cubes"></i> Dependencies ('+d.dependencies.length+')</h4>';
+      html+='<div style="background:#0b1220;border-radius:10px;padding:8px;font-family:monospace;font-size:10px;max-height:180px;overflow-y:auto">';
+      d.dependencies.forEach(function(dep){html+='<div style="padding:3px 0;border-bottom:1px solid #1f2937;color:#a78bfa">• '+esc(dep.name)+'<span style="color:#64748b;float:right">'+esc(dep.size||"?")+'</span></div>'});
+      html+='</div>';
+    }
+    // Manifest permissions
+    if(d.manifest_info&&d.manifest_info.permissions&&d.manifest_info.permissions.length){
+      html+='<h4 style="font-size:12px;color:#60a5fa;margin:14px 0 6px"><i class="fa-solid fa-shield"></i> Permissions</h4>';
+      html+='<div style="background:#0b1220;border-radius:10px;padding:8px;font-family:monospace;font-size:10px">';
+      d.manifest_info.permissions.forEach(function(p){html+='<div style="padding:2px 0;color:#93c5fd">• '+esc(p.replace("android.permission.",""))+'</div>'});
+      html+='</div>';
+    }
+    // Build history table
+    if(d.history&&d.history.length){
+      html+='<h4 style="font-size:12px;color:#60a5fa;margin:14px 0 6px"><i class="fa-solid fa-history"></i> Recent Builds</h4>';
+      html+='<table class="details-table"><thead><tr><th>Date</th><th>Status</th><th>Time</th><th>APK</th></tr></thead><tbody>';
+      d.history.forEach(function(h){
+        var dt=new Date(h.ts*1000).toLocaleString();
+        var st=h.success?'✅':'❌';
+        var dur=h.duration?Math.round(h.duration)+'s':'-';
+        var sz=h.apk_size?(Math.round(h.apk_size/1024)+'KB'):'-';
+        html+='<tr><td>'+dt+'</td><td>'+st+'</td><td>'+dur+'</td><td>'+sz+'</td></tr>';
+      });
+      html+='</tbody></table>';
+    }
+    document.getElementById("pdBox").innerHTML=html;
+  }catch(e){document.getElementById("pdBox").innerHTML='<div style="color:#f87171">Error: '+e+'</div>'}
 }
 
-// ============ PACKAGES & DEPS ============
-async function loadPackages(){
-  var box = document.getElementById("pkgList");
-  if(!box) return;
-  box.innerHTML = '<div class="empty"><i class="fa-solid fa-spinner fa-spin"></i> Loading packages...</div>';
-  try{
-    var r = await fetch("/api/packages");
-    var d = await r.json();
-    if(!d.packages || !d.packages.length) {
-      box.innerHTML = '<div class="empty">No packages found.</div>';
-      return;
-    }
-    var html = "";
-    d.packages.forEach(function(p){
-      html += '<div style="display:flex;justify-content:space-between;padding:6px;border-bottom:1px solid #1f2937;">';
-      html += '<span style="color:#60a5fa;">' + esc(p.name) + '</span>';
-      html += '<span style="color:#94a3b8;margin-right:10px;">v' + esc(p.version) + '</span>';
-      html += '<button class="btn btn-success" style="padding:2px 8px;font-size:10px;" onclick="upgradePkg(\'' + esc(p.name) + '\')"><i class="fa-solid fa-arrow-up"></i></button>';
-      html += '</div>';
-    });
-    box.innerHTML = html;
-  }catch(e){ box.innerHTML = '<div class="empty" style="color:#f87171">Error loading packages</div>'; }
-}
-async function upgradePkg(pkgName){
-  if(!confirm("Upgrade " + pkgName + "?")) return;
-  toast("Upgrading " + pkgName + "... Please wait", "info");
-  try{
-    var r = await fetch("/api/packages/upgrade", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({package: pkgName})
-    });
-    var d = await r.json();
-    if(r.ok) { toast("Upgraded " + pkgName + "!"); loadPackages(); }
-    else toast(d.error || "Failed", "error");
-  }catch(e){ toast("Error", "error"); }
-}
-async function upgradeAll(){
-  if(!confirm("Upgrade all packages? This may take time.")) return;
-  toast("Upgrading all packages...", "info");
-  try{
-    var r = await fetch("/api/packages/upgrade", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({package: "--all"})
-    });
-    var d = await r.json();
-    if(r.ok) { toast("All upgraded!"); loadPackages(); }
-  }catch(e){ toast("Error", "error"); }
-}
-async function showProjectDeps(){
-  showModal('<h3><i class="fa-solid fa-cubes"></i> Project Dependencies</h3><div id="depsBox" style="max-height:300px;overflow-y:auto;background:#0b1220;padding:10px;border-radius:10px;font-family:monospace;font-size:12px;">Loading...</div><button class="btn btn-primary" style="width:100%;margin-top:10px;padding:12px" onclick="updateProjectDeps()">Auto Update Deps</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Close</button>');
-  try{
-    var r = await fetch("/api/project-deps/" + encodeURIComponent(PROJECT));
-    var d = await r.json();
-    var box = document.getElementById("depsBox");
-    if(!d.dependencies || !d.dependencies.length){
-      box.innerHTML = '<div class="empty">No dependencies found.</div>';
-      return;
-    }
-    var html = "";
-    d.dependencies.forEach(function(dep){
-      html += '<div style="padding:5px;border-bottom:1px solid #1f2937;color:#a78bfa;">• ' + esc(dep) + '</div>';
-    });
-    box.innerHTML = html;
-  }catch(e){ document.getElementById("depsBox").innerText = "Error"; }
-}
-async function updateProjectDeps(){
-  toast("Checking for updates...", "info");
-  try{
-    var r = await fetch("/api/project-deps/update/" + encodeURIComponent(PROJECT), {method:"POST"});
-    var d = await r.json();
-    if(r.ok) {
-      toast("Updated " + d.updated + " dependencies!");
-      showProjectDeps();
-    } else toast(d.error || "Failed", "error");
-  }catch(e){ toast("Error", "error"); }
-}
-async function saveSdkVersion(){
-  var sdk = document.getElementById("compileSdkInput").value.trim();
-  if(!sdk) return toast("Enter SDK version", "error");
-  try{
-    var r = await fetch("/api/sdk-update", {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({project: PROJECT, compileSdk: sdk})
-    });
-    if(r.ok) toast("SDK updated to " + sdk);
-    else toast("Failed", "error");
-  }catch(e){ toast("Error", "error"); }
-}
-
-// ============ APK ANALYZER & SQLITE ============
-async function analyzeApk(){
-  switchPanel('build');
-  toast("Analyzing APK...", "info");
-  try{
-    var r = await fetch("/api/apk-analyze/" + encodeURIComponent(PROJECT));
-    var d = await r.json();
-    if(!r.ok) return toast(d.error || "Analyze failed", "error");
-    showModal('<h3><i class="fa-solid fa-magnifying-glass-chart"></i> APK Analyzer</h3><pre style="background:#000;color:#4ade80;padding:10px;border-radius:10px;font-size:10px;max-height:400px;overflow-y:auto;white-space:pre-wrap;word-break:break-all;">' + esc(d.info) + '</pre><button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>');
-  }catch(e){ toast("Error", "error"); }
-}
-function openSqliteViewer(){
-  showModal('<h3><i class="fa-solid fa-database"></i> SQLite Viewer</h3><input id="dbPathInput" placeholder="Path to .db file (e.g. app.db)"><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="loadDbTables()">Load Tables</button><div id="dbTableList" style="margin-top:10px;"></div><div id="dbQueryArea" style="display:none;"><textarea id="dbQueryInput" placeholder="SELECT * FROM table;" style="height:80px;margin-top:10px;"></textarea><button class="btn btn-success" style="width:100%;margin-top:6px;padding:12px" onclick="runDbQuery()">Run Query</button></div><div id="dbResultArea" style="margin-top:10px;overflow-x:auto;"></div><button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>');
-}
-async function loadDbTables(){
-  var path = document.getElementById("dbPathInput").value.trim();
-  if(!path) return toast("Enter path", "error");
-  try{
-    var r = await fetch("/api/db-tables/" + encodeURIComponent(PROJECT) + "?path=" + encodeURIComponent(path));
-    var d = await r.json();
-    if(!r.ok) return toast(d.error || "Failed", "error");
-    var html = '<div style="font-size:12px;color:#60a5fa;margin-bottom:5px">Tables:</div>';
-    d.tables.forEach(function(t){
-      html += '<span style="display:inline-block;background:#1f2937;padding:4px 10px;border-radius:10px;margin:2px;cursor:pointer;font-size:11px;" onclick="document.getElementById(\'dbQueryInput\').value=\'SELECT * FROM '+esc(t)+'\'">'+esc(t)+'</span>';
-    });
-    document.getElementById("dbTableList").innerHTML = html;
-    document.getElementById("dbQueryArea").style.display = "block";
-  }catch(e){ toast("Error", "error"); }
-}
-async function runDbQuery(){
-  var path = document.getElementById("dbPathInput").value.trim();
-  var query = document.getElementById("dbQueryInput").value.trim();
-  if(!query) return;
-  try{
-    var r = await fetch("/api/db-query/" + encodeURIComponent(PROJECT), {
-      method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({path: path, query: query})
-    });
-    var d = await r.json();
-    if(!r.ok) return toast(d.error || "Query failed", "error");
-    if(d.msg) {
-      document.getElementById("dbResultArea").innerHTML = '<div style="color:#4ade80">' + d.msg + '</div>';
-      return;
-    }
-    var html = '<table style="width:100%;border-collapse:collapse;font-size:11px;font-family:monospace;">';
-    html += '<tr>' + d.columns.map(function(c){return '<th style="border:1px solid #1f2937;padding:4px;background:#0b1220;color:#60a5fa">'+esc(c)+'</th>';}).join('') + '</tr>';
-    d.rows.forEach(function(row){
-      html += '<tr>' + row.map(function(cell){return '<td style="border:1px solid #1f2937;padding:4px;color:#e2e8f0">'+esc(String(cell))+'</td>';}).join('') + '</tr>';
-    });
-    html += '</table>';
-    document.getElementById("dbResultArea").innerHTML = html;
-  }catch(e){ toast("Error", "error"); }
-}
-
-// ============ EDITOR ============
-async function openFile(path){
-  var existing=-1;
-  for(var i=0;i<openTabs.length;i++){if(openTabs[i].path===path){existing=i;break;}}
-  if(existing>=0){switchTab(existing);document.getElementById("editor-box").style.display="flex";return;}
-  try{
-    var r=await fetch("/api/file-content/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(path));
-    var d=await r.json();
-    if(!r.ok){toast(d.error||"Error","error");return;}
-    openTabs.push({path:path,content:d.content,mode:getMode(path),dirty:false});
-    activeTabIdx=openTabs.length-1;
-    document.getElementById("editor-box").style.display="flex";
-    renderTabs();loadTabContent();
-    var ext=path.split(".").pop().toLowerCase();
-    var runnable=["py","c","cpp","cc","php","js","go","rs","rb","sh","java"];
-    document.getElementById("runBtn").style.display=runnable.indexOf(ext)>=0?"inline-flex":"none";
-    setTimeout(checkCurrentFile,500);
-  }catch(e){toast("Error: "+e,"error");}
-}
-function renderTabs(){
-  var bar=document.getElementById("editorTabs");bar.innerHTML="";
-  openTabs.forEach(function(t,i){
-    var div=document.createElement("div");
-    div.className="editor-tab"+(i===activeTabIdx?" active":"");
-    var name=t.path.split("/").pop();
-    div.innerHTML=(t.dirty?"• ":"")+esc(name)+' <span class="close-tab" data-i="'+i+'">×</span>';
-    div.onclick=function(e){
-      if(e.target.classList.contains("close-tab"))closeTab(parseInt(e.target.dataset.i));
-      else switchTab(i);
-    };
-    bar.appendChild(div);
+// VERSION SET
+function openVersionSet(){
+  showModal('<h3><i class="fa-solid fa-hashtag"></i> Set Version</h3><div class="setting-item"><label>Version Code</label><input type="number" id="vsCode" min="1" value="1"></div><div class="setting-item"><label>Version Name</label><input type="text" id="vsName" placeholder="1.0.0"></div><button class="btn btn-success" style="width:100%;margin-top:10px;padding:12px" onclick="doSetVersion()">Save Version</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>');
+  fetch("/api/project-details/"+encodeURIComponent(PROJECT)).then(function(r){return r.json()}).then(function(d){
+    if(d.version){document.getElementById("vsCode").value=d.version.code||1;document.getElementById("vsName").value=d.version.name||"1.0"}
   });
 }
-function switchTab(idx){
-  if(cm&&activeTabIdx>=0)openTabs[activeTabIdx].content=cm.getValue();
-  activeTabIdx=idx;renderTabs();loadTabContent();
-}
-function loadTabContent(){
-  if(activeTabIdx<0||!openTabs[activeTabIdx])return;
-  var tab=openTabs[activeTabIdx];
-  document.getElementById("editor-filename").innerText=tab.path;
-  if(cm){cm.toTextArea();cm=null;}
-  cm=CodeMirror.fromTextArea(document.getElementById("editor"),{
-    lineNumbers:true,mode:tab.mode,
-    theme:localStorage.getItem("cmTheme")||"dracula",
-    matchBrackets:true,autoCloseBrackets:true,indentUnit:4,tabSize:4,
-    lineWrapping:true,foldGutter:true,
-    gutters:["CodeMirror-linenumbers","CodeMirror-foldgutter"],
-    extraKeys:{
-      "Ctrl-S":function(){saveFile(false);},
-      "Cmd-S":function(){saveFile(false);},
-      "Ctrl-B":function(){buildApk();},
-      "Ctrl-Shift-P":function(){openCommandPalette();}
-    }
-  });
-  cm.setValue(tab.content);
-  cm.on("change",function(){
-    openTabs[activeTabIdx].dirty=true;renderTabs();
-    if(localStorage.getItem("autoSave")==="on"){
-      clearTimeout(autoSaveTimer);autoSaveTimer=setTimeout(function(){saveFile(true);},2500);
-    }
-    updateSplitPreview();
-  });
-  setTimeout(function(){cm.refresh();},80);
-  applyFontSize(localStorage.getItem("fontSize")||13);
-}
-function closeTab(idx){
-  if(openTabs[idx].dirty&&!confirm("Unsaved changes. Close anyway?"))return;
-  openTabs.splice(idx,1);
-  if(openTabs.length===0){closeEditor();return;}
-  if(activeTabIdx>=openTabs.length)activeTabIdx=openTabs.length-1;
-  if(idx<=activeTabIdx&&activeTabIdx>0)activeTabIdx--;
-  renderTabs();loadTabContent();
-}
-function closeEditor(){
-  if(cm&&activeTabIdx>=0)openTabs[activeTabIdx].content=cm.getValue();
-  document.getElementById("editor-box").style.display="none";
-  document.getElementById("runBtn").style.display="none";
-  document.getElementById("splitPane").classList.remove("show");
-  if(cm){cm.toTextArea();cm=null;}
-}
-function doSelectAll(){if(cm){cm.execCommand("selectAll");cm.focus();}}
-async function doCut(){if(!cm)return;var s=cm.getSelection();if(!s){toast("Select first");return;}try{await navigator.clipboard.writeText(s);cm.replaceSelection("");toast("Cut");}catch(e){toast("Failed","error");}}
-async function doCopy(){if(!cm)return;var s=cm.getSelection();if(!s){toast("Select first");return;}try{await navigator.clipboard.writeText(s);toast("Copied");}catch(e){var ta=document.createElement("textarea");ta.value=s;document.body.appendChild(ta);ta.select();document.execCommand("copy");document.body.removeChild(ta);toast("Copied");}}
-async function doPaste(){if(!cm)return;try{var t=await navigator.clipboard.readText();cm.replaceSelection(t);}catch(e){toast("Paste blocked","error");}}
-function doUndo(){if(cm)cm.undo();}
-function doRedo(){if(cm)cm.redo();}
-function doFind(){if(cm)cm.execCommand("find");}
-function doIndent(){if(!cm)return;var s=cm.getSelection();if(!s){cm.execCommand("indentMore");return;}cm.replaceSelection(s.split("\n").map(function(l){return "    "+l;}).join("\n"));}
-function formatCode(){
-  if(!cm)return;
-  var lines=cm.getValue().split("\n");var indent=0;
-  var formatted=lines.map(function(l){
-    var t=l.trim();
-    if(t.startsWith("}")||t.startsWith(")")||t.startsWith("]"))indent=Math.max(0,indent-1);
-    var res="    ".repeat(indent)+t;
-    if(t.endsWith("{")||t.endsWith("("))indent++;
-    return res;
-  }).join("\n");
-  cm.setValue(formatted);toast("Formatted");
-}
-async function saveFile(silent){
-  if(activeTabIdx<0||!cm)return;
-  var tab=openTabs[activeTabIdx];
-  var content=cm.getValue();
+async function doSetVersion(){
+  var code=document.getElementById("vsCode").value.trim();
+  var name=document.getElementById("vsName").value.trim();
+  if(!code||!name){toast("Both required","error");return}
+  if(!/^\d+$/.test(code)){toast("Version code must be number","error");return}
+  if(!/^\d+(\.\d+){1,3}$/.test(name)){toast("Version name must be like 1.0 or 1.2.3","error");return}
   try{
-    var r=await fetch("/api/file-content/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(tab.path),{
-      method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({content:content})
-    });
+    var r=await fetch("/api/version-set/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({versionCode:code,versionName:name})});
     var d=await r.json();
-    if(!r.ok){if(!silent)toast(d.error||"Save failed","error");return;}
-    tab.content=content;tab.dirty=false;renderTabs();
-    if(!silent)toast("Saved");
-  }catch(e){if(!silent)toast("Save error","error");}
-}
-async function checkCurrentFile(){
-  if(activeTabIdx<0||!cm)return;
-  await saveFile(true);
-  var path=openTabs[activeTabIdx].path;
-  var result=await checkFileErrors(path,false);
-  if(!result)return;
-  errorLines.forEach(function(line){
-    if(cm&&cm.getLineHandle(line-1))
-      cm.removeLineClass(cm.getLineHandle(line-1),"background","cm-error-line");
-  });
-  errorLines=[];
-  var badge=document.getElementById("editor-err-badge");
-  if(!result.errors.length){badge.innerText="0 ✓";badge.className="badge ok";}
-  else{
-    badge.innerText=result.errors.length+" err";badge.className="badge err";
-    result.errors.forEach(function(e){
-      if(e.line&&cm){var h=cm.getLineHandle(e.line-1);if(h){cm.addLineClass(h,"background","cm-error-line");errorLines.push(e.line);}}
-    });
-  }
-}
-async function checkFileErrors(path,showAlert){
-  try{
-    var r=await fetch("/api/check-file/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(path));
-    var d=await r.json();
-    if(!r.ok)return{errors:[]};
-    if(showAlert){if(!d.errors.length)toast("No errors");else toast(d.errors.length+" error(s)","error");}
-    return d;
-  }catch(e){return{errors:[]};}
-}
-async function scanAllErrors(){
-  document.getElementById("scanBtn").innerHTML='<i class="fa-solid fa-spinner fa-spin"></i>';
-  document.getElementById("errInfo").innerHTML='<i class="fa-solid fa-spinner fa-spin"></i> Scanning...';
-  document.getElementById("err-list").innerHTML="";
-  try{
-    var r=await fetch("/api/scan-errors/"+encodeURIComponent(PROJECT));
-    var d=await r.json();
-    if(!r.ok){document.getElementById("errInfo").innerText="Scan failed";return;}
-    var total=0,bad=0;
-    var box=document.getElementById("err-list");
-    (d.results||[]).forEach(function(f){
-      if(f.errors&&f.errors.length){
-        total+=f.errors.length;bad++;
-        var fh=document.createElement("div");
-        fh.style.cssText="color:#fbbf24;font-weight:700;margin-top:12px;font-size:13px";
-        fh.innerHTML='<i class="fa-solid fa-file-code"></i> '+esc(f.path)+' — '+f.errors.length+' error(s)';
-        box.appendChild(fh);
-        f.errors.forEach(function(e){
-          var item=document.createElement("div");
-          item.className="err-item";
-          item.innerHTML='<div style="color:#fbbf24;font-weight:700">Line '+e.line+', Col '+(e.col||1)+'</div><div>'+esc(e.message)+'</div>'+(e.code?'<div style="background:#450a0a;padding:4px;margin-top:4px;border-radius:4px;font-size:11px">'+esc(e.code)+'</div>':'');
-          item.onclick=function(){jumpToError(f.path,e.line);};
-          box.appendChild(item);
-        });
-      }
-    });
-    if(total===0){document.getElementById("errInfo").innerHTML='<i class="fa-solid fa-circle-check" style="color:#4ade80"></i> No errors in '+d.scanned+' files';}
-    else{document.getElementById("errInfo").innerHTML='<i class="fa-solid fa-triangle-exclamation" style="color:#f87171"></i> '+bad+' file(s) • '+total+' error(s)';}
-  }catch(e){document.getElementById("errInfo").innerText="Error: "+e;}
-  document.getElementById("scanBtn").innerHTML='<i class="fa-solid fa-magnifying-glass"></i>';
-}
-async function jumpToError(path,line){
-  await openFile(path);
-  setTimeout(function(){
-    if(cm&&line){cm.setCursor({line:line-1,ch:0});cm.focus();
-      var coords=cm.charCoords({line:line-1,ch:0},"local");
-      cm.scrollTo(null,coords.top-80);}
-  },400);
-}
-async function showHistory(){
-  if(activeTabIdx<0)return;
-  var path=openTabs[activeTabIdx].path;
-  try{
-    var r=await fetch("/api/history/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(path));
-    var d=await r.json();
-    var html='<h3><i class="fa-solid fa-clock-rotate-left"></i> History: '+esc(path.split("/").pop())+'</h3>';
-    if(!d.versions||!d.versions.length)html+='<div class="empty">No versions yet</div>';
-    else d.versions.forEach(function(v){
-      html+='<div class="file-item file" onclick="restoreHistory(\''+esc(path)+'\',\''+esc(v.file)+'\')"><div class="icon-wrap"><i class="fa-solid fa-clock"></i></div><span class="name">'+esc(v.mtime)+'<br><small style="color:#94a3b8">'+esc(v.size)+'</small></span></div>';
-    });
-    html+='<button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>';
-    showModal(html);
-  }catch(e){toast("Error","error");}
-}
-async function restoreHistory(path,version){
-  if(!confirm("Restore this version?"))return;
-  try{
-    var r=await fetch("/api/history-restore",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT,path:path,version:version})});
-    var d=await r.json();
-    if(r.ok){toast("Restored");closeModal();if(cm){var rr=await fetch("/api/file-content/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(path));var dd=await rr.json();cm.setValue(dd.content);}}
-    else toast(d.error||"Fail","error");
-  }catch(e){toast("Error","error");}
-}
-async function addBookmark(){
-  if(activeTabIdx<0)return;
-  var path=openTabs[activeTabIdx].path;
-  var line=cm?cm.getCursor().line+1:1;
-  var label=prompt("Bookmark label:",path.split("/").pop());
-  if(!label)return;
-  try{
-    await fetch("/api/bookmarks/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:path,line:line,label:label})});
-    toast("Bookmarked");
-  }catch(e){toast("Error","error");}
-}
-async function showBookmarks(){
-  try{
-    var r=await fetch("/api/bookmarks/"+encodeURIComponent(PROJECT));
-    var d=await r.json();
-    var html='<h3><i class="fa-regular fa-bookmark"></i> Bookmarks</h3>';
-    if(!d.bookmarks||!d.bookmarks.length)html+='<div class="empty">No bookmarks</div>';
-    else d.bookmarks.forEach(function(b){
-      html+='<div class="file-item file"><div class="icon-wrap"><i class="fa-solid fa-bookmark"></i></div><span class="name" onclick="closeModal();openFile(\''+esc(b.path)+'\')">'+esc(b.label)+'<br><small style="color:#94a3b8">'+esc(b.path)+':'+b.line+'</small></span><button class="btn btn-danger" style="padding:4px 8px" onclick="delBookmark(\''+b.id+'\')"><i class="fa-solid fa-trash"></i></button></div>';
-    });
-    html+='<button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>';
-    showModal(html);
-  }catch(e){toast("Error","error");}
-}
-async function delBookmark(id){
-  try{
-    await fetch("/api/bookmarks/"+encodeURIComponent(PROJECT),{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:id})});
-    showBookmarks();
-  }catch(e){}
+    if(r.ok){toast("Version set!");closeModal()}else toast(d.error||"Fail","error")
+  }catch(e){toast("Error","error")}
 }
 
-// ============ TERMINAL ============
-function clearTerminal(){document.getElementById("terminal-output").innerText="$ Terminal cleared\n";}
-function termKey(e){
-  if(e.key==="Enter")runCmd();
-  else if(e.key==="ArrowUp"){e.preventDefault();if(cmdHistory.length&&histIdx<cmdHistory.length-1){histIdx++;document.getElementById("cmd").value=cmdHistory[cmdHistory.length-1-histIdx];}}
-  else if(e.key==="ArrowDown"){e.preventDefault();if(histIdx>0){histIdx--;document.getElementById("cmd").value=cmdHistory[cmdHistory.length-1-histIdx];}else{histIdx=-1;document.getElementById("cmd").value="";}}
-}
-async function runCmd(){
-  var cmd=document.getElementById("cmd").value.trim();
-  if(!cmd)return;
-  cmdHistory.push(cmd);histIdx=-1;
-  var out=document.getElementById("terminal-output");
-  out.innerText+="\n$ "+cmd+"\n";
-  document.getElementById("cmd").value="";
-  out.scrollTop=out.scrollHeight;
-  try{
-    var r=await fetch("/api/run-command",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT,cmd:cmd})});
-    var d=await r.json();
-    if(d.stdout)out.innerText+=d.stdout;
-    if(d.stderr)out.innerText+="\n[stderr]\n"+d.stderr;
-    if(d.error)out.innerText+="\n[error] "+d.error;
-    out.innerText+="\n[exit "+(d.returncode!=null?d.returncode:"?")+"]\n";
-    out.scrollTop=out.scrollHeight;
-  }catch(e){out.innerText+="\n[error] "+e+"\n";}
-}
-async function loadPresets(){
-  try{
-    var r=await fetch("/api/preset-commands");var d=await r.json();
-    PRESETS=d.commands||[];
-    var box=document.getElementById("presetBox");
-    box.innerHTML="";
-    PRESETS.forEach(function(c){
-      var b=document.createElement("button");
-      b.innerHTML='<i class="fa-solid '+c.icon+'"></i><span>'+esc(c.name)+'</span>';
-      b.onclick=function(){document.getElementById("cmd").value=c.cmd;runCmd();};
-      box.appendChild(b);
-    });
-  }catch(e){}
-}
-async function showSavedCommands(){
-  try{
-    var r=await fetch("/api/saved-commands");var d=await r.json();
-    var html='<h3><i class="fa-solid fa-star"></i> Saved Commands</h3>';
-    if(!d.items||!d.items.length)html+='<div class="empty">No saved commands</div>';
-    else d.items.forEach(function(c){
-      html+='<div class="file-item file"><div class="icon-wrap"><i class="fa-solid fa-bolt"></i></div><span class="name" style="font-family:monospace">'+esc(c)+'</span><button class="btn btn-success" style="padding:5px 9px" onclick="closeModal();switchPanel(\'terminal\');document.getElementById(\'cmd\').value=\''+esc(c).replace(/'/g,"\\'")+'\';runCmd()"><i class="fa-solid fa-play"></i></button><button class="btn btn-danger" style="padding:5px 9px" onclick="delSavedCmd(\''+esc(c).replace(/'/g,"\\'")+'\')"><i class="fa-solid fa-trash"></i></button></div>';
-    });
-    html+='<button class="btn btn-success" style="width:100%;margin-top:8px;padding:11px" onclick="saveCurrentCmd()">+ Save Current</button><button class="btn" style="width:100%;margin-top:6px;padding:11px" onclick="closeModal()">Close</button>';
-    showModal(html);
-  }catch(e){toast("Error","error");}
-}
-async function saveCurrentCmd(){
-  var cmd=prompt("Command to save:");if(!cmd)return;
-  try{await fetch("/api/saved-commands",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cmd:cmd})});toast("Saved");}catch(e){toast("Error","error");}
-}
-async function delSavedCmd(cmd){
-  try{await fetch("/api/saved-commands",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({cmd:cmd})});showSavedCommands();}catch(e){}
-}
-async function showAliases(){
-  try{
-    var r=await fetch("/api/aliases");var d=await r.json();
-    var html='<h3><i class="fa-solid fa-tag"></i> Command Aliases</h3>';
-    Object.keys(d.aliases||{}).forEach(function(k){
-      html+='<div class="file-item file"><div class="icon-wrap"><i class="fa-solid fa-tag"></i></div><span class="name"><b>'+esc(k)+'</b> → <code style="color:#4ade80">'+esc(d.aliases[k])+'</code></span><button class="btn btn-danger" style="padding:5px 9px" onclick="delAlias(\''+esc(k)+'\')"><i class="fa-solid fa-trash"></i></button></div>';
-    });
-    html+='<input id="aliasKey" placeholder="alias name (e.g. upd)" style="margin-top:10px"><input id="aliasCmd" placeholder="command (e.g. pkg update -y)"><button class="btn btn-success" style="width:100%;padding:11px" onclick="addAlias()">+ Add Alias</button><button class="btn" style="width:100%;margin-top:6px;padding:11px" onclick="closeModal()">Close</button>';
-    showModal(html);
-  }catch(e){toast("Error","error");}
-}
-async function addAlias(){
-  var k=document.getElementById("aliasKey").value.trim();
-  var c=document.getElementById("aliasCmd").value.trim();
-  if(!k||!c){toast("Fill both","error");return;}
-  try{
-    var r=await fetch("/api/aliases",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({key:k,cmd:c})});
-    var d=await r.json();
-    if(r.ok){toast("Added");showAliases();}else toast(d.error||"Fail","error");
-  }catch(e){toast("Error","error");}
-}
-async function delAlias(k){
-  try{await fetch("/api/aliases",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({key:k})});showAliases();}catch(e){}
-}
+// APK ANALYZER & SQLITE
+async function analyzeApk(){switchPanel("build");toast("Analyzing...","info");try{var r=await fetch("/api/apk-analyze/"+encodeURIComponent(PROJECT));var d=await r.json();if(!r.ok)return toast(d.error||"Fail","error");showModal('<h3><i class="fa-solid fa-magnifying-glass-chart"></i> APK Analyzer</h3><pre style="background:#000;color:#4ade80;padding:10px;border-radius:10px;font-size:10px;max-height:400px;overflow-y:auto;white-space:pre-wrap;word-break:break-all">'+esc(d.info)+'</pre><button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>')}catch(e){toast("Error","error")}}
+function openSqliteViewer(){showModal('<h3><i class="fa-solid fa-database"></i> SQLite</h3><input id="dbPathInput" placeholder="Path (e.g. app.db)"><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="loadDbTables()">Load Tables</button><div id="dbTableList" style="margin-top:10px"></div><div id="dbQueryArea" style="display:none"><textarea id="dbQueryInput" placeholder="SELECT * FROM table;" style="height:80px;margin-top:10px"></textarea><button class="btn btn-success" style="width:100%;margin-top:6px;padding:12px" onclick="runDbQuery()">Run Query</button></div><div id="dbResultArea" style="margin-top:10px;overflow-x:auto"></div><button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>')}
+async function loadDbTables(){var path=document.getElementById("dbPathInput").value.trim();if(!path)return toast("Enter path","error");try{var r=await fetch("/api/db-tables/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(path));var d=await r.json();if(!r.ok)return toast(d.error||"Fail","error");var html='<div style="font-size:12px;color:#60a5fa;margin-bottom:5px">Tables:</div>';d.tables.forEach(function(t){html+='<span style="display:inline-block;background:#1f2937;padding:4px 10px;border-radius:10px;margin:2px;cursor:pointer;font-size:11px" onclick="document.getElementById(\'dbQueryInput\').value=\'SELECT * FROM '+esc(t)+'\'">'+esc(t)+'</span>'});document.getElementById("dbTableList").innerHTML=html;document.getElementById("dbQueryArea").style.display="block"}catch(e){toast("Error","error")}}
+async function runDbQuery(){var path=document.getElementById("dbPathInput").value.trim();var query=document.getElementById("dbQueryInput").value.trim();if(!query)return;try{var r=await fetch("/api/db-query/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:path,query:query})});var d=await r.json();if(!r.ok)return toast(d.error||"Fail","error");if(d.msg){document.getElementById("dbResultArea").innerHTML='<div style="color:#4ade80">'+d.msg+'</div>';return}var html='<table style="width:100%;border-collapse:collapse;font-size:11px;font-family:monospace">';html+='<tr>'+d.columns.map(function(c){return '<th style="border:1px solid #1f2937;padding:4px;background:#0b1220;color:#60a5fa">'+esc(c)+'</th>'}).join("")+'</tr>';d.rows.forEach(function(row){html+='<tr>'+row.map(function(cell){return '<td style="border:1px solid #1f2937;padding:4px;color:#e2e8f0">'+esc(String(cell))+'</td>'}).join("")+'</tr>'});html+='</table>';document.getElementById("dbResultArea").innerHTML=html}catch(e){toast("Error","error")}}
 
-// ============ PTY ============
-async function startPTY(){
-  if(ptySid){toast("PTY already running");return;}
-  try{
-    var r=await fetch("/api/pty/start",{method:"POST"});
-    var d=await r.json();
-    if(!r.ok){toast(d.error||"PTY failed","error");return;}
-    ptySid=d.session;ptyLastIdx=0;
-    document.getElementById("ptyBox").style.display="block";
-    document.getElementById("terminal-output").style.display="none";
-    document.getElementById("cmd-input").style.display="none";
-    if(ptyTimer)clearInterval(ptyTimer);
-    ptyTimer=setInterval(ptyPoll,300);
-    toast("PTY started");
-  }catch(e){toast("Error: "+e,"error");}
-}
-async function ptyPoll(){
-  if(!ptySid)return;
-  try{
-    var r=await fetch("/api/pty/output/"+ptySid+"?since="+ptyLastIdx);
-    var d=await r.json();
-    if(d.output){
-      var out=document.getElementById("ptyOutput");
-      out.textContent+=d.output;
-      out.scrollTop=out.scrollHeight;
-      ptyLastIdx=d.total;
-    }
-  }catch(e){}
-}
-async function ptySend(){
-  if(!ptySid)return;
-  var inp=document.getElementById("ptyInput");
-  var text=inp.value+"\n";
-  inp.value="";
-  try{await fetch("/api/pty/input/"+ptySid,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:text})});}catch(e){}
-}
-function ptyKey(e){if(e.key==="Enter"){e.preventDefault();ptySend();}}
-async function stopPTY(){
-  if(!ptySid)return;
-  if(ptyTimer)clearInterval(ptyTimer);ptyTimer=null;
-  try{await fetch("/api/pty/stop/"+ptySid,{method:"POST"});}catch(e){}
-  ptySid=null;
-  document.getElementById("ptyBox").style.display="none";
-  document.getElementById("terminal-output").style.display="block";
-  document.getElementById("cmd-input").style.display="flex";
-  toast("PTY stopped");
-}
+// EDITOR
+async function openFile(path){var existing=-1;for(var i=0;i<openTabs.length;i++){if(openTabs[i].path===path){existing=i;break}}if(existing>=0){switchTab(existing);document.getElementById("editor-box").style.display="flex";return}try{var r=await fetch("/api/file-content/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(path));var d=await r.json();if(!r.ok){toast(d.error||"Error","error");return}openTabs.push({path:path,content:d.content,mode:getMode(path),dirty:false});activeTabIdx=openTabs.length-1;document.getElementById("editor-box").style.display="flex";renderTabs();loadTabContent();var ext=path.split(".").pop().toLowerCase();var runnable=["py","c","cpp","cc","php","js","go","rs","rb","sh","java"];document.getElementById("runBtn").style.display=runnable.indexOf(ext)>=0?"inline-flex":"none";setTimeout(checkCurrentFile,500)}catch(e){toast("Error: "+e,"error")}}
+function renderTabs(){var bar=document.getElementById("editorTabs");bar.innerHTML="";openTabs.forEach(function(t,i){var div=document.createElement("div");div.className="editor-tab"+(i===activeTabIdx?" active":"");var name=t.path.split("/").pop();div.innerHTML=(t.dirty?"• ":"")+esc(name)+' <span class="close-tab" data-i="'+i+'">×</span>';div.onclick=function(e){if(e.target.classList.contains("close-tab"))closeTab(parseInt(e.target.dataset.i));else switchTab(i)};bar.appendChild(div)})}
+function switchTab(idx){if(cm&&activeTabIdx>=0)openTabs[activeTabIdx].content=cm.getValue();activeTabIdx=idx;renderTabs();loadTabContent()}
+function loadTabContent(){if(activeTabIdx<0||!openTabs[activeTabIdx])return;var tab=openTabs[activeTabIdx];document.getElementById("editor-filename").innerText=tab.path;if(cm){cm.toTextArea();cm=null}cm=CodeMirror.fromTextArea(document.getElementById("editor"),{lineNumbers:true,mode:tab.mode,theme:localStorage.getItem("cmTheme")||"dracula",matchBrackets:true,autoCloseBrackets:true,indentUnit:4,tabSize:4,lineWrapping:true,foldGutter:true,gutters:["CodeMirror-linenumbers","CodeMirror-foldgutter"],extraKeys:{"Ctrl-S":function(){saveFile(false)},"Ctrl-B":function(){buildApk()}}});cm.setValue(tab.content);cm.on("change",function(){openTabs[activeTabIdx].dirty=true;renderTabs();if(localStorage.getItem("autoSave")==="on"){clearTimeout(autoSaveTimer);autoSaveTimer=setTimeout(function(){saveFile(true)},2500)}updateSplitPreview()});setTimeout(function(){cm.refresh()},80);applyFontSize(localStorage.getItem("fontSize")||13)}
+function closeTab(idx){if(openTabs[idx].dirty&&!confirm("Unsaved. Close?"))return;openTabs.splice(idx,1);if(openTabs.length===0){closeEditor();return}if(activeTabIdx>=openTabs.length)activeTabIdx=openTabs.length-1;if(idx<=activeTabIdx&&activeTabIdx>0)activeTabIdx--;renderTabs();loadTabContent()}
+function closeEditor(){if(cm&&activeTabIdx>=0)openTabs[activeTabIdx].content=cm.getValue();document.getElementById("editor-box").style.display="none";document.getElementById("runBtn").style.display="none";document.getElementById("splitPane").classList.remove("show");if(cm){cm.toTextArea();cm=null}}
+function doSelectAll(){if(cm){cm.execCommand("selectAll");cm.focus()}}
+async function doCut(){if(!cm)return;var s=cm.getSelection();if(!s){toast("Select first");return}try{await navigator.clipboard.writeText(s);cm.replaceSelection("");toast("Cut")}catch(e){toast("Failed","error")}}
+async function doCopy(){if(!cm)return;var s=cm.getSelection();if(!s){toast("Select first");return}try{await navigator.clipboard.writeText(s);toast("Copied")}catch(e){var ta=document.createElement("textarea");ta.value=s;document.body.appendChild(ta);ta.select();document.execCommand("copy");document.body.removeChild(ta);toast("Copied")}}
+async function doPaste(){if(!cm)return;try{var t=await navigator.clipboard.readText();cm.replaceSelection(t)}catch(e){toast("Paste blocked","error")}}
+function doUndo(){if(cm)cm.undo()}
+function doRedo(){if(cm)cm.redo()}
+function doFind(){if(cm)cm.execCommand("find")}
+function doIndent(){if(!cm)return;var s=cm.getSelection();if(!s){cm.execCommand("indentMore");return}cm.replaceSelection(s.split("\n").map(function(l){return "    "+l}).join("\n"))}
+function formatCode(){if(!cm)return;var lines=cm.getValue().split("\n");var indent=0;var formatted=lines.map(function(l){var t=l.trim();if(t.startsWith("}")||t.startsWith(")")||t.startsWith("]"))indent=Math.max(0,indent-1);var res="    ".repeat(indent)+t;if(t.endsWith("{")||t.endsWith("("))indent++;return res}).join("\n");cm.setValue(formatted);toast("Formatted")}
+async function saveFile(silent){if(activeTabIdx<0||!cm)return;var tab=openTabs[activeTabIdx];var content=cm.getValue();try{var r=await fetch("/api/file-content/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(tab.path),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({content:content})});var d=await r.json();if(!r.ok){if(!silent)toast(d.error||"Save failed","error");return}tab.content=content;tab.dirty=false;renderTabs();if(!silent)toast("Saved")}catch(e){if(!silent)toast("Save error","error")}}
+async function checkCurrentFile(){if(activeTabIdx<0||!cm)return;await saveFile(true);var path=openTabs[activeTabIdx].path;var result=await checkFileErrors(path,false);if(!result)return;errorLines.forEach(function(line){if(cm&&cm.getLineHandle(line-1))cm.removeLineClass(cm.getLineHandle(line-1),"background","cm-error-line")});errorLines=[];var badge=document.getElementById("editor-err-badge");if(!result.errors.length){badge.innerText="0 ✓";badge.className="badge ok"}else{badge.innerText=result.errors.length+" err";badge.className="badge err";result.errors.forEach(function(e){if(e.line&&cm){var h=cm.getLineHandle(e.line-1);if(h){cm.addLineClass(h,"background","cm-error-line");errorLines.push(e.line)}}})}}
+async function checkFileErrors(path,showAlert){try{var r=await fetch("/api/check-file/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(path));var d=await r.json();if(!r.ok)return{errors:[]};if(showAlert){if(!d.errors.length)toast("No errors");else toast(d.errors.length+" error(s)","error")}return d}catch(e){return{errors:[]}}}
+async function scanAllErrors(){document.getElementById("scanBtn").innerHTML='<i class="fa-solid fa-spinner fa-spin"></i>';document.getElementById("errInfo").innerHTML='<i class="fa-solid fa-spinner fa-spin"></i> Scanning...';document.getElementById("err-list").innerHTML="";try{var r=await fetch("/api/scan-errors/"+encodeURIComponent(PROJECT));var d=await r.json();if(!r.ok){document.getElementById("errInfo").innerText="Failed";return}var total=0,bad=0;var box=document.getElementById("err-list");(d.results||[]).forEach(function(f){if(f.errors&&f.errors.length){total+=f.errors.length;bad++;var fh=document.createElement("div");fh.style.cssText="color:#fbbf24;font-weight:700;margin-top:12px;font-size:13px";fh.innerHTML='<i class="fa-solid fa-file-code"></i> '+esc(f.path)+' — '+f.errors.length+' error(s)';box.appendChild(fh);f.errors.forEach(function(e){var item=document.createElement("div");item.className="err-item";item.innerHTML='<div style="color:#fbbf24;font-weight:700">Line '+e.line+', Col '+(e.col||1)+'</div><div>'+esc(e.message)+'</div>'+(e.code?'<div style="background:#450a0a;padding:4px;margin-top:4px;border-radius:4px;font-size:11px">'+esc(e.code)+'</div>':'') ;item.onclick=function(){jumpToError(f.path,e.line)};box.appendChild(item)})}});if(total===0){document.getElementById("errInfo").innerHTML='<i class="fa-solid fa-circle-check" style="color:#4ade80"></i> No errors in '+d.scanned+' files'}else{document.getElementById("errInfo").innerHTML='<i class="fa-solid fa-triangle-exclamation" style="color:#f87171"></i> '+bad+' file(s) • '+total+' error(s)'}}catch(e){document.getElementById("errInfo").innerText="Error: "+e}document.getElementById("scanBtn").innerHTML='<i class="fa-solid fa-magnifying-glass"></i>'}
+async function jumpToError(path,line){await openFile(path);setTimeout(function(){if(cm&&line){cm.setCursor({line:line-1,ch:0});cm.focus();var coords=cm.charCoords({line:line-1,ch:0},"local");cm.scrollTo(null,coords.top-80)}},400)}
+async function showHistory(){if(activeTabIdx<0)return;var path=openTabs[activeTabIdx].path;try{var r=await fetch("/api/history/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(path));var d=await r.json();var html='<h3><i class="fa-solid fa-clock-rotate-left"></i> History: '+esc(path.split("/").pop())+'</h3>';if(!d.versions||!d.versions.length)html+='<div class="empty">No versions</div>';else d.versions.forEach(function(v){html+='<div class="file-item file" onclick="restoreHistory(\''+esc(path)+'\',\''+esc(v.file)+'\')"><div class="icon-wrap"><i class="fa-solid fa-clock"></i></div><span class="name">'+esc(v.mtime)+'<br><small style="color:#94a3b8">'+esc(v.size)+'</small></span></div>'});html+='<button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>';showModal(html)}catch(e){toast("Error","error")}}
+async function restoreHistory(path,version){if(!confirm("Restore?"))return;try{var r=await fetch("/api/history-restore",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT,path:path,version:version})});var d=await r.json();if(r.ok){toast("Restored");closeModal();if(cm){var rr=await fetch("/api/file-content/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(path));var dd=await rr.json();cm.setValue(dd.content)}}else toast(d.error||"Fail","error")}catch(e){toast("Error","error")}}
+async function addBookmark(){if(activeTabIdx<0)return;var path=openTabs[activeTabIdx].path;var line=cm?cm.getCursor().line+1:1;var label=prompt("Label:",path.split("/").pop());if(!label)return;try{await fetch("/api/bookmarks/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({path:path,line:line,label:label})});toast("Bookmarked")}catch(e){toast("Error","error")}}
+async function showBookmarks(){try{var r=await fetch("/api/bookmarks/"+encodeURIComponent(PROJECT));var d=await r.json();var html='<h3><i class="fa-regular fa-bookmark"></i> Bookmarks</h3>';if(!d.bookmarks||!d.bookmarks.length)html+='<div class="empty">No bookmarks</div>';else d.bookmarks.forEach(function(b){html+='<div class="file-item file"><div class="icon-wrap"><i class="fa-solid fa-bookmark"></i></div><span class="name" onclick="closeModal();openFile(\''+esc(b.path)+'\')">'+esc(b.label)+'<br><small style="color:#94a3b8">'+esc(b.path)+':'+b.line+'</small></span><button class="btn btn-danger" style="padding:4px 8px" onclick="delBookmark(\''+b.id+'\')"><i class="fa-solid fa-trash"></i></button></div>'});html+='<button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>';showModal(html)}catch(e){toast("Error","error")}}
+async function delBookmark(id){try{await fetch("/api/bookmarks/"+encodeURIComponent(PROJECT),{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:id})});showBookmarks()}catch(e){}}
 
-// ============ SYSTEM INFO ============
-async function loadSystemInfo(){
-  try{
-    var r=await fetch("/api/system-info");var d=await r.json();
-    var mem=d.MemTotal?(parseInt(d.MemTotal)/1024/1024).toFixed(1)+" GB":"?";
-    var avail=d.MemAvailable?(parseInt(d.MemAvailable)/1024/1024).toFixed(1)+" GB":"?";
-    var pct=d.MemTotal?Math.round((1-parseInt(d.MemAvailable)/parseInt(d.MemTotal))*100):0;
-    document.getElementById("sysInfo").innerHTML=
-      '<div class="stat-row"><span><i class="fa-solid fa-memory"></i> RAM</span><b>'+avail+' / '+mem+' ('+pct+'%)</b></div>'+
-      '<div class="stat-row"><span><i class="fa-solid fa-hdd"></i> Disk</span><b>'+(d.disk_free||"?")+' / '+(d.disk_total||"?")+'</b></div>'+
-      '<div class="stat-row"><span><i class="fa-solid fa-clock"></i> Uptime</span><b>'+(d.uptime||"?")+'</b></div>'+
-      '<div class="stat-row"><span><i class="fa-brands fa-python"></i> Python</span><b>'+(d.python||"?")+'</b></div>'+
-      '<div class="stat-row"><span><i class="fa-solid fa-microchip"></i> Arch</span><b>'+(d.machine||"?")+'</b></div>';
-  }catch(e){document.getElementById("sysInfo").innerText="Unavailable";}
-}
+// TERMINAL
+function clearTerminal(){document.getElementById("terminal-output").innerText="$ Terminal cleared\n"}
+function termKey(e){if(e.key==="Enter")runCmd();else if(e.key==="ArrowUp"){e.preventDefault();if(cmdHistory.length&&histIdx<cmdHistory.length-1){histIdx++;document.getElementById("cmd").value=cmdHistory[cmdHistory.length-1-histIdx]}}else if(e.key==="ArrowDown"){e.preventDefault();if(histIdx>0){histIdx--;document.getElementById("cmd").value=cmdHistory[cmdHistory.length-1-histIdx]}else{histIdx=-1;document.getElementById("cmd").value=""}}}
+async function runCmd(){var cmd=document.getElementById("cmd").value.trim();if(!cmd)return;cmdHistory.push(cmd);histIdx=-1;var out=document.getElementById("terminal-output");out.innerText+="\n$ "+cmd+"\n";document.getElementById("cmd").value="";out.scrollTop=out.scrollHeight;try{var r=await fetch("/api/run-command",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT,cmd:cmd})});var d=await r.json();if(d.stdout)out.innerText+=d.stdout;if(d.stderr)out.innerText+="\n[stderr]\n"+d.stderr;if(d.error)out.innerText+="\n[error] "+d.error;out.innerText+="\n[exit "+(d.returncode!=null?d.returncode:"?")+"]\n";out.scrollTop=out.scrollHeight}catch(e){out.innerText+="\n[error] "+e+"\n"}}
+async function loadPresets(){try{var r=await fetch("/api/preset-commands");var d=await r.json();PRESETS=d.commands||[];var box=document.getElementById("presetBox");box.innerHTML="";PRESETS.forEach(function(c){var b=document.createElement("button");b.innerHTML='<i class="fa-solid '+c.icon+'"></i><span>'+esc(c.name)+'</span>';b.onclick=function(){document.getElementById("cmd").value=c.cmd;runCmd()};box.appendChild(b)})}catch(e){}}
+async function showSavedCommands(){try{var r=await fetch("/api/saved-commands");var d=await r.json();var html='<h3><i class="fa-solid fa-star"></i> Saved Commands</h3>';if(!d.items||!d.items.length)html+='<div class="empty">No saved</div>';else d.items.forEach(function(c){html+='<div class="file-item file"><div class="icon-wrap"><i class="fa-solid fa-bolt"></i></div><span class="name" style="font-family:monospace">'+esc(c)+'</span><button class="btn btn-success" style="padding:5px 9px" onclick="closeModal();switchPanel(\'terminal\');document.getElementById(\'cmd\').value=\''+esc(c).replace(/'/g,"\\'")+'\';runCmd()"><i class="fa-solid fa-play"></i></button><button class="btn btn-danger" style="padding:5px 9px" onclick="delSavedCmd(\''+esc(c).replace(/'/g,"\\'")+'\')"><i class="fa-solid fa-trash"></i></button></div>'});html+='<button class="btn btn-success" style="width:100%;margin-top:8px;padding:11px" onclick="saveCurrentCmd()">+ Save Current</button><button class="btn" style="width:100%;margin-top:6px;padding:11px" onclick="closeModal()">Close</button>';showModal(html)}catch(e){toast("Error","error")}}
+async function saveCurrentCmd(){var cmd=prompt("Save:");if(!cmd)return;try{await fetch("/api/saved-commands",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({cmd:cmd})});toast("Saved")}catch(e){toast("Error","error")}}
+async function delSavedCmd(cmd){try{await fetch("/api/saved-commands",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({cmd:cmd})});showSavedCommands()}catch(e){}}
+async function showAliases(){try{var r=await fetch("/api/aliases");var d=await r.json();var html='<h3><i class="fa-solid fa-tag"></i> Aliases</h3>';Object.keys(d.aliases||{}).forEach(function(k){html+='<div class="file-item file"><div class="icon-wrap"><i class="fa-solid fa-tag"></i></div><span class="name"><b>'+esc(k)+'</b> → <code style="color:#4ade80">'+esc(d.aliases[k])+'</code></span><button class="btn btn-danger" style="padding:5px 9px" onclick="delAlias(\''+esc(k)+'\')"><i class="fa-solid fa-trash"></i></button></div>'});html+='<input id="aliasKey" placeholder="alias name"><input id="aliasCmd" placeholder="command"><button class="btn btn-success" style="width:100%;padding:11px" onclick="addAlias()">+ Add</button><button class="btn" style="width:100%;margin-top:6px;padding:11px" onclick="closeModal()">Close</button>';showModal(html)}catch(e){toast("Error","error")}}
+async function addAlias(){var k=document.getElementById("aliasKey").value.trim();var c=document.getElementById("aliasCmd").value.trim();if(!k||!c){toast("Fill both","error");return}try{var r=await fetch("/api/aliases",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({key:k,cmd:c})});var d=await r.json();if(r.ok){toast("Added");showAliases()}else toast(d.error||"Fail","error")}catch(e){toast("Error","error")}}
+async function delAlias(k){try{await fetch("/api/aliases",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({key:k})});showAliases()}catch(e){}}
 
-// ============ RUN CODE ============
-async function runCurrent(){
-  if(activeTabIdx<0){toast("Open a file first","error");return;}
-  if(cm)await saveFile(true);
-  document.querySelectorAll(".panel").forEach(function(p){p.classList.remove("active");});
-  document.getElementById("panel-output").classList.add("active");
-  var path=openTabs[activeTabIdx].path;
-  var outBox=document.getElementById("output-box");
-  outBox.innerText="Running "+path+"...\n\n";
-  try{
-    var r=await fetch("/api/run-code",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT,path:path})});
-    var d=await r.json();
-    document.getElementById("run-info").innerHTML='<i class="fa-solid fa-play"></i> <b>'+esc(path)+'</b> | '+esc(d.language||"?")+' | exit '+(d.returncode!=null?d.returncode:"?");
-    var text="";
-    if(d.command)text+="$ "+d.command+"\n\n";
-    if(d.stdout)text+=d.stdout;
-    if(d.stderr)text+="\n[stderr]\n"+d.stderr;
-    if(d.error)text+="\n[error] "+d.error;
-    outBox.innerText=text||"(no output)";
-  }catch(e){outBox.innerText="[error] "+e;}
-}
+// PTY
+async function startPTY(){if(ptySid){toast("PTY running");return}try{var r=await fetch("/api/pty/start",{method:"POST"});var d=await r.json();if(!r.ok){toast(d.error||"Fail","error");return}ptySid=d.session;ptyLastIdx=0;document.getElementById("ptyBox").style.display="block";document.getElementById("terminal-output").style.display="none";document.getElementById("cmd-input").style.display="none";if(ptyTimer)clearInterval(ptyTimer);ptyTimer=setInterval(ptyPoll,POLL_INTERVALS.pty);toast("PTY started")}catch(e){toast("Error","error")}}
+async function ptyPoll(){if(!ptySid)return;try{var r=await fetch("/api/pty/output/"+ptySid+"?since="+ptyLastIdx);var d=await r.json();if(d.output){var out=document.getElementById("ptyOutput");out.textContent+=d.output;out.scrollTop=out.scrollHeight;ptyLastIdx=d.total}}catch(e){}}
+async function ptySend(){if(!ptySid)return;var inp=document.getElementById("ptyInput");var text=inp.value+"\n";inp.value="";try{await fetch("/api/pty/input/"+ptySid,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:text})})}catch(e){}}
+function ptyKey(e){if(e.key==="Enter"){e.preventDefault();ptySend()}}
+async function stopPTY(){if(!ptySid)return;if(ptyTimer)clearInterval(ptyTimer);ptyTimer=null;try{await fetch("/api/pty/stop/"+ptySid,{method:"POST"})}catch(e){}ptySid=null;document.getElementById("ptyBox").style.display="none";document.getElementById("terminal-output").style.display="block";document.getElementById("cmd-input").style.display="flex";toast("PTY stopped")}
 
-// ============ PREVIEW ============
-function setDevice(d,el){
-  currentDevice=d;
-  document.querySelectorAll(".device-frames button").forEach(function(b){b.classList.remove("active");});
-  if(el)el.classList.add("active");
-  var f=document.getElementById("previewFrame");
-  f.className="preview-frame"+(d==="tablet"?" tablet":d==="desktop"?" desktop":"");
-}
-function togglePreviewMode(){
-  previewMode=previewMode==="android"?"html":"android";
-  document.getElementById("prevModeBtn").innerText=previewMode==="android"?"HTML":"Android";
-  refreshPreview();
-}
-async function refreshPreview(){
-  var box=document.getElementById("previewContent");
-  box.innerHTML='<p style="text-align:center;color:#64748b;padding:30px"><i class="fa-solid fa-spinner fa-spin"></i></p>';
-  try{
-    if(previewMode==="html"){
-      var candidates=["index.html","app/src/main/assets/index.html","public/index.html"];
-      for(var i=0;i<candidates.length;i++){
-        var r=await fetch("/api/file-content/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(candidates[i]));
-        if(r.ok){var d=await r.json();box.innerHTML='<iframe style="width:100%;height:440px;border:0;background:#fff;border-radius:8px" srcdoc="'+d.content.replace(/"/g,"&quot;")+'"></iframe>';return;}
-      }
-      box.innerHTML='<p style="text-align:center;color:#64748b;padding:40px">No index.html found</p>';
-      return;
-    }
-    var candidates=["app/src/main/res/layout/activity_main.xml","res/layout/activity_main.xml"];
-    var content=null;
-    for(var j=0;j<candidates.length;j++){
-      var r2=await fetch("/api/file-content/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(candidates[j]));
-      if(r2.ok){var d2=await r2.json();content=d2.content;break;}
-    }
-    if(!content&&activeTabIdx>=0&&openTabs[activeTabIdx].path.endsWith(".xml"))
-      content=cm?cm.getValue():openTabs[activeTabIdx].content;
-    if(!content){box.innerHTML='<p style="text-align:center;color:#64748b;padding:40px">No layout found</p>';return;}
-    box.innerHTML=renderAndroidXml(content);
-  }catch(e){box.innerHTML='<p style="color:#f87171">Error</p>';}
-}
-function renderAndroidXml(xmlStr){
-  try{
-    var parser=new DOMParser();
-    var doc=parser.parseFromString(xmlStr,"text/xml");
-    var root=doc.documentElement;
-    if(!root||root.tagName==="parsererror")return '<p style="color:#f87171">Invalid XML</p>';
-    return renderNode(root);
-  }catch(e){return '<p style="color:#f87171">Parse error</p>';}
-}
-function renderNode(node){
-  if(node.nodeType!==1)return "";
-  var tag=node.tagName.replace(/^.*:/,"");
-  var attrs={};
-  if(node.attributes){
-    for(var i=0;i<node.attributes.length;i++){
-      var a=node.attributes[i];
-      attrs[a.name.replace(/^android:/,"").replace(/^app:/,"")]=a.value;
-    }
-  }
-  var children="";
-  for(var j=0;j<node.childNodes.length;j++)children+=renderNode(node.childNodes[j]);
-  if(tag==="TextView")return '<div style="margin:6px 0;color:#fff">'+esc(attrs.text||attrs.hint||"Text")+'</div>';
-  if(tag==="Button")return '<button style="width:100%;padding:12px;margin:8px 0;border:0;border-radius:10px;background:#3b82f6;color:#fff">'+esc(attrs.text||"Button")+'</button>';
-  if(tag==="EditText")return '<input style="width:100%;padding:12px;margin:8px 0;border-radius:10px;border:1px solid #334155;background:#1e293b;color:#fff" placeholder="'+esc(attrs.hint||"")+'">';
-  if(tag==="ListView")return '<div style="background:#1e293b;border-radius:8px;padding:8px;color:#cbd5e1">List: item 1, item 2...</div>';
-  if(tag==="ImageView")return '<div style="background:#1e293b;padding:30px;text-align:center;border-radius:8px;color:#94a3b8">🖼 Image</div>';
-  return '<div>'+children+'</div>';
-}
-function toggleSplitPreview(){
-  var sp=document.getElementById("splitPane");
-  sp.classList.toggle("show");
-  if(sp.classList.contains("show"))updateSplitPreview();
-}
-async function updateSplitPreview(){
-  var sp=document.getElementById("splitPane");
-  if(!sp.classList.contains("show"))return;
-  if(!cm){sp.innerHTML="No editor";return;}
-  var val=cm.getValue();
-  if(val.trim().startsWith("<?xml")||val.trim().startsWith("<LinearLayout")){
-    sp.innerHTML='<div style="transform:scale(.55);transform-origin:top left;width:180%">'+renderAndroidXml(val)+'</div>';
-  }else if(val.trim().startsWith("<!DOCTYPE")||val.trim().toLowerCase().startsWith("<html")){
-    sp.innerHTML='<iframe style="width:100%;height:100%;border:0;background:#fff" srcdoc="'+val.replace(/"/g,"&quot;")+'"></iframe>';
-  }else{
-    sp.innerHTML='<pre style="color:#cbd5e1;font-size:11px;white-space:pre-wrap">'+esc(val.slice(0,3000))+'</pre>';
-  }
-}
+// SYSTEM
+async function loadSystemInfo(){try{var r=await fetch("/api/system-info");var d=await r.json();var mem=d.MemTotal?(parseInt(d.MemTotal)/1024/1024).toFixed(1)+" GB":"?";var avail=d.MemAvailable?(parseInt(d.MemAvailable)/1024/1024).toFixed(1)+" GB":"?";var pct=d.MemTotal?Math.round((1-parseInt(d.MemAvailable)/parseInt(d.MemTotal))*100):0;document.getElementById("sysInfo").innerHTML='<div class="stat-row"><span><i class="fa-solid fa-memory"></i> RAM</span><b>'+avail+' / '+mem+' ('+pct+'%)</b></div><div class="stat-row"><span><i class="fa-solid fa-hdd"></i> Disk</span><b>'+(d.disk_free||"?")+' / '+(d.disk_total||"?")+'</b></div><div class="stat-row"><span><i class="fa-solid fa-clock"></i> Uptime</span><b>'+(d.uptime||"?")+'</b></div><div class="stat-row"><span><i class="fa-brands fa-python"></i> Python</span><b>'+(d.python||"?")+'</b></div><div class="stat-row"><span><i class="fa-solid fa-microchip"></i> Arch</span><b>'+(d.machine||"?")+'</b></div>'}catch(e){document.getElementById("sysInfo").innerText="Unavailable"}}
 
-// ============ BUILD ============
-function formatTime(sec){sec=Math.floor(sec);if(sec<60)return sec+"s";return Math.floor(sec/60)+"m "+(sec%60)+"s";}
-function startElapsedTimer(){
-  if(elapsedTimer)clearInterval(elapsedTimer);
-  elapsedTimer=setInterval(function(){
-    var el=(Date.now()-buildStartTime)/1000;
-    var elEl=document.getElementById("statElapsed");
-    if(elEl)elEl.innerText=formatTime(el);
-  },500);
-}
-function processBuildLine(line){
+// RUN CODE
+async function runCurrent(){if(activeTabIdx<0){toast("Open file first","error");return}if(cm)await saveFile(true);document.querySelectorAll(".panel").forEach(function(p){p.classList.remove("active")});document.getElementById("panel-output").classList.add("active");var path=openTabs[activeTabIdx].path;var outBox=document.getElementById("output-box");outBox.innerText="Running "+path+"...\n\n";try{var r=await fetch("/api/run-code",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT,path:path})});var d=await r.json();document.getElementById("run-info").innerHTML='<i class="fa-solid fa-play"></i> <b>'+esc(path)+'</b> | '+esc(d.language||"?")+' | exit '+(d.returncode!=null?d.returncode:"?");var text="";if(d.command)text+="$ "+d.command+"\n\n";if(d.stdout)text+=d.stdout;if(d.stderr)text+="\n[stderr]\n"+d.stderr;if(d.error)text+="\n[error] "+d.error;outBox.innerText=text||"(no output)"}catch(e){outBox.innerText="[error] "+e}}
+
+// PREVIEW
+function setDevice(d,el){currentDevice=d;document.querySelectorAll(".device-frames button").forEach(function(b){b.classList.remove("active")});if(el)el.classList.add("active");var f=document.getElementById("previewFrame");f.className="preview-frame"+(d==="tablet"?" tablet":d==="desktop"?" desktop":"")}
+function togglePreviewMode(){previewMode=previewMode==="android"?"html":"android";document.getElementById("prevModeBtn").innerText=previewMode==="android"?"HTML":"Android";refreshPreview()}
+async function refreshPreview(){var box=document.getElementById("previewContent");box.innerHTML='<p style="text-align:center;color:#64748b;padding:30px"><i class="fa-solid fa-spinner fa-spin"></i></p>';try{if(previewMode==="html"){var candidates=["index.html","app/src/main/assets/index.html","public/index.html"];for(var i=0;i<candidates.length;i++){var r=await fetch("/api/file-content/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(candidates[i]));if(r.ok){var d=await r.json();box.innerHTML='<iframe style="width:100%;height:440px;border:0;background:#fff;border-radius:8px" src="/api/html-view/'+encodeURIComponent(PROJECT)+'?path='+encodeURIComponent(candidates[i])+'"></iframe>';return}}box.innerHTML='<p style="text-align:center;color:#64748b;padding:40px">No index.html</p>';return}var candidates=["app/src/main/res/layout/activity_main.xml","res/layout/activity_main.xml"];var content=null;for(var j=0;j<candidates.length;j++){var r2=await fetch("/api/file-content/"+encodeURIComponent(PROJECT)+"?path="+encodeURIComponent(candidates[j]));if(r2.ok){var d2=await r2.json();content=d2.content;break}}if(!content&&activeTabIdx>=0&&openTabs[activeTabIdx].path.endsWith(".xml"))content=cm?cm.getValue():openTabs[activeTabIdx].content;if(!content){box.innerHTML='<p style="text-align:center;color:#64748b;padding:40px">No layout</p>';return}box.innerHTML=renderAndroidXml(content)}catch(e){box.innerHTML='<p style="color:#f87171">Error</p>'}}
+function renderAndroidXml(xmlStr){try{var parser=new DOMParser();var doc=parser.parseFromString(xmlStr,"text/xml");var root=doc.documentElement;if(!root||root.tagName==="parsererror")return '<p style="color:#f87171">Invalid XML</p>';return renderNode(root)}catch(e){return '<p style="color:#f87171">Error</p>'}}
+function renderNode(node){if(node.nodeType!==1)return "";var tag=node.tagName.replace(/^.*:/,"");var attrs={};if(node.attributes){for(var i=0;i<node.attributes.length;i++){var a=node.attributes[i];attrs[a.name.replace(/^android:/,"").replace(/^app:/,"")]=a.value}}var children="";for(var j=0;j<node.childNodes.length;j++)children+=renderNode(node.childNodes[j]);if(tag==="TextView")return '<div style="margin:6px 0;color:#fff">'+esc(attrs.text||attrs.hint||"Text")+'</div>';if(tag==="Button")return '<button style="width:100%;padding:12px;margin:8px 0;border:0;border-radius:10px;background:#3b82f6;color:#fff">'+esc(attrs.text||"Button")+'</button>';if(tag==="EditText")return '<input style="width:100%;padding:12px;margin:8px 0;border-radius:10px;border:1px solid #334155;background:#1e293b;color:#fff" placeholder="'+esc(attrs.hint||"")+'">';if(tag==="ListView")return '<div style="background:#1e293b;border-radius:8px;padding:8px;color:#cbd5e1">List</div>';if(tag==="ImageView")return '<div style="background:#1e293b;padding:30px;text-align:center;border-radius:8px;color:#94a3b8">🖼</div>';return '<div>'+children+'</div>'}
+function toggleSplitPreview(){var sp=document.getElementById("splitPane");sp.classList.toggle("show");if(sp.classList.contains("show"))updateSplitPreview()}
+async function updateSplitPreview(){var sp=document.getElementById("splitPane");if(!sp.classList.contains("show"))return;if(!cm){sp.innerHTML="No editor";return}var val=cm.getValue();if(val.trim().startsWith("<?xml")||val.trim().startsWith("<LinearLayout")){sp.innerHTML='<div style="transform:scale(.55);transform-origin:top left;width:180%">'+renderAndroidXml(val)+'</div>'}else if(val.trim().startsWith("<!DOCTYPE")||val.trim().toLowerCase().startsWith("<html")){sp.innerHTML='<iframe style="width:100%;height:100%;border:0;background:#fff" srcdoc="'+val.replace(/"/g,"&quot;")+'"></iframe>'}else{sp.innerHTML='<pre style="color:#cbd5e1;font-size:11px;white-space:pre-wrap">'+esc(val.slice(0,3000))+'</pre>'}}
+
+// BUILD
+function startElapsedTimer(){if(elapsedTimer)clearInterval(elapsedTimer);elapsedTimer=setInterval(function(){var el=(Date.now()-buildStartTime)/1000;var elEl=document.getElementById("statElapsed");if(elEl)elEl.innerText=formatTime(el)},500)}
+function appendLogLine(line){
+  var logBox=document.getElementById("buildLog");
   var cls="";
   if(line.indexOf("BUILD SUCCESSFUL")>=0)cls="color:#4ade80";
   else if(line.indexOf("BUILD FAILED")>=0||line.indexOf("error:")>=0)cls="color:#f87171";
   else if(line.indexOf("> Task")>=0)cls="color:#fbbf24";
   else if(line.indexOf("💡 Hint:")>=0)cls="color:#fbbf24;font-weight:600";
-  
-  var htmlStr = "<div style='"+cls+"'>"+esc(line)+"</div>";
-
+  var div=document.createElement("div");
+  div.style.cssText=cls;
+  div.textContent=line;
+  logBox.appendChild(div);
+  // Limit DOM size to prevent UI hang
+  while(logBox.childElementCount>500){logBox.removeChild(logBox.firstChild)}
+  logBox.scrollTop=logBox.scrollHeight;
   var m=line.match(/^>\s+Task\s+(:[\w:]+)/);
-  if(m){
-    tasksSeen++;
-    document.getElementById("currentTask").innerText="▶ "+m[1];
-    var pct=Math.min(95,Math.round(tasksSeen/EST_TOTAL*100));
-    document.getElementById("buildProgressBar").style.width=pct+"%";
-    document.getElementById("buildProgressText").innerText=pct+"%";
-  }
-  if(line.indexOf("BUILD SUCCESSFUL")>=0){
-    document.getElementById("buildProgressBar").style.width="100%";
-    document.getElementById("buildProgressText").innerText="100%";
-    document.getElementById("currentTask").innerHTML='<i class="fa-solid fa-circle-check" style="color:#4ade80"></i> Build complete';
-  }
-  if(line.indexOf("BUILD FAILED")>=0)
-    document.getElementById("currentTask").innerHTML='<i class="fa-solid fa-circle-xmark" style="color:#f87171"></i> Build failed';
-
-  return htmlStr;
+  if(m){tasksSeen++;document.getElementById("currentTask").innerText="▶ "+m[1];var pct=Math.min(95,Math.round(tasksSeen/EST_TOTAL*100));document.getElementById("buildProgressBar").style.width=pct+"%";document.getElementById("buildProgressText").innerText=pct+"%"}
+  if(line.indexOf("BUILD SUCCESSFUL")>=0){document.getElementById("buildProgressBar").style.width="100%";document.getElementById("buildProgressText").innerText="100%";document.getElementById("currentTask").innerHTML='<i class="fa-solid fa-circle-check" style="color:#4ade80"></i> Build complete'}
+  if(line.indexOf("BUILD FAILED")>=0)document.getElementById("currentTask").innerHTML='<i class="fa-solid fa-circle-xmark" style="color:#f87171"></i> Build failed'
 }
 async function pollBuild(){
   if(!buildId)return;
   try{
     var r=await fetch("/api/build-poll/"+buildId+"?since="+lastLineIdx);
     var d=await r.json();
-    
     if(d.lines&&d.lines.length){
-      var logBox=document.getElementById("buildLog");
-      var combinedHtml = "";
-      
-      d.lines.forEach(function(line){
-         combinedHtml += processBuildLine(line);
-      });
-      
-      logBox.insertAdjacentHTML("beforeend", combinedHtml);
-      logBox.scrollTop=logBox.scrollHeight;
-      
-      if (logBox.childElementCount > 500) {
-          while (logBox.childElementCount > 300) {
-              logBox.removeChild(logBox.firstChild);
-          }
-      }
-      
+      d.lines.forEach(function(line){appendLogLine(line)});
       lastLineIdx=d.total;
     }
-    
     if(d.status==="done"){
       clearInterval(buildPollTimer);buildPollTimer=null;
-      if(elapsedTimer){clearInterval(elapsedTimer);elapsedTimer=null;}
+      if(elapsedTimer){clearInterval(elapsedTimer);elapsedTimer=null}
       if(d.success&&d.apk_path){
         document.getElementById("buildProgressBar").style.width="100%";
         document.getElementById("buildProgressText").innerText="100%";
         document.getElementById("currentTask").innerHTML='<i class="fa-solid fa-circle-check" style="color:#4ade80"></i> Build successful';
-        document.getElementById("buildStatusMsg").innerHTML='✓ APK ready!';
+        document.getElementById("buildStatusMsg").innerHTML="✓ APK ready!";
         document.getElementById("buildStatusMsg").style.color="#4ade80";
         document.getElementById("apk-box").style.display="block";
-        document.getElementById("apkDownloadBtn").onclick=function(){location.href="/api/download-apk/"+encodeURIComponent(PROJECT);};
+        document.getElementById("apkInstallBtn").onclick=function(){location.href="/api/apk-install/"+encodeURIComponent(PROJECT)};
+        document.getElementById("apkDownloadBtn").onclick=function(){location.href="/api/download-apk/"+encodeURIComponent(PROJECT)};
         toast("APK Ready!");
-        try{if(Notification.permission==="granted")new Notification("Zihad IDE","✅ Build successful!");}catch(e){}
+        try{if(Notification.permission==="granted")new Notification("Zihad IDE","✅ Build successful!")}catch(e){}
       }else{
         document.getElementById("currentTask").innerHTML='<i class="fa-solid fa-circle-xmark" style="color:#f87171"></i> Build failed';
         document.getElementById("buildStatusMsg").innerText="✗ Failed";
@@ -4082,182 +4389,62 @@ async function buildApk(){
   document.getElementById("apk-box").style.display="none";
   tasksSeen=0;lastLineIdx=0;EST_TOTAL=32;
   try{
-    try{if(Notification.permission==="default")await Notification.requestPermission();}catch(e){}
+    try{if(Notification.permission==="default")await Notification.requestPermission()}catch(e){}
     var r=await fetch("/api/build-start",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT})});
     var d=await r.json();
-    if(!r.ok){toast(d.error||"Error","error");return;}
+    if(!r.ok){toast(d.error||"Error","error");return}
     buildId=d.build_id;buildStartTime=Date.now();
     startElapsedTimer();
     if(buildPollTimer)clearInterval(buildPollTimer);
-    buildPollTimer=setInterval(pollBuild,700);
+    buildPollTimer=setInterval(pollBuild,POLL_INTERVALS.poll);
     pollBuild();
-  }catch(e){toast("Error: "+e,"error");}
+  }catch(e){toast("Error: "+e,"error")}
 }
-async function toggleAutoBuild(on){
-  try{
-    await fetch("/api/settings/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({autoBuild:on})});
-    toast(on?"Auto-build ON":"Auto-build OFF");
-  }catch(e){}
-}
-async function adbInstall(){
-  toast("Trying ADB install...");
-  try{
-    var r=await fetch("/api/adb-install",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT})});
-    var d=await r.json();
-    if(r.ok&&d.success)toast("Installed via ADB!");
-    else toast(d.error||"ADB failed","error");
-  }catch(e){toast("ADB error","error");}
-}
-async function cleanBuild(deep){
-  if(!confirm(deep?"Deep clean (also ~/.gradle)?" : "Clean build dirs?"))return;
-  try{
-    var r=await fetch("/api/cache-clean",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT,deep:deep})});
-    var d=await r.json();
-    if(r.ok)toast("Cleaned: "+((d.cleared||[]).join(", ")||"nothing"));
-    else toast(d.error||"Fail","error");
-  }catch(e){toast("Error","error");}
-}
-async function exportZip(){toast("Creating ZIP...");location.href="/api/export-zip/"+encodeURIComponent(PROJECT);}
+async function toggleAutoBuild(on){try{await fetch("/api/settings/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({autoBuild:on})});toast(on?"Auto-build ON":"Auto-build OFF")}catch(e){}}
+async function adbInstall(){toast("ADB install...");try{var r=await fetch("/api/adb-install",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT})});var d=await r.json();if(r.ok&&d.success)toast("Installed!");else toast(d.error||"Failed","error")}catch(e){toast("Error","error")}}
+async function cleanBuild(deep){if(!confirm(deep?"Deep clean?":"Clean?"))return;try{var r=await fetch("/api/cache-clean",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT,deep:deep})});var d=await r.json();if(r.ok)toast("Cleaned: "+((d.cleared||[]).join(", ")||"none"));else toast(d.error||"Fail","error")}catch(e){toast("Error","error")}}
+async function exportZip(){toast("Creating ZIP...");location.href="/api/export-zip/"+encodeURIComponent(PROJECT)}
 
-// ============ GIT ============
-function gitLog(text,cls){
-  var box=document.getElementById("gitOutput");
-  box.innerHTML="<span style='color:"+(cls||"#cbd5e1")+"'>"+esc(text).replace(/\n/g,"<br>")+"</span>";
-}
-async function gitAction(a){
+// BUILD LOG CACHE
+async function showCachedLog(){
+  showModal('<h3><i class="fa-solid fa-history"></i> Cached Build Log</h3><div id="cacheLogMeta" style="font-size:11px;color:#94a3b8;margin-bottom:8px"></div><div id="cacheLogBox" style="background:#000;color:#4ade80;padding:10px;border-radius:10px;font-family:monospace;font-size:10px;max-height:400px;overflow-y:auto;white-space:pre-wrap">Loading...</div><button class="btn btn-danger" style="width:100%;margin-top:10px;padding:11px" onclick="clearCachedLog()">🗑 Clear Cache</button><button class="btn" style="width:100%;margin-top:6px;padding:11px" onclick="closeModal()">Close</button>');
   try{
-    if(a==="init"){
-      gitLog("Initializing...");
-      var r=await fetch("/api/git/init/"+encodeURIComponent(PROJECT),{method:"POST"});
-      var d=await r.json();
-      gitLog(d.out||d.err||"Init done",d.success?"#4ade80":"#f87171");
-      if(!d.success)toast("Init failed","error");else toast("Git initialized");
-      return;
-    }
-    if(a==="status"){
-      var r=await fetch("/api/git/status/"+encodeURIComponent(PROJECT));
-      var d=await r.json();
-      document.getElementById("gitInfo").innerHTML='<i class="fa-brands fa-git-alt"></i> Branch: '+(d.branch||"?")+' | '+(d.init?"initialized":"not initialized");
-      if(!d.init){gitLog("Repository not initialized. Tap Init.");return;}
-      if(!d.files||!d.files.length){gitLog("✓ Working tree clean","#4ade80");return;}
-      gitLog("Modified:\n"+d.files.join("\n"));
-      return;
-    }
-    if(a==="add"){
-      var r=await fetch("/api/git/add/"+encodeURIComponent(PROJECT),{method:"POST"});
-      var d=await r.json();
-      gitLog(d.err||"Added","#4ade80");toast("Added");
-      return;
-    }
-    if(a==="log"){
-      var r=await fetch("/api/git/log/"+encodeURIComponent(PROJECT));
-      var d=await r.json();
-      gitLog(d.log.length?d.log.join("\n"):"No commits");
-      return;
-    }
-    if(a==="diff"){
-      var r=await fetch("/api/git/diff/"+encodeURIComponent(PROJECT));
-      var d=await r.json();
-      gitLog(d.diff||"No changes");
-      return;
-    }
-    if(a==="branches"){
-      var r=await fetch("/api/git/branch/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"list"})});
-      var d=await r.json();
-      gitLog("Branches:\n"+(d.branches||[]).join("\n"));
-      return;
-    }
-  }catch(e){gitLog("Error: "+e,"#f87171");}
-}
-async function gitCommitPrompt(){
-  var msg=prompt("Commit message:","Update");
-  if(!msg)return;
-  try{
-    var r=await fetch("/api/git/commit/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({message:msg})});
+    var r=await fetch("/api/build-log-cache/"+encodeURIComponent(PROJECT));
     var d=await r.json();
-    gitLog(d.out||d.err,d.success?"#4ade80":"#f87171");
-    if(d.success)toast("Committed");
-  }catch(e){toast("Error","error");}
+    var meta=document.getElementById("cacheLogMeta");
+    var box=document.getElementById("cacheLogBox");
+    if(!d.lines||!d.lines.length){box.innerHTML='<div class="empty">No cached log</div>';return}
+    if(d.meta){meta.innerHTML='<i class="fa-solid fa-clock"></i> Saved: '+new Date(d.meta.saved_at*1000).toLocaleString()+' • Lines: '+d.meta.total_lines+(d.meta.truncated?' (truncated)':'')}
+    box.innerHTML="";
+    d.lines.forEach(function(line){
+      var div=document.createElement("div");
+      if(line.indexOf("error:")>=0||line.indexOf("FAILED")>=0)div.style.color="#f87171";
+      else if(line.indexOf("BUILD SUCCESSFUL")>=0)div.style.color="#4ade80";
+      else if(line.indexOf("> Task")>=0)div.style.color="#fbbf24";
+      else if(line.indexOf("💡 Hint:")>=0)div.style.color="#fbbf24";
+      div.textContent=line;
+      box.appendChild(div);
+    });
+  }catch(e){document.getElementById("cacheLogBox").innerText="Error: "+e}
 }
-async function gitRemote(action){
-  try{
-    var r=await fetch("/api/git/remote/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:action})});
-    var d=await r.json();
-    gitLog((d.out||"")+"\n"+(d.err||""),d.success?"#4ade80":"#f87171");
-  }catch(e){gitLog("Error: "+e,"#f87171");}
-}
-async function gitSetRemote(){
-  var url=prompt("Remote URL (origin):","https://github.com/user/repo.git");
-  if(!url)return;
-  try{
-    var r=await fetch("/api/git/remote/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"set",url:url})});
-    var d=await r.json();
-    if(d.success)toast("Remote set");else toast(d.err||"Fail","error");
-  }catch(e){toast("Error","error");}
-}
+async function clearCachedLog(){if(!confirm("Clear cached log?"))return;try{var r=await fetch("/api/build-log-cache/"+encodeURIComponent(PROJECT),{method:"DELETE"});if(r.ok){toast("Cleared");closeModal()}}catch(e){toast("Error","error")}}
 
-// ============ LOGCAT ============
-async function logcatStart(){
-  try{
-    var r=await fetch("/api/logcat/start",{method:"POST"});
-    var d=await r.json();
-    if(!r.ok){toast(d.error||"Fail","error");return;}
-    logcatSid=d.session;logcatLines=[];logcatLastIdx=0;
-    if(logcatTimer)clearInterval(logcatTimer);
-    logcatTimer=setInterval(logcatPoll,700);
-    toast("Logcat started");
-  }catch(e){toast("Error","error");}
-}
-async function logcatPoll(){
-  if(!logcatSid)return;
-  try{
-    var r=await fetch("/api/logcat/poll/"+logcatSid+"?since="+logcatLastIdx);
-    var d=await r.json();
-    if(d.lines&&d.lines.length){logcatLines=logcatLines.concat(d.lines);logcatLastIdx=d.total;renderLogcat();}
-  }catch(e){}
-}
-function renderLogcat(){
-  var box=document.getElementById("logcatBox");
-  var filter=(document.getElementById("lcFilter").value)||"all";
-  var filtered=logcatLines;
-  if(filter==="error")filtered=logcatLines.filter(function(l){return l.indexOf(" E ")>=0||l.toLowerCase().indexOf("error")>=0;});
-  else if(filter==="warn")filtered=logcatLines.filter(function(l){return l.indexOf(" E ")>=0||l.indexOf(" W ")>=0||l.toLowerCase().indexOf("error")>=0;});
-  else if(filter==="info")filtered=logcatLines.filter(function(l){return l.indexOf(" I ")>=0||l.indexOf(" E ")>=0||l.indexOf(" W ")>=0;});
-  box.innerHTML=filtered.slice(-500).map(function(l){
-    var cls="";
-    if(l.indexOf(" E ")>=0||l.toLowerCase().indexOf("error")>=0)cls="err";
-    else if(l.indexOf(" W ")>=0)cls="warn";
-    else if(l.indexOf(" I ")>=0)cls="info";
-    return '<div class="logcat-line '+cls+'">'+esc(l)+'</div>';
-  }).join("");
-  box.scrollTop=box.scrollHeight;
-}
-async function logcatStop(){
-  if(!logcatSid)return;
-  if(logcatTimer)clearInterval(logcatTimer);logcatTimer=null;
-  try{await fetch("/api/logcat/stop/"+logcatSid,{method:"POST"});}catch(e){}
-  logcatSid=null;toast("Logcat stopped");
-}
-function logcatClear(){logcatLines=[];logcatLastIdx=0;renderLogcat();}
+// GIT
+function gitLog(text,cls){var box=document.getElementById("gitOutput");box.innerHTML="<span style='color:"+(cls||"#cbd5e1")+"'>"+esc(text).replace(/\n/g,"<br>")+"</span>"}
+async function gitAction(a){try{if(a==="init"){gitLog("Initializing...");var r=await fetch("/api/git/init/"+encodeURIComponent(PROJECT),{method:"POST"});var d=await r.json();gitLog(d.out||d.err||"Done",d.success?"#4ade80":"#f87171");if(!d.success)toast("Init failed","error");else toast("Git initialized");return}if(a==="status"){var r=await fetch("/api/git/status/"+encodeURIComponent(PROJECT));var d=await r.json();document.getElementById("gitInfo").innerHTML='<i class="fa-brands fa-git-alt"></i> Branch: '+(d.branch||"?")+' | '+(d.init?"initialized":"not initialized");if(!d.init){gitLog("Not initialized.");return}if(!d.files||!d.files.length){gitLog("✓ Clean","#4ade80");return}gitLog("Modified:\n"+d.files.join("\n"));return}if(a==="add"){var r=await fetch("/api/git/add/"+encodeURIComponent(PROJECT),{method:"POST"});var d=await r.json();gitLog(d.err||"Added","#4ade80");toast("Added");return}if(a==="log"){var r=await fetch("/api/git/log/"+encodeURIComponent(PROJECT));var d=await r.json();gitLog(d.log.length?d.log.join("\n"):"No commits");return}if(a==="diff"){var r=await fetch("/api/git/diff/"+encodeURIComponent(PROJECT));var d=await r.json();gitLog(d.diff||"No changes");return}if(a==="branches"){var r=await fetch("/api/git/branch/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"list"})});var d=await r.json();gitLog("Branches:\n"+(d.branches||[]).join("\n"));return}}catch(e){gitLog("Error: "+e,"#f87171")}}
+async function gitCommitPrompt(){var msg=prompt("Commit message:","Update");if(!msg)return;try{var r=await fetch("/api/git/commit/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({message:msg})});var d=await r.json();gitLog(d.out||d.err,d.success?"#4ade80":"#f87171");if(d.success)toast("Committed")}catch(e){toast("Error","error")}}
+async function gitRemote(action){try{var r=await fetch("/api/git/remote/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:action})});var d=await r.json();gitLog((d.out||"")+"\n"+(d.err||""),d.success?"#4ade80":"#f87171")}catch(e){gitLog("Error: "+e,"#f87171")}}
+async function gitSetRemote(){var url=prompt("Remote URL:","https://github.com/user/repo.git");if(!url)return;try{var r=await fetch("/api/git/remote/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({action:"set",url:url})});var d=await r.json();if(d.success)toast("Remote set");else toast(d.err||"Fail","error")}catch(e){toast("Error","error")}}
 
-// ============ NOTIFICATIONS ============
-async function pollNotifications(){
-  try{
-    var r=await fetch("/api/notifications?since="+notifLastSeen);
-    var d=await r.json();
-    if(d.new&&d.new.length){
-      d.new.forEach(function(n){
-        if(n.ts>notifLastSeen){
-          notifLastSeen=n.ts;
-          if(n.kind==="error")toast(n.title+" — "+n.body,"error");
-          else if(n.kind==="success")toast(n.title+" — "+n.body,"success");
-        }
-      });
-    }
-    var btn=document.getElementById("notifBtn");
-    btn.dataset.count=d.unread||0;
-  }catch(e){}
-}
+// LOGCAT
+async function logcatStart(){try{var r=await fetch("/api/logcat/start",{method:"POST"});var d=await r.json();if(!r.ok){toast(d.error||"Fail","error");return}logcatSid=d.session;logcatLines=[];logcatLastIdx=0;if(logcatTimer)clearInterval(logcatTimer);logcatTimer=setInterval(logcatPoll,POLL_INTERVALS.logcat);toast("Logcat started")}catch(e){toast("Error","error")}}
+async function logcatPoll(){if(!logcatSid)return;try{var r=await fetch("/api/logcat/poll/"+logcatSid+"?since="+logcatLastIdx);var d=await r.json();if(d.lines&&d.lines.length){logcatLines=logcatLines.concat(d.lines);logcatLastIdx=d.total;renderLogcat()}}catch(e){}}
+function renderLogcat(){var box=document.getElementById("logcatBox");var filter=(document.getElementById("lcFilter").value)||"all";var filtered=logcatLines;if(filter==="error")filtered=logcatLines.filter(function(l){return l.indexOf(" E ")>=0||l.toLowerCase().indexOf("error")>=0});else if(filter==="warn")filtered=logcatLines.filter(function(l){return l.indexOf(" E ")>=0||l.indexOf(" W ")>=0});else if(filter==="info")filtered=logcatLines.filter(function(l){return l.indexOf(" I ")>=0||l.indexOf(" E ")>=0||l.indexOf(" W ")>=0});box.innerHTML=filtered.slice(-500).map(function(l){var cls="";if(l.indexOf(" E ")>=0||l.toLowerCase().indexOf("error")>=0)cls="err";else if(l.indexOf(" W ")>=0)cls="warn";else if(l.indexOf(" I ")>=0)cls="info";return '<div class="logcat-line '+cls+'">'+esc(l)+'</div>'}).join("");box.scrollTop=box.scrollHeight}
+async function logcatStop(){if(!logcatSid)return;if(logcatTimer)clearInterval(logcatTimer);logcatTimer=null;try{await fetch("/api/logcat/stop/"+logcatSid,{method:"POST"})}catch(e){}logcatSid=null;toast("Logcat stopped")}
+function logcatClear(){logcatLines=[];logcatLastIdx=0;renderLogcat()}
+
+// NOTIFICATIONS
+async function pollNotifications(){try{var r=await fetch("/api/notifications?since="+notifLastSeen);var d=await r.json();if(d.new&&d.new.length){d.new.forEach(function(n){if(n.ts>notifLastSeen){notifLastSeen=n.ts;if(n.kind==="error")toast(n.title+" — "+n.body,"error");else if(n.kind==="success")toast(n.title+" — "+n.body,"success")}})}var btn=document.getElementById("notifBtn");btn.dataset.count=d.unread||0}catch(e){}}
 async function showNotifications(){
   try{
     var r=await fetch("/api/notifications");var d=await r.json();
@@ -4267,634 +4454,319 @@ async function showNotifications(){
       html+='<div style="max-height:400px;overflow-y:auto">';
       d.items.forEach(function(n){
         var when=new Date(n.ts*1000).toLocaleString();
-        html+='<div class="notif-item '+(n.kind||"info")+'"><div class="ttl">'+esc(n.title)+'</div><div class="bdy">'+esc(n.body)+'</div><div class="time">'+when+'</div></div>';
+        var clickAttr = n.kind==="error" ? 'onclick="showNotifDetails(\''+esc(n.project||PROJECT)+'\')"' : n.kind==="success" ? 'onclick="installFromNotif(\''+esc(n.project||PROJECT)+'\')"' : '';
+        html+='<div class="notif-item '+(n.kind||"info")+'" '+clickAttr+'><div class="ttl">'+esc(n.title)+'</div><div class="bdy">'+esc(n.body)+'</div><div class="time">'+when+' '+(n.kind==="error"?'<span style="color:#60a5fa">• Tap for details</span>':n.kind==="success"?'<span style="color:#22c55e">• Tap to install</span>':'')+'</div></div>';
       });
       html+='</div>';
     }
     html+='<div style="display:flex;gap:6px;margin-top:8px"><button class="btn btn-primary" style="flex:1;padding:11px" onclick="markNotifsRead()">Mark Read</button><button class="btn btn-danger" style="flex:1;padding:11px" onclick="clearNotifs()">Clear</button><button class="btn" style="padding:11px" onclick="closeModal()">Close</button></div>';
     showModal(html);
-    fetch("/api/notifications/read",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})}).then(function(){pollNotifications();});
-  }catch(e){toast("Error","error");}
+    fetch("/api/notifications/read",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})}).then(function(){pollNotifications()});
+  }catch(e){toast("Error","error")}
 }
-async function markNotifsRead(){try{await fetch("/api/notifications/read",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})});closeModal();pollNotifications();}catch(e){}}
-async function clearNotifs(){try{await fetch("/api/notifications/clear",{method:"POST"});closeModal();pollNotifications();}catch(e){}}
-
-// ============ KANBAN ============
-async function loadKanban(){
+async function showNotifDetails(proj){
   try{
-    var r=await fetch("/api/kanban/"+encodeURIComponent(PROJECT));
+    var r=await fetch("/api/notifications/details?project="+encodeURIComponent(proj));
     var d=await r.json();
-    var board=document.getElementById("kanbanBoard");
-    var cols=[{id:"todo",name:"📋 Todo"},{id:"doing",name:"⚙️ Doing"},{id:"done",name:"✅ Done"}];
-    board.innerHTML="";
-    cols.forEach(function(col){
-      var cards=d.columns&&d.columns[col.id]?d.columns[col.id]:[];
-      var html='<div class="kanban-col"><h4>'+col.name+' <span class="badge info">'+cards.length+'</span></h4>';
-      cards.forEach(function(c){
-        var priClass=c.priority==="high"?"p-high":c.priority==="low"?"p-low":"";
-        var nextCol=col.id==="todo"?"doing":col.id==="doing"?"done":"todo";
-        html+='<div class="kanban-card '+priClass+'">'+esc(c.text)+
-          '<span class="del" onclick="kanbanDel(\''+col.id+'\',\''+c.id+'\')"><i class="fa-solid fa-xmark"></i></span>'+
-          '<div style="margin-top:5px;font-size:10px"><a onclick="kanbanMove(\''+col.id+'\',\''+nextCol+'\',\''+c.id+'\')" style="color:#60a5fa;cursor:pointer"><i class="fa-solid fa-arrow-right"></i> '+nextCol+'</a></div>'+
-          '</div>';
+    var html='<h3><i class="fa-solid fa-triangle-exclamation"></i> Build Errors</h3>';
+    html+='<div class="info-bar"><b>'+proj+'</b> — '+d.total_errors+' total errors</div>';
+    if(d.grouped&&d.grouped.length){
+      html+='<div style="max-height:400px;overflow-y:auto">';
+      d.grouped.forEach(function(e){
+        html+='<div style="background:#1a0505;border-left:3px solid #ef4444;padding:8px;margin:5px 0;border-radius:8px;font-family:monospace;font-size:11px;color:#fca5a5;word-break:break-word"><div style="float:right;background:#ef4444;color:#fff;padding:1px 6px;border-radius:8px;font-size:9px">×'+e.count+'</div>'+esc(e.text)+'</div>';
       });
       html+='</div>';
-      board.insertAdjacentHTML("beforeend",html);
-    });
-  }catch(e){document.getElementById("kanbanBoard").innerText="Error";}
+    }else{
+      html+='<div class="empty">No errors found</div>';
+    }
+    html+='<button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>';
+    showModal(html);
+  }catch(e){toast("Error","error")}
 }
-async function kanbanAdd(){
-  var text=document.getElementById("kanbanInput").value.trim();
-  var priority=document.getElementById("kanbanPriority").value;
-  if(!text)return;
-  try{
-    var r=await fetch("/api/kanban/"+encodeURIComponent(PROJECT)+"/add",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:text,column:"todo",priority:priority})});
-    document.getElementById("kanbanInput").value="";
-    loadKanban();
-  }catch(e){}
+function installFromNotif(proj){
+  if(confirm("Install this APK?")){location.href="/api/apk-install/"+encodeURIComponent(proj)}
 }
-async function kanbanMove(from,to,id){
-  try{
-    var r=await fetch("/api/kanban/"+encodeURIComponent(PROJECT)+"/move",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({from:from,to:to,id:id})});
-    loadKanban();
-  }catch(e){}
-}
-async function kanbanDel(col,id){
-  if(!confirm("Delete?"))return;
-  try{
-    var r=await fetch("/api/kanban/"+encodeURIComponent(PROJECT)+"/del",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({column:col,id:id})});
-    loadKanban();
-  }catch(e){}
-}
+async function markNotifsRead(){try{await fetch("/api/notifications/read",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({})});closeModal();pollNotifications()}catch(e){}}
+async function clearNotifs(){try{await fetch("/api/notifications/clear",{method:"POST"});closeModal();pollNotifications()}catch(e){}}
 
-// ============ NOTES ============
-async function loadNotes(){
-  try{
-    var r=await fetch("/api/notes/"+encodeURIComponent(PROJECT));
-    var d=await r.json();
-    document.getElementById("notesArea").value=d.content||"";
-  }catch(e){}
-}
-async function saveNotes(){
-  var content=document.getElementById("notesArea").value;
-  try{
-    await fetch("/api/notes/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({content:content})});
-    toast("Notes saved");
-  }catch(e){toast("Error","error");}
-}
+// KANBAN
+async function loadKanban(){try{var r=await fetch("/api/kanban/"+encodeURIComponent(PROJECT));var d=await r.json();var board=document.getElementById("kanbanBoard");var cols=[{id:"todo",name:"📋 Todo"},{id:"doing",name:"⚙️ Doing"},{id:"done",name:"✅ Done"}];board.innerHTML="";cols.forEach(function(col){var cards=d.columns&&d.columns[col.id]?d.columns[col.id]:[];var html='<div class="kanban-col"><h4>'+col.name+' <span class="badge info">'+cards.length+'</span></h4>';cards.forEach(function(c){var priClass=c.priority==="high"?"p-high":c.priority==="low"?"p-low":"";var nextCol=col.id==="todo"?"doing":col.id==="doing"?"done":"todo";html+='<div class="kanban-card '+priClass+'">'+esc(c.text)+'<span class="del" onclick="kanbanDel(\''+col.id+'\',\''+c.id+'\')"><i class="fa-solid fa-xmark"></i></span><div style="margin-top:5px;font-size:10px"><a onclick="kanbanMove(\''+col.id+'\',\''+nextCol+'\',\''+c.id+'\')" style="color:#60a5fa;cursor:pointer"><i class="fa-solid fa-arrow-right"></i> '+nextCol+'</a></div></div>'});html+='</div>';board.insertAdjacentHTML("beforeend",html)})}catch(e){document.getElementById("kanbanBoard").innerText="Error"}}
+async function kanbanAdd(){var text=document.getElementById("kanbanInput").value.trim();var priority=document.getElementById("kanbanPriority").value;if(!text)return;try{await fetch("/api/kanban/"+encodeURIComponent(PROJECT)+"/add",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:text,column:"todo",priority:priority})});document.getElementById("kanbanInput").value="";loadKanban()}catch(e){}}
+async function kanbanMove(from,to,id){try{await fetch("/api/kanban/"+encodeURIComponent(PROJECT)+"/move",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({from:from,to:to,id:id})});loadKanban()}catch(e){}}
+async function kanbanDel(col,id){if(!confirm("Delete?"))return;try{await fetch("/api/kanban/"+encodeURIComponent(PROJECT)+"/del",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({column:col,id:id})});loadKanban()}catch(e){}}
 
-// ============ ANALYTICS ============
+// NOTES
+async function loadNotes(){try{var r=await fetch("/api/notes/"+encodeURIComponent(PROJECT));var d=await r.json();document.getElementById("notesArea").value=d.content||""}catch(e){}}
+async function saveNotes(){var content=document.getElementById("notesArea").value;try{await fetch("/api/notes/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({content:content})});toast("Notes saved")}catch(e){toast("Error","error")}}
+
+// ANALYTICS (5 charts, all clickable)
 async function loadAnalytics(){
+  try{var r=await fetch("/api/build-chart/"+encodeURIComponent(PROJECT));var d=await r.json();var chart=d.chart||[];var maxDur=Math.max.apply(null,chart.map(function(x){return x.duration||0}))||1;var html="";chart.slice(0,20).reverse().forEach(function(x){var h=Math.max(4,Math.round((x.duration/maxDur)*90));var cls=x.success?"ok":"fail";html+='<div class="chart-col '+cls+'" style="height:'+h+'px" title="'+x.duration.toFixed(1)+'s"></div>'});document.getElementById("buildTimeChart").innerHTML=html||'<div class="empty" style="width:100%">No builds</div>'}catch(e){}
+  try{var r2=await fetch("/api/apk-size-graph/"+encodeURIComponent(PROJECT));var d2=await r2.json();var pts=d2.points||[];var maxSize=Math.max.apply(null,pts.map(function(x){return x.size||0}))||1;var html2="";pts.slice(0,20).reverse().forEach(function(x){var h=Math.max(4,Math.round((x.size/maxSize)*90));html2+='<div class="chart-col" style="height:'+h+'px" title="'+Math.round(x.size/1024)+'KB"></div>'});document.getElementById("apkSizeChart").innerHTML=html2||'<div class="empty" style="width:100%">No data</div>'}catch(e){}
+  try{var r3=await fetch("/api/error-frequency/"+encodeURIComponent(PROJECT));var d3=await r3.json();var freq=d3.freq||{};var keys=Object.keys(freq).sort(function(a,b){return freq[b]-freq[a]}).slice(0,10);var html3="";if(!keys.length)html3='<div class="empty">No errors</div>';keys.forEach(function(k){var pct=Math.min(100,Math.round((freq[k]/Math.max.apply(null,Object.values(freq)))*100));html3+='<div style="margin-bottom:8px"><div style="font-size:11px;font-family:monospace;color:#fca5a5;margin-bottom:3px">'+esc(k.slice(0,60))+' <span style="color:#94a3b8">×'+freq[k]+'</span></div><div style="height:6px;background:#1f2937;border-radius:3px"><div style="width:'+pct+'%;height:100%;background:linear-gradient(90deg,#ef4444,#dc2626);border-radius:3px"></div></div></div>'});document.getElementById("errFreqList").innerHTML=html3}catch(e){}
+  try{var r4=await fetch("/api/project-details/"+encodeURIComponent(PROJECT));var d4=await r4.json();if(d4.language_stats&&Object.keys(d4.language_stats).length){var colors=["#3b82f6","#22c55e","#f59e0b","#ef4444","#8b5cf6","#ec4899"];var sortedLangs=Object.entries(d4.language_stats).sort(function(a,b){return b[1].percent-a[1].percent});var bar="",i=0;sortedLangs.forEach(function(e){var c=colors[i%colors.length];bar+='<div style="width:'+e[1].percent+'%;background:'+c+'">'+e[1].percent+'%</div>';i++});var html4='<div class="lang-bar">'+bar+'</div><div style="display:flex;flex-wrap:wrap;gap:6px;margin-top:6px;font-size:10px">';i=0;sortedLangs.forEach(function(e){var c=colors[i%colors.length];html4+='<span style="display:flex;align-items:center;gap:3px"><span style="width:8px;height:8px;border-radius:2px;background:'+c+'"></span>'+esc(e[0])+' '+e[1].percent+'%</span>';i++});html4+='</div>';document.getElementById("langBreakdown").innerHTML=html4}else document.getElementById("langBreakdown").innerHTML='<div class="empty">No code files</div>'}catch(e){}
+  try{var r5=await fetch("/api/build-chart/"+encodeURIComponent(PROJECT));var d5=await r5.json();var ch=d5.chart||[];if(ch.length){var ok=ch.filter(function(x){return x.success}).length;var total=ch.length;var pct=Math.round(ok/total*100);var color=pct>=70?"#22c55e":pct>=40?"#f59e0b":"#ef4444";document.getElementById("successRateBox").innerHTML='<div style="font-size:36px;font-weight:700;color:'+color+'">'+pct+'%</div><div style="font-size:11px;color:#94a3b8;margin-top:4px">'+ok+'/'+total+' successful builds</div>'}else document.getElementById("successRateBox").innerHTML='<div class="empty">No builds yet</div>'}catch(e){}
+}
+async function showStatsDetails(type){
+  if(type==="success_rate"){loadAnalytics();return}
   try{
-    var r=await fetch("/api/build-chart/"+encodeURIComponent(PROJECT));
+    var r=await fetch("/api/stats-details/"+encodeURIComponent(PROJECT)+"?type="+type);
     var d=await r.json();
-    var chart=d.chart||[];
-    var maxDur=Math.max.apply(null,chart.map(function(x){return x.duration||0;}))||1;
+    if(!r.ok){toast(d.error||"Fail","error");return}
+    var html='<h3><i class="fa-solid fa-chart-line"></i> '+esc(d.title||type)+'</h3>';
+    if(!d.rows||!d.rows.length){html+='<div class="empty">No data</div>'}
+    else{
+      html+='<div style="overflow-x:auto"><table class="details-table"><thead><tr>';
+      d.columns.forEach(function(c){html+='<th>'+esc(c)+'</th>'});
+      html+='</tr></thead><tbody>';
+      d.rows.forEach(function(row){
+        html+='<tr>';
+        d.columns.forEach(function(c){html+='<td>'+esc(String(row[c]||"-"))+'</td>'});
+        html+='</tr>';
+      });
+      html+='</tbody></table></div>';
+    }
+    html+='<button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>';
+    showModal(html);
+  }catch(e){toast("Error","error")}
+}
+
+// SETTINGS
+async function openSettings(){
+  document.getElementById("settingsModal").classList.add("show");
+  try{
+    var r=await fetch("/api/ide-settings");var d=await r.json();
+    document.getElementById("set_compileSdk").value=d.compileSdk||34;
+    document.getElementById("set_targetSdk").value=d.targetSdk||34;
+    document.getElementById("set_minSdk").value=d.minSdk||23;
+    document.getElementById("set_gradleVersion").value=d.gradleVersion||"8.11.1";
+    document.getElementById("set_autoBuild").checked=!!d.autoBuild;
+  }catch(e){}
+  document.getElementById("set_autoSave").value=localStorage.getItem("autoSave")||"off";
+  document.getElementById("set_fontSize").value=localStorage.getItem("fontSize")||13;
+  document.getElementById("set_cmTheme").value=localStorage.getItem("cmTheme")||"dracula";
+  document.getElementById("set_uiLang").value=localStorage.getItem("uiLang")||"en";
+  loadTimeouts();
+  loadCustomThemes();
+}
+function switchSettingsTab(id,el){document.querySelectorAll("#settingsModal .tab").forEach(function(t){t.classList.remove("active")});el.classList.add("active");document.querySelectorAll("#settingsModal .settings-content").forEach(function(c){c.style.display="none"});document.getElementById("tab-"+id).style.display="block"}
+async function loadTimeouts(){
+  try{
+    var r=await fetch("/api/timeouts");var d=await r.json();
+    TIMEOUT_LABELS=d.labels||{};TIMEOUT_VALUES=d.timeouts||{};TIMEOUT_DEFAULTS=d.defaults||{};
+    var list=document.getElementById("timeoutsList");list.innerHTML="";
     var html="";
-    chart.slice(0,20).reverse().forEach(function(x){
-      var h=Math.max(4,Math.round((x.duration/maxDur)*90));
-      var cls=x.success?"ok":"fail";
-      html+='<div class="chart-col '+cls+'" style="height:'+h+'px" title="'+x.duration.toFixed(1)+'s"></div>';
+    Object.keys(TIMEOUT_LABELS).forEach(function(k){
+      var lbl=TIMEOUT_LABELS[k];var val=TIMEOUT_VALUES[k]||60;
+      html+='<div class="setting-item"><div><label>'+esc(lbl[0])+'</label><small>'+esc(lbl[1])+' ('+lbl[2]+'-'+lbl[3]+')</small></div><input type="number" id="to_'+k+'" min="'+lbl[2]+'" max="'+lbl[3]+'" value="'+val+'"></div>';
     });
-    document.getElementById("buildTimeChart").innerHTML=html||'<div class="empty" style="width:100%">No builds yet</div>';
-  }catch(e){}
-  try{
-    var r2=await fetch("/api/apk-size-graph/"+encodeURIComponent(PROJECT));
-    var d2=await r2.json();
-    var pts=d2.points||[];
-    var maxSize=Math.max.apply(null,pts.map(function(x){return x.size||0;}))||1;
-    var html2="";
-    pts.slice(0,20).reverse().forEach(function(x){
-      var h=Math.max(4,Math.round((x.size/maxSize)*90));
-      html2+='<div class="chart-col" style="height:'+h+'px" title="'+Math.round(x.size/1024)+' KB"></div>';
-    });
-    document.getElementById("apkSizeChart").innerHTML=html2||'<div class="empty" style="width:100%">No data</div>';
-  }catch(e){}
-  try{
-    var r3=await fetch("/api/error-frequency/"+encodeURIComponent(PROJECT));
-    var d3=await r3.json();
-    var freq=d3.freq||{};
-    var keys=Object.keys(freq).sort(function(a,b){return freq[b]-freq[a];}).slice(0,20);
-    var html3="";
-    if(!keys.length)html3='<div class="empty">No errors recorded</div>';
-    keys.forEach(function(k){
-      var pct=Math.min(100,Math.round((freq[k]/Math.max.apply(null,Object.values(freq)))*100));
-      html3+='<div style="margin-bottom:8px"><div style="font-size:11px;font-family:monospace;color:#fca5a5;margin-bottom:3px">'+esc(k.slice(0,80))+' <span style="color:#94a3b8">× '+freq[k]+'</span></div><div class="chart-bar" style="height:6px"><div style="width:'+pct+'%;height:100%;background:linear-gradient(90deg,#ef4444,#dc2626);border-radius:3px"></div></div></div>';
-    });
-    document.getElementById("errFreqList").innerHTML=html3;
+    list.innerHTML=html;
   }catch(e){}
 }
-
-// ============ MORE MENU TOOLS ============
-function showMoreMenu(){document.getElementById("moreModal").classList.add("show");}
-function openPkgRename(){
-  showModal('<h3><i class="fa-solid fa-box"></i> Rename Package</h3><input id="oldPkg" placeholder="Old package"><input id="newPkg" placeholder="New package"><button class="btn btn-primary" style="width:100%;padding:12px;margin-top:8px" onclick="doPkgRename()">Update All</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>');
+async function resetTimeouts(){
+  if(!confirm("Reset all timeouts to defaults?"))return;
+  try{var r=await fetch("/api/timeouts/reset",{method:"POST"});if(r.ok){toast("Reset done");loadTimeouts()}}catch(e){toast("Error","error")}
 }
-async function doPkgRename(){
-  var oldP=document.getElementById("oldPkg").value.trim();
-  var newP=document.getElementById("newPkg").value.trim();
-  if(!oldP||!newP){toast("Fill both","error");return;}
+async function saveAllSettings(){
+  var data={
+    compileSdk:document.getElementById("set_compileSdk").value,
+    targetSdk:document.getElementById("set_targetSdk").value,
+    minSdk:document.getElementById("set_minSdk").value,
+    gradleVersion:document.getElementById("set_gradleVersion").value,
+    autoBuild:document.getElementById("set_autoBuild").checked
+  };
+  var timeouts={};
+  Object.keys(TIMEOUT_LABELS).forEach(function(k){var el=document.getElementById("to_"+k);if(el)timeouts[k]=parseInt(el.value)||60});
+  // Validate SDK
   try{
-    var r=await fetch("/api/rename-package",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT,old:oldP,new:newP})});
-    var d=await r.json();
-    if(r.ok){toast("Updated "+d.updated+" files");closeModal();}
-    else toast(d.error||"Fail","error");
-  }catch(e){toast("Error","error");}
-}
-async function openStrings(){
+    if(parseInt(data.compileSdk)<21||parseInt(data.compileSdk)>35){toast("compileSdk must be 21-35","error");return}
+    if(parseInt(data.targetSdk)<21||parseInt(data.targetSdk)>35){toast("targetSdk must be 21-35","error");return}
+    if(parseInt(data.minSdk)<21||parseInt(data.minSdk)>30){toast("minSdk must be 21-30","error");return}
+    if(!/^\d+\.\d+(\.\d+)?$/.test(data.gradleVersion)){toast("Invalid Gradle version","error");return}
+  }catch(e){toast("Invalid input","error");return}
   try{
-    var r=await fetch("/api/strings/"+encodeURIComponent(PROJECT));var d=await r.json();
-    window._strItems=d.items||[];
-    renderStringsModal();
-  }catch(e){toast("Error","error");}
+    var r=await fetch("/api/ide-settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});
+    if(!r.ok){var err=await r.json();toast(err.error||"Failed","error");return}
+    var r2=await fetch("/api/timeouts",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(timeouts)});
+    if(!r2.ok){toast("Timeout save failed","error");return}
+    // Save local
+    localStorage.setItem("autoSave",document.getElementById("set_autoSave").value);
+    localStorage.setItem("fontSize",document.getElementById("set_fontSize").value);
+    localStorage.setItem("cmTheme",document.getElementById("set_cmTheme").value);
+    localStorage.setItem("uiLang",document.getElementById("set_uiLang").value);
+    if(cm)cm.setOption("theme",document.getElementById("set_cmTheme").value);
+    applyFontSize(document.getElementById("set_fontSize").value);
+    // Update poll intervals
+    POLL_INTERVALS.poll=timeouts.build_poll_interval||700;
+    POLL_INTERVALS.logcat=timeouts.logcat_poll_interval||700;
+    POLL_INTERVALS.pty=timeouts.pty_poll_interval||300;
+    POLL_INTERVALS.sys=timeouts.system_info_poll||15000;
+    POLL_INTERVALS.notif=timeouts.notif_poll_interval||3000;
+    toast("Settings saved!");
+    closeAllModals();
+  }catch(e){toast("Error: "+e,"error")}
 }
-function renderStringsModal(){
-  var items=window._strItems;
-  var html='<h3><i class="fa-solid fa-language"></i> Strings Editor</h3><div style="max-height:300px;overflow-y:auto">';
-  items.forEach(function(it,i){
-    html+='<div style="display:flex;gap:6px;margin:4px 0"><input value="'+esc(it.name)+'" placeholder="key" style="flex:1" onchange="strUpdate('+i+',this.value,\'name\')"><input value="'+esc(it.value)+'" placeholder="value" style="flex:2" onchange="strUpdate('+i+',this.value,\'value\')"><button class="btn btn-danger" style="padding:6px" onclick="strDel('+i+')"><i class="fa-solid fa-trash"></i></button></div>';
-  });
-  html+='</div><button class="btn btn-success" style="width:100%;margin-top:8px;padding:10px" onclick="strAdd()">+ Add</button><button class="btn btn-primary" style="width:100%;margin-top:6px;padding:12px" onclick="strSave()">💾 Save</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>';
-  showModal(html);
-}
-function strUpdate(i,v,k){window._strItems[i][k]=v;}
-function strDel(i){window._strItems.splice(i,1);renderStringsModal();}
-function strAdd(){window._strItems.push({name:"new_string",value:""});renderStringsModal();}
-async function strSave(){
+function applyFontSize(v){localStorage.setItem("fontSize",v);if(cm)cm.getWrapperElement().style.fontSize=v+"px"}
+async function loadCustomThemes(){
   try{
-    var r=await fetch("/api/strings/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items:window._strItems})});
-    var d=await r.json();
-    if(r.ok){toast("Saved "+d.count);closeModal();}else toast(d.error||"Fail","error");
-  }catch(e){toast("Error","error");}
-}
-async function openThemeBuilder(){
-  try{
-    var r=await fetch("/api/theme/"+encodeURIComponent(PROJECT));var d=await r.json();
-    window._themeColors=d.colors||[];
-    renderThemeModal();
-  }catch(e){toast("Error","error");}
-}
-function renderThemeModal(){
-  var html='<h3><i class="fa-solid fa-brush"></i> Theme Builder</h3><div style="max-height:300px;overflow-y:auto">';
-  window._themeColors.forEach(function(c,i){
-    html+='<div style="display:flex;gap:6px;margin:4px 0;align-items:center"><input value="'+esc(c.name)+'" placeholder="name" style="flex:1" onchange="thmUpdate('+i+',this.value,\'name\')"><input type="color" value="'+esc(c.value)+'" style="width:50px;height:40px;padding:2px" onchange="thmUpdate('+i+',this.value,\'value\')"><input value="'+esc(c.value)+'" style="flex:1" onchange="thmUpdate('+i+',this.value,\'value\')"><button class="btn btn-danger" style="padding:6px" onclick="thmDel('+i+')"><i class="fa-solid fa-trash"></i></button></div>';
-  });
-  html+='</div><button class="btn btn-success" style="width:100%;margin-top:8px;padding:10px" onclick="thmAdd()">+ Color</button><button class="btn btn-primary" style="width:100%;margin-top:6px;padding:12px" onclick="thmSave()">💾 Save</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>';
-  showModal(html);
-}
-function thmUpdate(i,v,k){window._themeColors[i][k]=v;}
-function thmDel(i){window._themeColors.splice(i,1);renderThemeModal();}
-function thmAdd(){window._themeColors.push({name:"new_color",value:"#3b82f6"});renderThemeModal();}
-async function thmSave(){
-  try{
-    var r=await fetch("/api/theme/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({colors:window._themeColors})});
-    var d=await r.json();
-    if(r.ok){toast("Saved");closeModal();}else toast(d.error||"Fail","error");
-  }catch(e){toast("Error","error");}
-}
-async function openManifest(){
-  try{
-    var r=await fetch("/api/manifest/"+encodeURIComponent(PROJECT));var d=await r.json();
-    var html='<h3><i class="fa-solid fa-file-code"></i> Manifest Editor</h3>';
-    html+='<div style="font-size:12px;color:#94a3b8;margin-bottom:6px">Permissions:</div>';
-    html+='<div style="margin-bottom:10px">'+(d.permissions||[]).map(function(p){return '<div style="font-family:monospace;font-size:11px;color:#93c5fd">• '+esc(p)+'</div>';}).join("")+'</div>';
-    html+='<div style="font-size:12px;color:#94a3b8;margin-bottom:6px">Activities:</div>';
-    html+='<div style="margin-bottom:10px">'+(d.activities||[]).map(function(p){return '<div style="font-family:monospace;font-size:11px;color:#fbbf24">• '+esc(p)+'</div>';}).join("")+'</div>';
-    html+='<textarea id="manifestRaw" style="height:280px;font-family:monospace;font-size:11px">'+esc(d.raw||"")+'</textarea>';
-    html+='<button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="saveManifest()">💾 Save</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>';
-    showModal(html);
-  }catch(e){toast("Error","error");}
-}
-async function saveManifest(){
-  var raw=document.getElementById("manifestRaw").value;
-  try{
-    var r=await fetch("/api/manifest/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({raw:raw})});
-    var d=await r.json();
-    if(r.ok){toast("Saved");closeModal();}else toast(d.error||"Fail","error");
-  }catch(e){toast("Error","error");}
-}
-function openIconGen(){
-  showModal('<h3><i class="fa-solid fa-image"></i> Icon Generator</h3><p style="font-size:12px;color:#94a3b8">Upload square PNG. Auto-generates all mipmaps.</p><input type="file" id="iconFile" accept="image/*" style="padding:8px;background:transparent;color:#fff"><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="doIconGen()">🚀 Generate</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>');
-}
-async function doIconGen(){
-  var f=document.getElementById("iconFile").files[0];
-  if(!f){toast("Select file","error");return;}
-  var fd=new FormData();fd.append("file",f);
-  toast("Uploading...");
-  try{
-    var r=await fetch("/api/icon-generate/"+encodeURIComponent(PROJECT),{method:"POST",body:fd});
-    var d=await r.json();
-    if(r.ok){toast("Icons generated!");closeModal();}
-    else toast(d.error||"Fail","error");
-  }catch(e){toast("Error","error");}
-}
-async function openEnvMgr(){
-  try{
-    var r=await fetch("/api/env/"+encodeURIComponent(PROJECT));var d=await r.json();
-    window._envItems=d.items||[];
-    renderEnvModal();
-  }catch(e){toast("Error","error");}
-}
-function renderEnvModal(){
-  var html='<h3><i class="fa-solid fa-key"></i> ENV Manager</h3><p style="font-size:11px;color:#94a3b8">Written to .env file</p>';
-  window._envItems.forEach(function(it,i){
-    html+='<div style="display:flex;gap:6px;margin:4px 0"><input value="'+esc(it.key)+'" placeholder="KEY" style="flex:1" onchange="envUpdate('+i+',this.value,\'key\')"><input value="'+esc(it.value)+'" placeholder="value" style="flex:2" onchange="envUpdate('+i+',this.value,\'value\')"><button class="btn btn-danger" style="padding:6px" onclick="envDel('+i+')"><i class="fa-solid fa-trash"></i></button></div>';
-  });
-  html+='<button class="btn btn-success" style="width:100%;margin-top:8px;padding:10px" onclick="envAdd()">+ Add</button><button class="btn btn-primary" style="width:100%;margin-top:6px;padding:12px" onclick="envSave()">💾 Save</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Close</button>';
-  showModal(html);
-}
-function envUpdate(i,v,k){window._envItems[i][k]=v;}
-function envDel(i){window._envItems.splice(i,1);renderEnvModal();}
-function envAdd(){window._envItems.push({key:"NEW_KEY",value:""});renderEnvModal();}
-async function envSave(){
-  try{
-    var r=await fetch("/api/env/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items:window._envItems})});
-    var d=await r.json();
-    if(r.ok){toast("Saved");closeModal();}else toast(d.error||"Fail","error");
-  }catch(e){toast("Error","error");}
-}
-function openBulkRename(){
-  showModal('<h3><i class="fa-solid fa-i-cursor"></i> Bulk Rename</h3><input id="bulkPattern" placeholder="Regex e.g. old_(.*)"><input id="bulkReplace" placeholder="Replace e.g. new_\\1"><input id="bulkExt" placeholder="Extension filter (optional)"><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="doBulkRename()">🚀 Rename</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>');
-}
-async function doBulkRename(){
-  var p=document.getElementById("bulkPattern").value;
-  var r=document.getElementById("bulkReplace").value;
-  var e=document.getElementById("bulkExt").value;
-  if(!p){toast("Pattern required","error");return;}
-  if(!confirm("Rename matching files?"))return;
-  try{
-    var res=await fetch("/api/bulk-rename",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT,pattern:p,replace:r,ext:e})});
-    var d=await res.json();
-    if(res.ok){toast("Renamed "+d.renamed);closeModal();loadFiles(currentPath);}
-    else toast(d.error||"Fail","error");
-  }catch(err){toast("Error","error");}
-}
-function openFirebaseWizard(){
-  showModal('<h3><i class="fa-solid fa-fire"></i> Firebase Setup Wizard</h3><p style="font-size:12px;color:#94a3b8">Paste google-services.json content below:</p><textarea id="fbJson" style="height:220px;font-family:monospace;font-size:11px" placeholder=\'{"project_info":{...}}\'></textarea><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="doFirebaseWizard()">🚀 Inject</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>');
-}
-async function doFirebaseWizard(){
-  var j=document.getElementById("fbJson").value;
-  try{
-    var r=await fetch("/api/firebase-inject",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT,json:j})});
-    var d=await r.json();
-    if(r.ok){toast("Firebase injected!");closeModal();}
-    else toast(d.error||"Fail","error");
-  }catch(e){toast("Error","error");}
-}
-async function bumpVersion(){
-  if(!confirm("Bump versionCode +1?"))return;
-  try{
-    var r=await fetch("/api/version-bump/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({versionCode:true,versionName:false})});
-    var d=await r.json();
-    if(r.ok)toast("Version bumped");else toast(d.error||"Fail","error");
-  }catch(e){toast("Error","error");}
-}
-function openKeystore(){
-  showModal('<h3><i class="fa-solid fa-lock"></i> Keystore Config</h3><input id="ksFile" placeholder="Keystore file path"><input id="ksPass" placeholder="Store password" type="password"><input id="ksAlias" placeholder="Key alias"><input id="ksKeyPass" placeholder="Key password" type="password"><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="saveKs()">💾 Save</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>');
-  fetch("/api/keystore").then(function(r){return r.json();}).then(function(d){
-    if(d.storeFile)document.getElementById("ksFile").value=d.storeFile;
-    if(d.keyAlias)document.getElementById("ksAlias").value=d.keyAlias;
-  });
-}
-async function saveKs(){
-  var data={storeFile:document.getElementById("ksFile").value,storePassword:document.getElementById("ksPass").value,keyAlias:document.getElementById("ksAlias").value||"release",keyPassword:document.getElementById("ksKeyPass").value};
-  try{
-    var r=await fetch("/api/keystore",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});
-    if(r.ok){toast("Saved");closeModal();}
-  }catch(e){toast("Error","error");}
-}
-async function signRelease(){
-  if(!confirm("Build + sign release APK?"))return;
-  toast("Building release...");
-  try{
-    var r=await fetch("/api/sign-release/"+encodeURIComponent(PROJECT),{method:"POST"});
-    var d=await r.json();
-    if(r.ok){toast("Signed!");location.href=d.download;}
-    else toast(d.error||"Fail","error");
-  }catch(e){toast("Error","error");}
-}
-function openRestore(){
-  showModal('<h3><i class="fa-solid fa-download"></i> Restore Backup</h3><p style="font-size:12px;color:#94a3b8">Select a ZIP backup file.</p><input type="file" id="restoreFile" accept=".zip" style="padding:8px;background:transparent;color:#fff"><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="doRestore()">🚀 Restore</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>');
-}
-async function doRestore(){
-  var f=document.getElementById("restoreFile").files[0];
-  if(!f)return;
-  var fd=new FormData();fd.append("file",f);
-  try{
-    var r=await fetch("/api/restore",{method:"POST",body:fd});
-    var d=await r.json();
-    if(r.ok){toast("Restored!");closeModal();}
-    else toast(d.error||"Fail","error");
-  }catch(e){toast("Error","error");}
-}
-function showShortcuts(){
-  showModal('<h3><i class="fa-solid fa-keyboard"></i> Shortcuts</h3><div style="font-size:13px;line-height:2;color:#cbd5e1"><b>Ctrl+S</b> Save<br><b>Ctrl+B</b> Build<br><b>Ctrl+Shift+P</b> Command Palette<br><b>Ctrl+F</b> Find<br><b>Ctrl+Z</b> Undo<br><b>Ctrl+Y</b> Redo<br></div><button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>');
-}
-
-// ============ DEV TOOLS ============
-function openDevTools(){
-  var html='<h3><i class="fa-solid fa-toolbox"></i> Dev Tools</h3><div class="devtool-grid">';
-  html+='<div class="devtool-item" onclick="toolHash()"><i class="fa-solid fa-fingerprint"></i>Hash</div>';
-  html+='<div class="devtool-item" onclick="toolBase64()"><i class="fa-solid fa-code"></i>Base64</div>';
-  html+='<div class="devtool-item" onclick="toolUUID()"><i class="fa-solid fa-id-card"></i>UUID</div>';
-  html+='<div class="devtool-item" onclick="toolLorem()"><i class="fa-solid fa-paragraph"></i>Lorem</div>';
-  html+='<div class="devtool-item" onclick="toolJSON()"><i class="fa-solid fa-brackets-curly"></i>JSON</div>';
-  html+='<div class="devtool-item" onclick="toolColorPicker()"><i class="fa-solid fa-palette"></i>Color</div>';
-  html+='<div class="devtool-item" onclick="showProcs()"><i class="fa-solid fa-list-check"></i>Processes</div>';
-  html+='</div><div id="toolOutput" style="margin-top:10px"></div><button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>';
-  showModal(html);
-}
-async function toolHash(){
-  var t=prompt("Text to hash:");if(!t)return;
-  var r=await fetch("/api/devtool/hash",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:t,algo:"sha256"})});
-  var d=await r.json();
-  document.getElementById("toolOutput").innerHTML='<div style="font-family:monospace;font-size:11px;word-break:break-all;padding:10px;background:#000;border-radius:10px;color:#4ade80">SHA256:<br>'+esc(d.result||d.error)+'</div>';
-}
-async function toolBase64(){
-  var t=prompt("Text:");if(!t)return;
-  var r=await fetch("/api/devtool/base64",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:t,mode:"encode"})});
-  var d=await r.json();
-  document.getElementById("toolOutput").innerHTML='<div style="font-family:monospace;font-size:11px;word-break:break-all;padding:10px;background:#000;border-radius:10px;color:#4ade80">'+esc(d.result||d.error)+'</div>';
-}
-async function toolUUID(){
-  var r=await fetch("/api/devtool/uuid");var d=await r.json();
-  document.getElementById("toolOutput").innerHTML='<div style="font-family:monospace;font-size:11px;padding:10px;background:#000;border-radius:10px;color:#4ade80">'+esc(d.uuid)+'</div>';
-}
-async function toolLorem(){
-  var r=await fetch("/api/devtool/lorem?n=3");var d=await r.json();
-  document.getElementById("toolOutput").innerHTML='<textarea style="height:150px">'+esc(d.text)+'</textarea>';
-}
-function toolJSON(){
-  document.getElementById("toolOutput").innerHTML='<textarea id="jsonIO" placeholder="Paste JSON..." style="height:120px"></textarea><button class="btn btn-primary" style="width:100%;margin-top:6px;padding:10px" onclick="formatJSON()">Format</button>';
-}
-function formatJSON(){
-  try{var v=document.getElementById("jsonIO").value;var p=JSON.parse(v);document.getElementById("jsonIO").value=JSON.stringify(p,null,2);}
-  catch(e){alert("Invalid: "+e.message);}
-}
-function toolColorPicker(){
-  document.getElementById("toolOutput").innerHTML='<input type="color" id="clrPkr" style="width:100%;height:60px" oninput="document.getElementById(\'clrTxt\').innerText=this.value"><div id="clrTxt" style="text-align:center;font-family:monospace;padding:8px;color:#4ade80">#000000</div>';
-}
-async function showProcs(){
-  var r=await fetch("/api/proc-list");var d=await r.json();
-  var html='<div style="max-height:340px;overflow-y:auto;font-family:monospace;font-size:11px;background:#000;padding:10px;border-radius:10px;color:#4ade80">';
-  (d.procs||[]).forEach(function(l){html+=esc(l)+"<br>";});
-  html+='</div>';
-  document.getElementById("toolOutput").innerHTML=html;
-}
-
-// ============ SNIPPETS ============
-async function openSnippets(){
-  try{
-    var r=await fetch("/api/snippets");var d=await r.json();
-    var html='<h3><i class="fa-solid fa-scissors"></i> Code Snippets</h3><div style="max-height:300px;overflow-y:auto">';
-    if(!d.items||!d.items.length)html+='<div class="empty">No snippets</div>';
-    else d.items.forEach(function(s,i){
-      html+='<div style="background:#0b1220;padding:8px;border-radius:8px;margin:4px 0;display:flex;gap:6px;align-items:center"><b style="color:#60a5fa;flex:1;font-size:12px">'+esc(s.name)+' <small style="color:#94a3b8">['+esc(s.lang)+']</small></b><button class="btn btn-success" style="padding:4px 8px" onclick="insertSnippet(\''+esc(s.code).replace(/'/g,"\\'").replace(/\n/g,"\\n")+'\')"><i class="fa-solid fa-plus"></i></button><button class="btn btn-danger" style="padding:4px 8px" onclick="delSnippet('+i+')"><i class="fa-solid fa-trash"></i></button></div>';
-    });
-    html+='</div><button class="btn btn-success" style="width:100%;margin-top:8px;padding:11px" onclick="addSnippet()">+ New Snippet</button><button class="btn" style="width:100%;margin-top:6px;padding:11px" onclick="closeModal()">Close</button>';
-    showModal(html);
-  }catch(e){}
-}
-function insertSnippet(code){if(!cm)return toast("Open a file first","error");cm.replaceSelection(code);closeModal();}
-async function addSnippet(){
-  var name=prompt("Name:");if(!name)return;
-  var lang=prompt("Language:","java")||"text";
-  var code=prompt("Code:");if(!code)return;
-  await fetch("/api/snippets",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name,lang:lang,code:code})});
-  openSnippets();
-}
-async function delSnippet(i){await fetch("/api/snippets",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({index:i})});openSnippets();}
-
-// ============ MACROS ============
-async function openMacros(){
-  try{
-    var r=await fetch("/api/macros");var d=await r.json();
-    var html='<h3><i class="fa-solid fa-record-vinyl"></i> Macros</h3>';
-    (d.macros||[]).forEach(function(m){
-      html+='<div class="file-item file"><div class="icon-wrap"><i class="fa-solid fa-play"></i></div><span class="name">'+esc(m.name)+' <small style="color:#94a3b8">'+m.steps.length+' steps</small></span><button class="btn btn-success" style="padding:5px 9px" onclick="runMacro(\''+m.id+'\')"><i class="fa-solid fa-play"></i></button><button class="btn btn-danger" style="padding:5px 9px" onclick="delMacro(\''+m.id+'\')"><i class="fa-solid fa-trash"></i></button></div>';
-    });
-    html+='<button class="btn btn-success" style="width:100%;margin-top:8px;padding:11px" onclick="createMacro()">+ Record Macro</button><button class="btn" style="width:100%;margin-top:6px;padding:11px" onclick="closeModal()">Close</button>';
-    showModal(html);
-  }catch(e){}
-}
-async function createMacro(){
-  var name=prompt("Macro name:");if(!name)return;
-  var cmd=prompt("Step 1: shell command:");if(!cmd)return;
-  var steps=[{type:"cmd",value:cmd}];
-  if(confirm("Add build step?"))steps.push({type:"build"});
-  await fetch("/api/macros",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name,steps:steps})});
-  openMacros();
-}
-async function runMacro(id){
-  try{
-    var r=await fetch("/api/macros/run/"+id,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT})});
-    var d=await r.json();
-    if(r.ok)toast("Macro executed");else toast(d.error||"Fail","error");
-    closeModal();
-  }catch(e){toast("Error","error");}
-}
-async function delMacro(id){await fetch("/api/macros",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:id})});openMacros();}
-
-// ============ CUSTOM THEMES ============
-async function openCustomThemes(){
-  try{
-    var r=await fetch("/api/themes");var d=await r.json();
-    var html='<h3><i class="fa-solid fa-palette"></i> Custom Themes</h3>';
+    var r=await fetch("/api/editor-themes");var d=await r.json();
+    var list=document.getElementById("customThemesList");
+    var html="";
     (d.themes||[]).forEach(function(t){
-      html+='<div class="file-item file"><div class="icon-wrap" style="background:'+(t.colors.primary||"#3b82f6")+'"></div><span class="name">'+esc(t.name)+'</span><button class="btn btn-success" style="padding:5px 9px" onclick="applyTheme(\''+t.id+'\')"><i class="fa-solid fa-check"></i></button><button class="btn btn-danger" style="padding:5px 9px" onclick="delTheme(\''+t.id+'\')"><i class="fa-solid fa-trash"></i></button></div>';
+      if(t.builtin)return;
+      html+='<div style="background:#0b1220;padding:8px;border-radius:8px;margin:4px 0;display:flex;gap:6px;align-items:center"><div style="flex:1"><b style="color:#60a5fa;font-size:12px">'+esc(t.name)+'</b><br><small style="color:#94a3b8;font-size:10px">'+esc(t.description||"")+'</small></div><button class="btn btn-success" style="padding:4px 8px" onclick="applyCustomTheme(\''+t.id+'\')"><i class="fa-solid fa-check"></i></button><button class="btn btn-danger" style="padding:4px 8px" onclick="delCustomTheme(\''+t.id+'\')"><i class="fa-solid fa-trash"></i></button></div>';
     });
-    html+='<input id="themeName" placeholder="Theme name"><input type="color" id="themePrimary" value="#3b82f6" style="width:100%;height:44px;padding:4px"><button class="btn btn-success" style="width:100%;padding:11px" onclick="createTheme()">+ Create Theme</button><button class="btn" style="width:100%;margin-top:6px;padding:11px" onclick="closeModal()">Close</button>';
-    window._customThemes=d.themes||[];
-    showModal(html);
+    list.innerHTML=html||'<div class="empty" style="padding:10px;font-size:11px">No custom themes yet</div>';
   }catch(e){}
 }
-async function createTheme(){
-  var name=document.getElementById("themeName").value.trim();
-  var primary=document.getElementById("themePrimary").value;
-  if(!name)return;
-  await fetch("/api/themes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name,colors:{primary:primary}})});
-  openCustomThemes();
+function applyCustomTheme(id){toast("Theme applied (restart to see effect)")}
+async function delCustomTheme(id){if(!confirm("Delete theme?"))return;try{await fetch("/api/editor-themes/"+id,{method:"DELETE"});loadCustomThemes();toast("Deleted")}catch(e){}}
+function openAddEditorTheme(){
+  showModal('<h3><i class="fa-solid fa-palette"></i> Add Editor Theme</h3><input id="theme_name" placeholder="Theme name (e.g. My Dark)"><input id="theme_author" placeholder="Author"><textarea id="theme_desc" placeholder="Description" style="min-height:60px"></textarea><input id="theme_bg" placeholder="Background color (e.g. #0d1117)"><input id="theme_fg" placeholder="Foreground color (e.g. #c9d1d9)"><input id="theme_accent" placeholder="Accent color (e.g. #3b82f6)"><button class="btn btn-success" style="width:100%;margin-top:8px;padding:12px" onclick="doAddEditorTheme()">Create Theme</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>');
 }
-function applyTheme(id){
-  var t=(window._customThemes||[]).find(function(x){return x.id===id;});
-  if(!t)return;
-  if(t.colors.primary){document.documentElement.style.setProperty("--primary",t.colors.primary);}
-  toast("Theme applied: "+t.name);
+async function doAddEditorTheme(){
+  var name=document.getElementById("theme_name").value.trim();
+  if(!name){toast("Name required","error");return}
+  var data={name:name,author:document.getElementById("theme_author").value||"user",description:document.getElementById("theme_desc").value||"",colors:{bg:document.getElementById("theme_bg").value||"#0d1117",fg:document.getElementById("theme_fg").value||"#c9d1d9",accent:document.getElementById("theme_accent").value||"#3b82f6"},css:""};
+  try{var r=await fetch("/api/editor-themes",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});if(r.ok){toast("Theme created!");closeModal();loadCustomThemes()}}catch(e){toast("Error","error")}
 }
-async function delTheme(id){await fetch("/api/themes/"+id,{method:"DELETE"});openCustomThemes();}
 
-// ============ PLUGINS ============
-async function openPlugins(){
-  try{
-    var r=await fetch("/api/plugins");var d=await r.json();
-    var html='<h3><i class="fa-solid fa-puzzle-piece"></i> Plugins</h3>';
-    (d.plugins||[]).forEach(function(p){
-      html+='<div class="plugin-item"><h5>'+esc(p.name)+' v'+esc(p.version)+'</h5><p>'+esc(p.description||"No description")+'</p><button class="btn btn-danger" style="padding:5px 9px" onclick="delPlugin(\''+esc(p._file)+'\')"><i class="fa-solid fa-trash"></i> Delete</button></div>';
-    });
-    html+='<input id="pluginName" placeholder="Plugin name"><input id="pluginDesc" placeholder="Description"><textarea id="pluginCode" placeholder="JavaScript code..." style="height:100px"></textarea><button class="btn btn-success" style="width:100%;padding:11px" onclick="createPlugin()">+ Add Plugin</button><button class="btn" style="width:100%;margin-top:6px;padding:11px" onclick="closeModal()">Close</button>';
-    showModal(html);
-  }catch(e){}
-}
-async function createPlugin(){
-  var name=document.getElementById("pluginName").value.trim();
-  var desc=document.getElementById("pluginDesc").value;
-  var code=document.getElementById("pluginCode").value;
-  if(!name)return;
-  await fetch("/api/plugins",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name,description:desc,code:code})});
-  openPlugins();
-}
-async function delPlugin(f){await fetch("/api/plugins/"+encodeURIComponent(f),{method:"DELETE"});openPlugins();}
+// MORE MENU
+function showMoreMenu(){document.getElementById("moreModal").classList.add("show")}
 
-// ============ COMMAND PALETTE ============
+// STANDARD TOOLS (from original)
+function openPkgRename(){showModal('<h3><i class="fa-solid fa-box"></i> Rename Package</h3><input id="oldPkg" placeholder="Old package"><input id="newPkg" placeholder="New package"><button class="btn btn-primary" style="width:100%;padding:12px;margin-top:8px" onclick="doPkgRename()">Update All</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>')}
+async function doPkgRename(){var oldP=document.getElementById("oldPkg").value.trim();var newP=document.getElementById("newPkg").value.trim();if(!oldP||!newP){toast("Fill both","error");return}try{var r=await fetch("/api/rename-package",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT,old:oldP,new:newP})});var d=await r.json();if(r.ok){toast("Updated "+d.updated);closeModal()}else toast(d.error||"Fail","error")}catch(e){toast("Error","error")}}
+async function openStrings(){try{var r=await fetch("/api/strings/"+encodeURIComponent(PROJECT));var d=await r.json();window._strItems=d.items||[];renderStringsModal()}catch(e){toast("Error","error")}}
+function renderStringsModal(){var items=window._strItems;var html='<h3><i class="fa-solid fa-language"></i> Strings</h3><div style="max-height:300px;overflow-y:auto">';items.forEach(function(it,i){html+='<div style="display:flex;gap:6px;margin:4px 0"><input value="'+esc(it.name)+'" placeholder="key" style="flex:1" onchange="strUpdate('+i+',this.value,\'name\')"><input value="'+esc(it.value)+'" placeholder="value" style="flex:2" onchange="strUpdate('+i+',this.value,\'value\')"><button class="btn btn-danger" style="padding:6px" onclick="strDel('+i+')"><i class="fa-solid fa-trash"></i></button></div>'});html+='</div><button class="btn btn-success" style="width:100%;margin-top:8px;padding:10px" onclick="strAdd()">+ Add</button><button class="btn btn-primary" style="width:100%;margin-top:6px;padding:12px" onclick="strSave()">Save</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>';showModal(html)}
+function strUpdate(i,v,k){window._strItems[i][k]=v}
+function strDel(i){window._strItems.splice(i,1);renderStringsModal()}
+function strAdd(){window._strItems.push({name:"new_string",value:""});renderStringsModal()}
+async function strSave(){try{var r=await fetch("/api/strings/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items:window._strItems})});var d=await r.json();if(r.ok){toast("Saved "+d.count);closeModal()}else toast(d.error||"Fail","error")}catch(e){toast("Error","error")}}
+async function openThemeBuilder(){try{var r=await fetch("/api/theme/"+encodeURIComponent(PROJECT));var d=await r.json();window._themeColors=d.colors||[];renderThemeModal()}catch(e){toast("Error","error")}}
+function renderThemeModal(){var html='<h3><i class="fa-solid fa-brush"></i> Theme</h3><div style="max-height:300px;overflow-y:auto">';window._themeColors.forEach(function(c,i){html+='<div style="display:flex;gap:6px;margin:4px 0;align-items:center"><input value="'+esc(c.name)+'" placeholder="name" style="flex:1" onchange="thmUpdate('+i+',this.value,\'name\')"><input type="color" value="'+esc(c.value)+'" style="width:50px;height:40px;padding:2px" onchange="thmUpdate('+i+',this.value,\'value\')"><input value="'+esc(c.value)+'" style="flex:1" onchange="thmUpdate('+i+',this.value,\'value\')"><button class="btn btn-danger" style="padding:6px" onclick="thmDel('+i+')"><i class="fa-solid fa-trash"></i></button></div>'});html+='</div><button class="btn btn-success" style="width:100%;margin-top:8px;padding:10px" onclick="thmAdd()">+ Color</button><button class="btn btn-primary" style="width:100%;margin-top:6px;padding:12px" onclick="thmSave()">Save</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>';showModal(html)}
+function thmUpdate(i,v,k){window._themeColors[i][k]=v}
+function thmDel(i){window._themeColors.splice(i,1);renderThemeModal()}
+function thmAdd(){window._themeColors.push({name:"new_color",value:"#3b82f6"});renderThemeModal()}
+async function thmSave(){try{var r=await fetch("/api/theme/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({colors:window._themeColors})});var d=await r.json();if(r.ok){toast("Saved");closeModal()}else toast(d.error||"Fail","error")}catch(e){toast("Error","error")}}
+async function openManifest(){try{var r=await fetch("/api/manifest/"+encodeURIComponent(PROJECT));var d=await r.json();var html='<h3><i class="fa-solid fa-file-code"></i> Manifest</h3><div style="font-size:12px;color:#94a3b8;margin-bottom:6px">Permissions:</div><div style="margin-bottom:10px">'+(d.permissions||[]).map(function(p){return '<div style="font-family:monospace;font-size:11px;color:#93c5fd">• '+esc(p)+'</div>'}).join("")+'</div><div style="font-size:12px;color:#94a3b8;margin-bottom:6px">Activities:</div><div style="margin-bottom:10px">'+(d.activities||[]).map(function(p){return '<div style="font-family:monospace;font-size:11px;color:#fbbf24">• '+esc(p)+'</div>'}).join("")+'</div><textarea id="manifestRaw" style="height:280px;font-family:monospace;font-size:11px">'+esc(d.raw||"")+'</textarea><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="saveManifest()">Save</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>';showModal(html)}catch(e){toast("Error","error")}}
+async function saveManifest(){var raw=document.getElementById("manifestRaw").value;try{var r=await fetch("/api/manifest/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({raw:raw})});var d=await r.json();if(r.ok){toast("Saved");closeModal()}else toast(d.error||"Fail","error")}catch(e){toast("Error","error")}}
+function openIconGen(){showModal('<h3><i class="fa-solid fa-image"></i> Icon Generator</h3><p style="font-size:12px;color:#94a3b8">Upload square PNG</p><input type="file" id="iconFile" accept="image/*" style="padding:8px;background:transparent;color:#fff"><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="doIconGen()">Generate</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>')}
+async function doIconGen(){var f=document.getElementById("iconFile").files[0];if(!f){toast("Select file","error");return}var fd=new FormData();fd.append("file",f);toast("Uploading...");try{var r=await fetch("/api/icon-generate/"+encodeURIComponent(PROJECT),{method:"POST",body:fd});var d=await r.json();if(r.ok){toast("Icons generated!");closeModal()}else toast(d.error||"Fail","error")}catch(e){toast("Error","error")}}
+async function openEnvMgr(){try{var r=await fetch("/api/env/"+encodeURIComponent(PROJECT));var d=await r.json();window._envItems=d.items||[];renderEnvModal()}catch(e){toast("Error","error")}}
+function renderEnvModal(){var html='<h3><i class="fa-solid fa-key"></i> ENV</h3>';window._envItems.forEach(function(it,i){html+='<div style="display:flex;gap:6px;margin:4px 0"><input value="'+esc(it.key)+'" placeholder="KEY" style="flex:1" onchange="envUpdate('+i+',this.value,\'key\')"><input value="'+esc(it.value)+'" placeholder="value" style="flex:2" onchange="envUpdate('+i+',this.value,\'value\')"><button class="btn btn-danger" style="padding:6px" onclick="envDel('+i+')"><i class="fa-solid fa-trash"></i></button></div>'});html+='<button class="btn btn-success" style="width:100%;margin-top:8px;padding:10px" onclick="envAdd()">+ Add</button><button class="btn btn-primary" style="width:100%;margin-top:6px;padding:12px" onclick="envSave()">Save</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Close</button>';showModal(html)}
+function envUpdate(i,v,k){window._envItems[i][k]=v}
+function envDel(i){window._envItems.splice(i,1);renderEnvModal()}
+function envAdd(){window._envItems.push({key:"NEW_KEY",value:""});renderEnvModal()}
+async function envSave(){try{var r=await fetch("/api/env/"+encodeURIComponent(PROJECT),{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({items:window._envItems})});var d=await r.json();if(r.ok){toast("Saved");closeModal()}else toast(d.error||"Fail","error")}catch(e){toast("Error","error")}}
+function openBulkRename(){showModal('<h3><i class="fa-solid fa-i-cursor"></i> Bulk Rename</h3><input id="bulkPattern" placeholder="Regex e.g. old_(.*)"><input id="bulkReplace" placeholder="Replace e.g. new_\\1"><input id="bulkExt" placeholder="Ext filter"><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="doBulkRename()">Rename</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>')}
+async function doBulkRename(){var p=document.getElementById("bulkPattern").value;var r=document.getElementById("bulkReplace").value;var e=document.getElementById("bulkExt").value;if(!p){toast("Pattern required","error");return}if(!confirm("Rename?"))return;try{var res=await fetch("/api/bulk-rename",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT,pattern:p,replace:r,ext:e})});var d=await res.json();if(res.ok){toast("Renamed "+d.renamed);closeModal();loadFiles(currentPath)}else toast(d.error||"Fail","error")}catch(err){toast("Error","error")}}
+function openFirebaseWizard(){showModal('<h3><i class="fa-solid fa-fire"></i> Firebase</h3><textarea id="fbJson" style="height:220px;font-family:monospace;font-size:11px" placeholder=\'{"project_info":{...}}\'></textarea><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="doFirebaseWizard()">Inject</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>')}
+async function doFirebaseWizard(){var j=document.getElementById("fbJson").value;try{var r=await fetch("/api/firebase-inject",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT,json:j})});var d=await r.json();if(r.ok){toast("Injected!");closeModal()}else toast(d.error||"Fail","error")}catch(e){toast("Error","error")}}
+function openKeystore(){showModal('<h3><i class="fa-solid fa-lock"></i> Keystore</h3><input id="ksFile" placeholder="Keystore file"><input id="ksPass" placeholder="Store password" type="password"><input id="ksAlias" placeholder="Key alias"><input id="ksKeyPass" placeholder="Key password" type="password"><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="saveKs()">Save</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>');fetch("/api/keystore").then(function(r){return r.json()}).then(function(d){if(d.storeFile)document.getElementById("ksFile").value=d.storeFile;if(d.keyAlias)document.getElementById("ksAlias").value=d.keyAlias})}
+async function saveKs(){var data={storeFile:document.getElementById("ksFile").value,storePassword:document.getElementById("ksPass").value,keyAlias:document.getElementById("ksAlias").value||"release",keyPassword:document.getElementById("ksKeyPass").value};try{var r=await fetch("/api/keystore",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(data)});if(r.ok){toast("Saved");closeModal()}}catch(e){toast("Error","error")}}
+async function signRelease(){if(!confirm("Build + sign release?"))return;toast("Building release...","info");try{var r=await fetch("/api/sign-release/"+encodeURIComponent(PROJECT),{method:"POST"});var d=await r.json();if(r.ok){toast("Signed!");location.href=d.download}else toast(d.error||"Fail","error")}catch(e){toast("Error","error")}}
+function openRestore(){showModal('<h3><i class="fa-solid fa-download"></i> Restore</h3><input type="file" id="restoreFile" accept=".zip" style="padding:8px;background:transparent;color:#fff"><button class="btn btn-primary" style="width:100%;margin-top:8px;padding:12px" onclick="doRestore()">Restore</button><button class="btn" style="width:100%;margin-top:6px;padding:12px" onclick="closeModal()">Cancel</button>')}
+async function doRestore(){var f=document.getElementById("restoreFile").files[0];if(!f)return;var fd=new FormData();fd.append("file",f);try{var r=await fetch("/api/restore",{method:"POST",body:fd});var d=await r.json();if(r.ok){toast("Restored!");closeModal()}else toast(d.error||"Fail","error")}catch(e){toast("Error","error")}}
+function showShortcuts(){showModal('<h3><i class="fa-solid fa-keyboard"></i> Shortcuts</h3><div style="font-size:13px;line-height:2;color:#cbd5e1"><b>Ctrl+S</b> Save<br><b>Ctrl+B</b> Build<br><b>Ctrl+Shift+P</b> Command Palette<br><b>Ctrl+F</b> Find<br><b>Ctrl+Z</b> Undo<br><b>Ctrl+Y</b> Redo</div><button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>')}
+
+// DEV TOOLS
+function openDevTools(){showModal('<h3><i class="fa-solid fa-toolbox"></i> Dev Tools</h3><div class="devtool-grid"><div class="devtool-item" onclick="toolHash()"><i class="fa-solid fa-fingerprint"></i>Hash</div><div class="devtool-item" onclick="toolBase64()"><i class="fa-solid fa-code"></i>Base64</div><div class="devtool-item" onclick="toolUUID()"><i class="fa-solid fa-id-card"></i>UUID</div><div class="devtool-item" onclick="toolLorem()"><i class="fa-solid fa-paragraph"></i>Lorem</div><div class="devtool-item" onclick="toolJSON()"><i class="fa-solid fa-brackets-curly"></i>JSON</div><div class="devtool-item" onclick="toolColorPicker()"><i class="fa-solid fa-palette"></i>Color</div><div class="devtool-item" onclick="showProcs()"><i class="fa-solid fa-list-check"></i>Processes</div></div><div id="toolOutput" style="margin-top:10px"></div><button class="btn" style="width:100%;margin-top:10px;padding:12px" onclick="closeModal()">Close</button>')}
+async function toolHash(){var t=prompt("Text to hash:");if(!t)return;var r=await fetch("/api/devtool/hash",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:t,algo:"sha256"})});var d=await r.json();document.getElementById("toolOutput").innerHTML='<div style="font-family:monospace;font-size:11px;word-break:break-all;padding:10px;background:#000;border-radius:10px;color:#4ade80">SHA256:<br>'+esc(d.result||d.error)+'</div>'}
+async function toolBase64(){var t=prompt("Text:");if(!t)return;var r=await fetch("/api/devtool/base64",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({text:t,mode:"encode"})});var d=await r.json();document.getElementById("toolOutput").innerHTML='<div style="font-family:monospace;font-size:11px;word-break:break-all;padding:10px;background:#000;border-radius:10px;color:#4ade80">'+esc(d.result||d.error)+'</div>'}
+async function toolUUID(){var r=await fetch("/api/devtool/uuid");var d=await r.json();document.getElementById("toolOutput").innerHTML='<div style="font-family:monospace;font-size:11px;padding:10px;background:#000;border-radius:10px;color:#4ade80">'+esc(d.uuid)+'</div>'}
+async function toolLorem(){var r=await fetch("/api/devtool/lorem?n=3");var d=await r.json();document.getElementById("toolOutput").innerHTML='<textarea style="height:150px">'+esc(d.text)+'</textarea>'}
+function toolJSON(){document.getElementById("toolOutput").innerHTML='<textarea id="jsonIO" placeholder="Paste JSON" style="height:120px"></textarea><button class="btn btn-primary" style="width:100%;margin-top:6px;padding:10px" onclick="formatJSON()">Format</button>'}
+function formatJSON(){try{var v=document.getElementById("jsonIO").value;var p=JSON.parse(v);document.getElementById("jsonIO").value=JSON.stringify(p,null,2)}catch(e){alert("Invalid: "+e.message)}}
+function toolColorPicker(){document.getElementById("toolOutput").innerHTML='<input type="color" id="clrPkr" style="width:100%;height:60px" oninput="document.getElementById(\'clrTxt\').innerText=this.value"><div id="clrTxt" style="text-align:center;font-family:monospace;padding:8px;color:#4ade80">#000000</div>'}
+async function showProcs(){var r=await fetch("/api/proc-list");var d=await r.json();var html='<div style="max-height:340px;overflow-y:auto;font-family:monospace;font-size:11px;background:#000;padding:10px;border-radius:10px;color:#4ade80">';(d.procs||[]).forEach(function(l){html+=esc(l)+"<br>"});html+='</div>';document.getElementById("toolOutput").innerHTML=html}
+
+// SNIPPETS
+async function openSnippets(){try{var r=await fetch("/api/snippets");var d=await r.json();var html='<h3><i class="fa-solid fa-scissors"></i> Snippets</h3><div style="max-height:300px;overflow-y:auto">';if(!d.items||!d.items.length)html+='<div class="empty">No snippets</div>';else d.items.forEach(function(s,i){html+='<div style="background:#0b1220;padding:8px;border-radius:8px;margin:4px 0;display:flex;gap:6px;align-items:center"><b style="color:#60a5fa;flex:1;font-size:12px">'+esc(s.name)+' <small style="color:#94a3b8">['+esc(s.lang)+']</small></b><button class="btn btn-success" style="padding:4px 8px" onclick="insertSnippet(\''+esc(s.code).replace(/'/g,"\\'").replace(/\n/g,"\\n")+'\')"><i class="fa-solid fa-plus"></i></button><button class="btn btn-danger" style="padding:4px 8px" onclick="delSnippet('+i+')"><i class="fa-solid fa-trash"></i></button></div>'});html+='</div><button class="btn btn-success" style="width:100%;margin-top:8px;padding:11px" onclick="addSnippet()">+ New</button><button class="btn" style="width:100%;margin-top:6px;padding:11px" onclick="closeModal()">Close</button>';showModal(html)}catch(e){}}
+function insertSnippet(code){if(!cm)return toast("Open file first","error");cm.replaceSelection(code);closeModal()}
+async function addSnippet(){var name=prompt("Name:");if(!name)return;var lang=prompt("Language:","java")||"text";var code=prompt("Code:");if(!code)return;await fetch("/api/snippets",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name,lang:lang,code:code})});openSnippets()}
+async function delSnippet(i){await fetch("/api/snippets",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({index:i})});openSnippets()}
+
+// MACROS
+async function openMacros(){try{var r=await fetch("/api/macros");var d=await r.json();var html='<h3><i class="fa-solid fa-record-vinyl"></i> Macros</h3>';(d.macros||[]).forEach(function(m){html+='<div class="file-item file"><div class="icon-wrap"><i class="fa-solid fa-play"></i></div><span class="name">'+esc(m.name)+' <small style="color:#94a3b8">'+m.steps.length+' steps</small></span><button class="btn btn-success" style="padding:5px 9px" onclick="runMacro(\''+m.id+'\')"><i class="fa-solid fa-play"></i></button><button class="btn btn-danger" style="padding:5px 9px" onclick="delMacro(\''+m.id+'\')"><i class="fa-solid fa-trash"></i></button></div>'});html+='<button class="btn btn-success" style="width:100%;margin-top:8px;padding:11px" onclick="createMacro()">+ New</button><button class="btn" style="width:100%;margin-top:6px;padding:11px" onclick="closeModal()">Close</button>';showModal(html)}catch(e){}}
+async function createMacro(){var name=prompt("Name:");if(!name)return;var cmd=prompt("Step 1 command:");if(!cmd)return;var steps=[{type:"cmd",value:cmd}];if(confirm("Add build step?"))steps.push({type:"build"});await fetch("/api/macros",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({name:name,steps:steps})});openMacros()}
+async function runMacro(id){try{var r=await fetch("/api/macros/run/"+id,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({project:PROJECT})});var d=await r.json();if(r.ok)toast("Executed");else toast(d.error||"Fail","error");closeModal()}catch(e){toast("Error","error")}}
+async function delMacro(id){await fetch("/api/macros",{method:"DELETE",headers:{"Content-Type":"application/json"},body:JSON.stringify({id:id})});openMacros()}
+
+// COMMAND PALETTE
 var PALETTE_CMDS=[
   {name:"Build APK",icon:"fa-hammer",run:buildApk},
   {name:"Run Current File",icon:"fa-play",run:runCurrent},
   {name:"Scan Errors",icon:"fa-magnifying-glass",run:scanAllErrors},
+  {name:"Project Details",icon:"fa-circle-info",run:showProjectDetails},
   {name:"Export ZIP",icon:"fa-file-zipper",run:exportZip},
   {name:"ADB Install",icon:"fa-mobile-button",run:adbInstall},
-  {name:"Clean Build",icon:"fa-broom",run:function(){cleanBuild(false);}},
-  {name:"Deep Clean",icon:"fa-broom",run:function(){cleanBuild(true);}},
-  {name:"Git Status",icon:"fa-code-branch",run:function(){switchPanel("git");}},
-  {name:"Logcat Start",icon:"fa-list-ul",run:function(){switchPanel("logcat");logcatStart();}},
-  {name:"Real PTY Terminal",icon:"fa-terminal",run:function(){switchPanel("terminal");startPTY();}},
-  {name:"Kanban Board",icon:"fa-list-check",run:function(){switchPanel("kanban");}},
-  {name:"Project Notes",icon:"fa-note-sticky",run:function(){switchPanel("notes");}},
-  {name:"Analytics",icon:"fa-chart-line",run:function(){switchPanel("analytics");}},
+  {name:"Clean Build",icon:"fa-broom",run:function(){cleanBuild(false)}},
+  {name:"Deep Clean",icon:"fa-broom",run:function(){cleanBuild(true)}},
+  {name:"Cached Build Log",icon:"fa-history",run:showCachedLog},
+  {name:"HTML Viewer",icon:"fa-code",run:function(){switchPanel("htmlview")}},
+  {name:"Git Status",icon:"fa-code-branch",run:function(){switchPanel("git")}},
+  {name:"Logcat Start",icon:"fa-list-ul",run:function(){switchPanel("logcat");logcatStart()}},
+  {name:"PTY Terminal",icon:"fa-terminal",run:function(){switchPanel("terminal");startPTY()}},
+  {name:"Kanban",icon:"fa-list-check",run:function(){switchPanel("kanban")}},
+  {name:"Notes",icon:"fa-note-sticky",run:function(){switchPanel("notes")}},
+  {name:"Analytics",icon:"fa-chart-line",run:function(){switchPanel("analytics")}},
   {name:"Rename Package",icon:"fa-box",run:openPkgRename},
-  {name:"Strings Editor",icon:"fa-language",run:openStrings},
-  {name:"Theme Builder",icon:"fa-brush",run:openThemeBuilder},
-  {name:"Manifest Editor",icon:"fa-file-code",run:openManifest},
+  {name:"Strings",icon:"fa-language",run:openStrings},
+  {name:"Theme",icon:"fa-brush",run:openThemeBuilder},
+  {name:"Manifest",icon:"fa-file-code",run:openManifest},
   {name:"Icon Generator",icon:"fa-image",run:openIconGen},
+  {name:"Set Version",icon:"fa-hashtag",run:openVersionSet},
   {name:"ENV Manager",icon:"fa-key",run:openEnvMgr},
   {name:"Bulk Rename",icon:"fa-i-cursor",run:openBulkRename},
-  {name:"Firebase Setup",icon:"fa-fire",run:openFirebaseWizard},
-  {name:"Version Bump",icon:"fa-hashtag",run:bumpVersion},
-  {name:"Keystore Config",icon:"fa-lock",run:openKeystore},
+  {name:"Firebase",icon:"fa-fire",run:openFirebaseWizard},
+  {name:"Keystore",icon:"fa-lock",run:openKeystore},
   {name:"Sign Release",icon:"fa-certificate",run:signRelease},
   {name:"Dev Tools",icon:"fa-toolbox",run:openDevTools},
   {name:"Snippets",icon:"fa-scissors",run:openSnippets},
   {name:"Macros",icon:"fa-record-vinyl",run:openMacros},
   {name:"Bookmarks",icon:"fa-bookmark",run:showBookmarks},
-  {name:"Recent Files",icon:"fa-clock-rotate-left",run:showRecent},
+  {name:"Recent",icon:"fa-clock-rotate-left",run:showRecent},
   {name:"Aliases",icon:"fa-tag",run:showAliases},
-  {name:"Plugins",icon:"fa-puzzle-piece",run:openPlugins},
-  {name:"Custom Themes",icon:"fa-palette",run:openCustomThemes},
   {name:"Settings",icon:"fa-gear",run:openSettings},
-  {name:"Toggle HTML/Android Preview",icon:"fa-eye",run:togglePreviewMode},
+  {name:"Toggle Preview Mode",icon:"fa-eye",run:togglePreviewMode},
   {name:"Notifications",icon:"fa-bell",run:showNotifications},
   {name:"APK Analyzer",icon:"fa-magnifying-glass-chart",run:analyzeApk},
   {name:"SQLite Viewer",icon:"fa-database",run:openSqliteViewer},
 ];
 var paletteFiltered=PALETTE_CMDS.slice(),paletteIdx=0;
-function openCommandPalette(){
-  document.getElementById("cmdPalette").classList.add("show");
-  document.getElementById("cmdPaletteInput").value="";
-  paletteFiltered=PALETTE_CMDS.slice();paletteIdx=0;renderPalette();
-  setTimeout(function(){document.getElementById("cmdPaletteInput").focus();},50);
-}
-function renderPalette(){
-  var ul=document.getElementById("cmdPaletteList");ul.innerHTML="";
-  paletteFiltered.slice(0,12).forEach(function(c,i){
-    var li=document.createElement("li");
-    li.innerHTML='<i class="fa-solid '+c.icon+'"></i>'+esc(c.name);
-    if(i===paletteIdx)li.classList.add("active");
-    li.onclick=function(){closePalette();c.run();};
-    ul.appendChild(li);
-  });
-}
-function filterPalette(){
-  var q=document.getElementById("cmdPaletteInput").value.toLowerCase();
-  paletteFiltered=PALETTE_CMDS.filter(function(c){return c.name.toLowerCase().indexOf(q)>=0;});
-  paletteIdx=0;renderPalette();
-}
-function paletteKey(e){
-  if(e.key==="Escape")closePalette();
-  else if(e.key==="ArrowDown"){e.preventDefault();if(paletteIdx<paletteFiltered.length-1){paletteIdx++;renderPalette();}}
-  else if(e.key==="ArrowUp"){e.preventDefault();if(paletteIdx>0){paletteIdx--;renderPalette();}}
-  else if(e.key==="Enter"){e.preventDefault();var c=paletteFiltered[paletteIdx];if(c){closePalette();c.run();}}
-}
-function closePalette(){document.getElementById("cmdPalette").classList.remove("show");}
+function openCommandPalette(){document.getElementById("cmdPalette").classList.add("show");document.getElementById("cmdPaletteInput").value="";paletteFiltered=PALETTE_CMDS.slice();paletteIdx=0;renderPalette();setTimeout(function(){document.getElementById("cmdPaletteInput").focus()},50)}
+function renderPalette(){var ul=document.getElementById("cmdPaletteList");ul.innerHTML="";paletteFiltered.slice(0,12).forEach(function(c,i){var li=document.createElement("li");li.innerHTML='<i class="fa-solid '+c.icon+'"></i>'+esc(c.name);if(i===paletteIdx)li.classList.add("active");li.onclick=function(){closePalette();c.run()};ul.appendChild(li)})}
+function filterPalette(){var q=document.getElementById("cmdPaletteInput").value.toLowerCase();paletteFiltered=PALETTE_CMDS.filter(function(c){return c.name.toLowerCase().indexOf(q)>=0});paletteIdx=0;renderPalette()}
+function paletteKey(e){if(e.key==="Escape")closePalette();else if(e.key==="ArrowDown"){e.preventDefault();if(paletteIdx<paletteFiltered.length-1){paletteIdx++;renderPalette()}}else if(e.key==="ArrowUp"){e.preventDefault();if(paletteIdx>0){paletteIdx--;renderPalette()}}else if(e.key==="Enter"){e.preventDefault();var c=paletteFiltered[paletteIdx];if(c){closePalette();c.run()}}}
+function closePalette(){document.getElementById("cmdPalette").classList.remove("show")}
 
-// ============ SETTINGS ============
-async function openSettings(){
-  document.getElementById("fontSize").value=localStorage.getItem("fontSize")||13;
-  document.getElementById("autoSave").value=localStorage.getItem("autoSave")||"off";
-  document.getElementById("cmTheme").value=localStorage.getItem("cmTheme")||"dracula";
-  document.getElementById("uiLang").value=localStorage.getItem("uiLang")||"en";
-  document.getElementById("settingsModal").classList.add("show");
-  loadIdeSettings();
-  try{
-    var r=await fetch("/api/settings/"+encodeURIComponent(PROJECT));
-    var d=await r.json();
-    if(document.getElementById("autoBuildChk"))document.getElementById("autoBuildChk").checked=!!d.autoBuild;
-  }catch(e){}
-}
-function applyFontSize(v){localStorage.setItem("fontSize",v);if(cm)cm.getWrapperElement().style.fontSize=v+"px";}
-function changeTheme(t){localStorage.setItem("cmTheme",t);if(cm)cm.setOption("theme",t);}
-function setLang(l){
-  localStorage.setItem("uiLang",l);
-  var map={en:{explorer:"Files",preview:"Preview",errors:"Errors",terminal:"Term",build:"Build",packages:"Pkgs",git:"Git",logcat:"Log",kanban:"Todo",notes:"Notes",analytics:"Stats"},
-           bn:{explorer:"ফাইল",preview:"প্রিভিউ",errors:"ভুল",terminal:"টার্ম",build:"বিল্ড",packages:"প্যাকেজ",git:"গিট",logcat:"লগ",kanban:"টুডু",notes:"নোট",analytics:"স্ট্যাট"}};
-  var m=map[l]||map.en;
-  document.querySelectorAll(".nav-item").forEach(function(it){
-    var p=it.dataset.panel;
-    if(p&&m[p]){var sp=it.querySelector("span");if(sp)sp.textContent=m[p];}
-  });
-  toast("Language: "+l);
-}
-async function loadIdeSettings(){
-  try{
-    var r=await fetch("/api/ide-settings");
-    var d=await r.json();
-    if(document.getElementById("gradleVerInput"))document.getElementById("gradleVerInput").value=d.gradleVersion||"8.11.1";
-  }catch(e){}
-}
-async function saveIdeSettings(){
-  var v=document.getElementById("gradleVerInput").value.trim();
-  if(!v)return;
-  try{
-    var r=await fetch("/api/ide-settings",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({gradleVersion:v})});
-    if(r.ok){toast("Gradle version set to "+v);}
-  }catch(e){toast("Error","error");}
-}
-
-// ============ SHORTCUTS ============
+// KEYBOARD SHORTCUTS
 document.addEventListener("keydown",function(e){
-  if((e.ctrlKey||e.metaKey)&&e.shiftKey&&e.key.toLowerCase()==="p"){e.preventDefault();openCommandPalette();}
-  else if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="s"){e.preventDefault();if(cm)saveFile(false);}
-  else if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="b"){e.preventDefault();buildApk();}
+  if((e.ctrlKey||e.metaKey)&&e.shiftKey&&e.key.toLowerCase()==="p"){e.preventDefault();openCommandPalette()}
+  else if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="s"){e.preventDefault();if(cm)saveFile(false)}
+  else if((e.ctrlKey||e.metaKey)&&e.key.toLowerCase()==="b"){e.preventDefault();buildApk()}
   else if(e.key==="Escape")closePalette();
 });
 
-// ============ INIT ============
-if(localStorage.getItem("uiLang"))setLang(localStorage.getItem("uiLang"));
+// INIT
 loadFiles("");
 loadPresets();
 loadSystemInfo();
 setInterval(loadSystemInfo,15000);
 pollNotifications();
 notifPollTimer=setInterval(pollNotifications,3000);
-setTimeout(function(){try{scanAllErrors();}catch(e){}},1500);
-setTimeout(function(){try{
-  fetch("/api/settings/"+encodeURIComponent(PROJECT)).then(function(r){return r.json();}).then(function(d){
+setTimeout(function(){try{scanAllErrors()}catch(e){}},1500);
+setTimeout(function(){
+  fetch("/api/settings/"+encodeURIComponent(PROJECT)).then(function(r){return r.json()}).then(function(d){
     if(document.getElementById("autoBuildChk"))document.getElementById("autoBuildChk").checked=!!d.autoBuild;
-  });
-}catch(e){}},1000);
+  })
+},1000);
 </script>
 </body>
 </html>
 '''
 
-@app.route("/api/download-file/<path:name>")
-def download_single_file(name):
-    project = safe_project(name)
-    if project is None or not project.exists():
-        return jsonify({"error": "Invalid"}), 400
-    sub = request.args.get("path", "")
-    target = safe_subpath(project, sub)
-    if target is None or not target.is_file():
-        return jsonify({"error": "Not found"}), 404
-    return send_file(str(target), as_attachment=True, download_name=target.name)
 # ============================================================
 # MAIN
 # ============================================================
@@ -4902,21 +4774,25 @@ def download_single_file(name):
 if __name__ == "__main__":
     print("")
     print("=================================================")
-    print("⚡ ZIHAD MOBILE IDE v13.0 — ULTIMATE EDITION")
+    print("⚡ ZIHAD MOBILE IDE v14.0 — ULTIMATE PRO")
     print("=================================================")
     print("Projects :", PROJECTS_DIR)
     print("APKs     :", APKS_DIR)
-    print("Plugins  :", PLUGINS_DIR)
-    print("Kanban   :", KANBAN_DIR)
-    print("Notes    :", NOTES_DIR)
+    print("Log Cache:", BUILD_LOG_CACHE_DIR)
     print("Server   : http://127.0.0.1:%d" % PORT)
     print("=================================================")
-    print("Features: 12 templates, Git, Logcat, PTY, Kanban,")
-    print("Notes, Bookmarks, Plugins, Themes, Aliases,")
-    print("Macros, Analytics, Auto-Build, Notifications,")
-    print("Dev Tools, Snippets, Command Palette, i18n,")
-    print("PWA, Live Preview, Real Termux PTY, Packages,")
-    print("Dependencies, SDK Manager, APK Analyzer, SQLite Viewer")
+    print("NEW in v14:")
+    print("  • Settings with all timeouts (18 configurable)")
+    print("  • Auto-download Gradle wrapper (no timeout)")
+    print("  • Build log cache (last only, background)")
+    print("  • Project Details (deps, size, language %, icon)")
+    print("  • HTML Viewer with full CSS/JS support")
+    print("  • 5 clickable stats charts")
+    print("  • Notifications with error grouping + APK install")
+    print("  • Custom editor themes")
+    print("  • Version set with validation")
+    print("  • Full SDK/Gradle settings")
     print("=================================================")
     print("")
     app.run(host="127.0.0.1", port=PORT, debug=False, threaded=True)
+
