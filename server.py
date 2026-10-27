@@ -2876,12 +2876,7 @@ setTimeout(function(){fetch("/api/settings/"+encodeURIComponent(PROJECT)).then(f
 </html>
 '''
 
-@app.route("/project/<path:name>")
-def open_project(name):
-    project = safe_project(name)
-    if project is None or not project.exists():
-        return "Project not found", 404
-    return IDE_HTML.replace("__NAME__", project.name)
+
 
 # ============================================================
 # MAIN
